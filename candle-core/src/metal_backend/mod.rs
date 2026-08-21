@@ -979,7 +979,18 @@ impl BackendStorage for MetalStorage {
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
-        let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
+        // `copy_strided_src` below writes every element of the destination, so
+        // allocating it zeroed adds a blit fill whose result is immediately
+        // discarded. This is per convolution, and models that run convolution
+        // in most of their layers pay it repeatedly.
+        let el_count = res_l.shape().elem_count();
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_size_for(el_count, res.dtype())
+            .with_label("conv1d_out")
+            .build()?;
+        let mut res_t = Self::new(buffer, self.device().clone(), el_count, res.dtype());
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
     }
