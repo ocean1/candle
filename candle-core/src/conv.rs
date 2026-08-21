@@ -192,6 +192,11 @@ impl Tensor {
         };
         if groups == 1 {
             self.conv1d_single_group(kernel, &params)
+        } else if groups == c_in && c_in_k == 1 && c_out == c_in {
+            // Depthwise: each output channel reads exactly one input channel.
+            // The generic path below runs one convolution per group, which for
+            // a wide depthwise layer is thousands of dispatches.
+            self.conv1d_depthwise(kernel, &params, groups)
         } else {
             let blocks = self.chunk(groups, 1)?;
             let kernel = kernel.chunk(groups, 0)?;
@@ -201,6 +206,50 @@ impl Tensor {
                 .map(|(block, kernel)| block.conv1d_single_group(kernel, &params))
                 .collect::<Result<Vec<_>>>()?;
             Tensor::cat(&blocks, 1)
+        }
+    }
+
+    /// Depthwise 1D convolution.
+    ///
+    /// Falls back to the generic grouped path when the backend has no fused
+    /// implementation, so behaviour is identical either way.
+    fn conv1d_depthwise(
+        &self,
+        kernel: &Self,
+        params: &ParamsConv1D,
+        groups: usize,
+    ) -> Result<Self> {
+        let storage = self.storage().conv1d_depthwise(
+            self.layout(),
+            &kernel.storage(),
+            kernel.layout(),
+            params,
+        );
+
+        match storage {
+            Ok(storage) => {
+                let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::Conv1D {
+                    arg,
+                    kernel,
+                    padding: params.padding,
+                    stride: params.stride,
+                    dilation: params.dilation,
+                });
+                let out_dims = vec![params.b_size, groups, params.l_out()];
+                Ok(crate::tensor::from_storage(storage, out_dims, op, false))
+            }
+            Err(Error::UnsupportedDTypeForOp(_, _)) | Err(Error::Metal(_)) => {
+                // No fused kernel for this backend or dtype.
+                let blocks = self.chunk(groups, 1)?;
+                let kernel = kernel.chunk(groups, 0)?;
+                let blocks = blocks
+                    .iter()
+                    .zip(&kernel)
+                    .map(|(block, kernel)| block.conv1d_single_group(kernel, params))
+                    .collect::<Result<Vec<_>>>()?;
+                Tensor::cat(&blocks, 1)
+            }
+            Err(e) => Err(e),
         }
     }
 

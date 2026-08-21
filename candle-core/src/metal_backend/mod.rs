@@ -995,6 +995,69 @@ impl BackendStorage for MetalStorage {
         Ok(res_t)
     }
 
+    fn conv1d_depthwise(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &ParamsConv1D,
+    ) -> Result<Self> {
+        // Only the contiguous-kernel case is fused; anything else falls back.
+        if !kernel_l.is_contiguous() {
+            return Err(crate::Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "conv1d_depthwise (non-contiguous kernel)",
+            ));
+        }
+
+        let name = match self.dtype {
+            DType::F32 => "conv1d_depthwise_f32",
+            DType::F16 => "conv1d_depthwise_f16",
+            DType::BF16 => "conv1d_depthwise_bf16",
+            dtype => {
+                return Err(crate::Error::UnsupportedDTypeForOp(
+                    dtype,
+                    "conv1d_depthwise",
+                ))
+            }
+        };
+
+        let dims = layout.shape().dims();
+        let (b, c, _l_in) = (dims[0], dims[1], dims[2]);
+        let l_out = params.l_out();
+        let dst_el = b * c * l_out;
+
+        // Written in destination order, so no transpose copy afterwards.
+        let dst = self
+            .device
+            .new_buffer_builder()
+            .with_size_for(dst_el, self.dtype)
+            .with_label("conv1d_depthwise")
+            .build()?;
+
+        let encoder = self.device.command_encoder()?;
+        candle_metal_kernels::call_conv1d_depthwise(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            name,
+            dims,
+            layout.stride(),
+            (
+                params.k_size,
+                params.stride,
+                params.padding,
+                params.dilation,
+            ),
+            buffer_o(&self.buffer, layout, self.dtype),
+            buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+            &dst,
+        )
+        .map_err(MetalError::from)?;
+
+        Ok(Self::new(dst, self.device.clone(), dst_el, self.dtype))
+    }
+
     fn conv_transpose1d(
         &self,
         layout: &Layout,

@@ -41,6 +41,23 @@ pub trait BackendStorage: Sized {
         _params: &crate::conv::ParamsConv1D,
     ) -> Result<Self>;
 
+    /// Depthwise 1D convolution, writing directly in `(b, c, l_out)` layout.
+    ///
+    /// Optional. The default declines and callers fall back to the generic
+    /// grouped path, so backends without a fused implementation are unaffected.
+    fn conv1d_depthwise(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConv1D,
+    ) -> Result<Self> {
+        Err(crate::Error::UnsupportedDTypeForOp(
+            self.dtype(),
+            "conv1d_depthwise (no fused implementation for this backend)",
+        ))
+    }
+
     fn conv_transpose1d(
         &self,
         _l: &Layout,
