@@ -19,10 +19,21 @@ impl CommandBuffer {
     }
 
     /// Create a compute command encoder with the provided per-encoder fence and global output map.
-    pub fn compute_command_encoder(&self, fence: &Arc<Fence>) -> ComputeCommandEncoder {
+    pub fn compute_command_encoder(
+        &self,
+        fence: &Arc<Fence>,
+        prev_ce_outputs: &PrevCeOutputs,
+    ) -> ComputeCommandEncoder {
         self.as_ref()
             .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-            .map(|raw| ComputeCommandEncoder::new(raw, self.raw.clone(), Arc::clone(fence)))
+            .map(|raw| {
+                ComputeCommandEncoder::new(
+                    raw,
+                    self.raw.clone(),
+                    Arc::clone(fence),
+                    Arc::clone(prev_ce_outputs),
+                )
+            })
             .unwrap()
     }
 
@@ -33,7 +44,14 @@ impl CommandBuffer {
         let fence = Arc::new(Fence::new(&device));
         self.as_ref()
             .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-            .map(|raw| ComputeCommandEncoder::new(raw, self.raw.clone(), fence))
+            .map(|raw| {
+                ComputeCommandEncoder::new(
+                    raw,
+                    self.raw.clone(),
+                    fence,
+                    Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                )
+            })
             .unwrap()
     }
 
