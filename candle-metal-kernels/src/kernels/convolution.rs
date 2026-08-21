@@ -45,6 +45,56 @@ pub fn call_im2col1d_strided(
     Ok(())
 }
 
+/// Fused depthwise 1D convolution.
+///
+/// Computes the whole layer in one dispatch, writing directly in `(b, c, l_out)`
+/// layout. The generic path instead builds an im2col matrix, runs a matmul and
+/// transposes the result, and candle splits grouped convolutions into one
+/// convolution per group — so a depthwise layer over N channels costs roughly
+/// 3N dispatches there against one here.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv1d_depthwise(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    (k_size, stride, padding, dilation): (usize, usize, usize, usize),
+    input: BufferOffset,
+    weight: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let l_out = (shape[2] + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
+    // One thread per output element, in destination order.
+    let dst_el = shape[0] * shape[1] * l_out;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "conv1d_depthwise {name} dst_el={dst_el}");
+    set_params!(
+        encoder,
+        (
+            dst_el,
+            l_out,
+            k_size,
+            stride,
+            padding,
+            dilation,
+            shape,
+            strides,
+            &input,
+            &weight,
+            Output::new(output)
+        )
+    );
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_col2im1d(
     device: &Device,
