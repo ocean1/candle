@@ -168,21 +168,15 @@ impl Commands {
 
         if state_guard.current_encoder.is_none() {
             let fence = Arc::new(Fence::new(&self.device));
-            let enc = state_guard.current.compute_command_encoder(&fence);
-            // Wait for all prior encoder fences before the first dispatch.
-            // Using HazardTrackingModeUntracked implies that Metal does not automatically flush GPU caches
-            // at encoder or command buffer boundaries.
-            {
-                use std::collections::HashSet;
-                let map = self.prev_ce_outputs.lock().unwrap();
-                let mut seen = HashSet::new();
-                for f in map.values() {
-                    let ptr = Arc::as_ptr(f) as usize;
-                    if seen.insert(ptr) {
-                        enc.wait_for_fence(f);
-                    }
-                }
-            }
+            // No blanket wait here. HazardTrackingModeUntracked means Metal does
+            // not flush GPU caches at encoder boundaries, so ordering is ours to
+            // enforce -- but the encoder already records every buffer it binds,
+            // so it waits per buffer in set_input_buffer / set_output_buffer
+            // instead. Waiting on every live fence would order this encoder
+            // after work it never touches.
+            let enc = state_guard
+                .current
+                .compute_command_encoder(&fence, &self.prev_ce_outputs);
             state_guard.current_encoder = Some(enc);
         }
 

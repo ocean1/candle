@@ -30,6 +30,9 @@ pub struct EncoderState {
     pub all_inputs: HashSet<usize>,
     /// All outputs seen this encoder session (registered in global map at end_encoding).
     pub all_outputs: HashSet<usize>,
+    /// Fences already waited on this session, so a buffer bound repeatedly does
+    /// not re-emit the same wait.
+    pub waited_fences: HashSet<usize>,
 }
 
 impl EncoderState {
@@ -42,6 +45,7 @@ impl EncoderState {
             needs_barrier: false,
             all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
+            waited_fences: HashSet::new(),
         }
     }
 }
@@ -57,6 +61,9 @@ pub struct ComputeCommandEncoder {
     /// and the clone held by CommandsGuard. Uncontended in practice (CommandsGuard
     /// holds the outer Commands mutex for the entire kernel dispatch).
     pub(crate) state: Arc<Mutex<EncoderState>>,
+    /// Buffer -> fence of its last writer, so a bind can wait on just that
+    /// buffer instead of on every live fence.
+    pub(crate) prev_ce_outputs: PrevCeOutputs,
 }
 
 impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
@@ -70,12 +77,33 @@ impl ComputeCommandEncoder {
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         fence: Arc<Fence>,
+        prev_ce_outputs: PrevCeOutputs,
     ) -> ComputeCommandEncoder {
         ComputeCommandEncoder {
             raw,
             command_buffer,
             fence,
             state: Arc::new(Mutex::new(EncoderState::new())),
+            prev_ce_outputs,
+        }
+    }
+
+    /// Wait on the fence of `ptr`'s last writer, if any, and only once.
+    ///
+    /// This replaces waiting on every live fence at encoder creation. The
+    /// encoder already records every buffer it binds, so the wait can be
+    /// limited to buffers this encoder actually touches.
+    fn wait_for_buffer(&self, ptr: usize) {
+        let fence = {
+            let map = self.prev_ce_outputs.lock().unwrap();
+            map.get(&ptr).cloned()
+        };
+        let Some(fence) = fence else { return };
+
+        let mut state = self.state.lock().unwrap();
+        if state.waited_fences.insert(Arc::as_ptr(&fence) as usize) {
+            drop(state);
+            self.raw.waitForFence(fence.raw());
         }
     }
 
@@ -119,6 +147,9 @@ impl ComputeCommandEncoder {
     pub fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
+            // Read-after-write against an earlier encoder: order against that
+            // buffer's last writer only.
+            self.wait_for_buffer(ptr);
             let mut s = self.state.lock().unwrap();
             if s.prev_outputs.contains(&ptr) {
                 s.needs_barrier = true;
@@ -135,6 +166,8 @@ impl ComputeCommandEncoder {
     pub fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
+            // Write-after-write or write-after-read against an earlier encoder.
+            self.wait_for_buffer(ptr);
             let mut s = self.state.lock().unwrap();
             if s.prev_outputs.contains(&ptr) || s.prev_inputs.contains(&ptr) {
                 s.needs_barrier = true;
