@@ -662,6 +662,91 @@ COL2IM1D_OP(uint32_t, col2im1d_u32)
 COL2IM1D_OP(bfloat, col2im1d_bf16)
 #endif
 
+// Depthwise 1D convolution, fused.
+//
+// The generic path builds an im2col matrix, runs a matmul, then transposes the
+// result into place — three dispatches and two intermediate buffers. For a
+// depthwise conv (groups == c_in, so each output channel reads only its own
+// input channel) the matmul is degenerate: every output is a short dot product
+// of k_size taps. candle also splits grouped convs into one conv per group and
+// concatenates, so a 2048-channel depthwise layer becomes thousands of
+// dispatches. This does the whole layer in one, writing straight to the final
+// (b, c, l_out) layout so no transpose copy is needed.
+template <typename T, typename A>
+METAL_FUNC void conv1d_depthwise(
+    constant size_t &dst_numel,
+    constant size_t &l_out,
+    constant size_t &k_size,
+    constant size_t &stride,
+    constant size_t &padding,
+    constant size_t &dilation,
+    constant size_t *src_dims,
+    constant size_t *src_strides,
+    device const T *src,
+    device const T *weight,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  if (tid >= dst_numel) {
+    return;
+  }
+
+  const size_t c = src_dims[1];
+  const size_t l_in = src_dims[2];
+
+  // dst is contiguous (b, c, l_out); recover the index directly.
+  const size_t l_idx = tid % l_out;
+  const size_t tmp = tid / l_out;
+  const size_t c_idx = tmp % c;
+  const size_t b_idx = tmp / c;
+
+  // Accumulate in a wider type: f16 sums lose precision quickly, and this
+  // costs nothing since the taps are few.
+  A acc = static_cast<A>(0);
+  const size_t src_base = b_idx * src_strides[0] + c_idx * src_strides[1];
+  const size_t w_base = c_idx * k_size;
+
+  for (size_t k = 0; k < k_size; ++k) {
+    const size_t pos = l_idx * stride + k * dilation;
+    // Positions inside the padding contribute nothing.
+    if (pos < padding) {
+      continue;
+    }
+    const size_t src_l = pos - padding;
+    if (src_l >= l_in) {
+      continue;
+    }
+    acc += static_cast<A>(src[src_base + src_l * src_strides[2]])
+         * static_cast<A>(weight[w_base + k]);
+  }
+
+  dst[tid] = static_cast<T>(acc);
+}
+
+#define CONV1D_DEPTHWISE_OP(T, A, FN_NAME) \
+kernel void FN_NAME(  \
+    constant size_t &dst_numel, \
+    constant size_t &l_out, \
+    constant size_t &k_size, \
+    constant size_t &stride, \
+    constant size_t &padding, \
+    constant size_t &dilation, \
+    constant size_t *src_dims, \
+    constant size_t *src_strides, \
+    device const T *src, \
+    device const T *weight, \
+    device T *dst, \
+    uint tid [[ thread_position_in_grid ]] \
+) {  \
+  conv1d_depthwise<T, A>(dst_numel, l_out, k_size, stride, padding, dilation, src_dims, src_strides, src, weight, dst, tid); \
+} \
+
+CONV1D_DEPTHWISE_OP(float, float, conv1d_depthwise_f32)
+CONV1D_DEPTHWISE_OP(half, float, conv1d_depthwise_f16)
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
+CONV1D_DEPTHWISE_OP(bfloat, float, conv1d_depthwise_bf16)
+#endif
+
 IM2COL1D_OP(float, im2col1d_f32)
 IM2COL1D_OP(half, im2col1d_f16)
 IM2COL1D_OP(uint8_t, im2col1d_u8)
