@@ -349,8 +349,31 @@ impl MetalDevice {
     }
 }
 
+/// Alignment applied to every buffer allocation.
+///
+/// This is the Apple Silicon cache line. Aligning to it means every buffer
+/// starts on a line boundary, so no two buffers share a line and the memory
+/// controller can coalesce accesses cleanly. It also covers the alignment any
+/// dtype could need: the kernels use `float4`/`half4` (16 bytes) widely and
+/// quantized block structures are wider still, all well under 128.
+const BUFFER_ALIGNMENT: usize = 128;
+
+/// Size to allocate for a request of `size` bytes.
+///
+/// Previously this rounded up to the next power of two, which wastes up to 2x
+/// per buffer. That is not hypothetical: for shapes that sit just above a
+/// power of two -- a 292-token KV cache, or an FFN intermediate of 10752 --
+/// the rounding costs 75% and 52% respectively, and the pool holds the excess
+/// for the process lifetime.
+///
+/// Aligning instead keeps the guarantees that matter (vector alignment, and a
+/// size the memory controller likes) without the waste. Reuse is unaffected:
+/// `find_available_buffer` accepts any pooled buffer at least as large as the
+/// request, so a slightly larger buffer still satisfies a smaller one.
 fn buf_size(size: usize) -> usize {
-    size.next_power_of_two()
+    // Never return 0: Metal rejects zero-length buffers, and callers may ask
+    // for an empty tensor.
+    size.max(1).next_multiple_of(BUFFER_ALIGNMENT)
 }
 
 /// Applies the [`BufferBuilder`] label, clearing any stale label on a reused pooled buffer.
@@ -457,31 +480,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_buf_size_exact_powers_of_two() {
-        assert_eq!(buf_size(1), 1);
-        assert_eq!(buf_size(2), 2);
-        assert_eq!(buf_size(4), 4);
-        assert_eq!(buf_size(8), 8);
-        assert_eq!(buf_size(16), 16);
-        assert_eq!(buf_size(1024), 1024);
+    fn test_buf_size_is_aligned() {
+        for size in [1usize, 2, 3, 127, 128, 129, 1000, 4096, 21504, 299008] {
+            let got = buf_size(size);
+            assert!(got >= size, "buf_size({size}) = {got} is too small");
+            assert_eq!(
+                got % BUFFER_ALIGNMENT,
+                0,
+                "buf_size({size}) = {got} is not {BUFFER_ALIGNMENT}-aligned"
+            );
+            assert!(
+                got - size < BUFFER_ALIGNMENT,
+                "buf_size({size}) = {got} wastes a whole alignment unit"
+            );
+        }
     }
 
     #[test]
-    fn test_buf_size_rounds_up() {
-        assert_eq!(buf_size(3), 4);
-        assert_eq!(buf_size(5), 8);
-        assert_eq!(buf_size(6), 8);
-        assert_eq!(buf_size(7), 8);
-        assert_eq!(buf_size(9), 16);
-        assert_eq!(buf_size(1000), 1024);
-        assert_eq!(buf_size(1025), 2048);
+    fn test_buf_size_never_zero() {
+        // Metal rejects zero-length buffers, and an empty tensor asks for one.
+        assert_eq!(buf_size(0), BUFFER_ALIGNMENT);
+    }
+
+    #[test]
+    fn test_buf_size_avoids_power_of_two_waste() {
+        // Shapes that sit just above a power of two are the ones that suffered:
+        // a 292-token KV cache and an FFN intermediate both rounded up hard.
+        assert_eq!(buf_size(299008), 299008); // was 524288, 75% waste
+        assert_eq!(buf_size(21504), 21504); // was 32768, 52% waste
     }
 
     #[test]
     fn test_buf_size_bf16_f16_scalar() {
-        // BF16 and F16 are 2 bytes per element. A scalar tensor requests
-        // a 2-byte buffer. This must not be rounded down to 1.
-        assert_eq!(buf_size(2), 2);
+        // BF16 and F16 are 2 bytes per element; a scalar tensor requests a
+        // 2-byte buffer. It must not be rounded down.
+        assert!(buf_size(2) >= 2);
     }
 }
 
