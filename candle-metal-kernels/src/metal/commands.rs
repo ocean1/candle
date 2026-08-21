@@ -123,6 +123,23 @@ pub struct Commands {
     /// Global cross-encoder output map. Maps buffer pointer to the fence of the last encoder
     /// that wrote it, enabling cross-command-buffer ordering for HazardTrackingModeUntracked.
     prev_ce_outputs: PrevCeOutputs,
+    /// The distinct fences currently referenced by `prev_ce_outputs`, each with
+    /// the number of buffers pointing at it.
+    ///
+    /// A new encoder waits on every distinct prior fence. Deriving that set from
+    /// `prev_ce_outputs` means scanning one entry per live buffer and allocating
+    /// a HashSet to deduplicate them, on every encoder. Maintaining it here makes
+    /// encoder creation proportional to the number of distinct fences instead,
+    /// which is typically small.
+    live_fences: Arc<Mutex<Vec<LiveFence>>>,
+}
+
+/// A fence still referenced by `prev_ce_outputs`, with its buffer count.
+struct LiveFence {
+    /// Identity of the fence, used to match without comparing Arc contents.
+    ptr: usize,
+    fence: Arc<Fence>,
+    buffers: usize,
 }
 
 unsafe impl Send for Commands {}
@@ -154,6 +171,7 @@ impl Commands {
             compute_per_buffer,
             device,
             prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
+            live_fences: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -173,14 +191,9 @@ impl Commands {
             // Using HazardTrackingModeUntracked implies that Metal does not automatically flush GPU caches
             // at encoder or command buffer boundaries.
             {
-                use std::collections::HashSet;
-                let map = self.prev_ce_outputs.lock().unwrap();
-                let mut seen = HashSet::new();
-                for f in map.values() {
-                    let ptr = Arc::as_ptr(f) as usize;
-                    if seen.insert(ptr) {
-                        enc.wait_for_fence(f);
-                    }
+                let fences = self.live_fences.lock().unwrap();
+                for live in fences.iter() {
+                    enc.wait_for_fence(&live.fence);
                 }
             }
             state_guard.current_encoder = Some(enc);
@@ -211,14 +224,9 @@ impl Commands {
         // Wait for all prior encoder fences before any blit commands execute.
         // Required for HazardTrackingModeUntracked: GPU caches are not auto-flushed.
         {
-            use std::collections::HashSet;
-            let map = self.prev_ce_outputs.lock().unwrap();
-            let mut seen = HashSet::new();
-            for f in map.values() {
-                let ptr = Arc::as_ptr(f) as usize;
-                if seen.insert(ptr) {
-                    encoder.wait_for_fence(f);
-                }
+            let fences = self.live_fences.lock().unwrap();
+            for live in fences.iter() {
+                encoder.wait_for_fence(&live.fence);
             }
         }
 
@@ -259,6 +267,7 @@ impl Commands {
         }
 
         self.prev_ce_outputs.lock()?.clear();
+        self.live_fences.lock()?.clear();
 
         Ok(())
     }
@@ -354,9 +363,29 @@ impl Commands {
 
         {
             let mut prev_ce_outputs = self.prev_ce_outputs.lock().unwrap();
-            // Register our outputs so subsequent encoders can wait for us.
+            let mut fences = self.live_fences.lock().unwrap();
+            let this_ptr = Arc::as_ptr(&encoder.fence) as usize;
+            let mut claimed = 0usize;
+
+            // Register our outputs so subsequent encoders can wait for us,
+            // keeping `live_fences` consistent with the map.
             for output in all_outputs.iter() {
-                let _ = prev_ce_outputs.insert(*output, encoder.fence.clone());
+                if let Some(prev) = prev_ce_outputs.insert(*output, encoder.fence.clone()) {
+                    // Another fence owned this buffer; it loses one reference.
+                    release_fence(&mut fences, Arc::as_ptr(&prev) as usize);
+                }
+                claimed += 1;
+            }
+
+            if claimed > 0 {
+                match fences.iter_mut().find(|f| f.ptr == this_ptr) {
+                    Some(live) => live.buffers += claimed,
+                    None => fences.push(LiveFence {
+                        ptr: this_ptr,
+                        fence: encoder.fence.clone(),
+                        buffers: claimed,
+                    }),
+                }
             }
         }
 
@@ -367,12 +396,16 @@ impl Commands {
         if !all_outputs.is_empty() {
             let fence_for_cleanup = Arc::clone(&encoder.fence);
             let map_for_cleanup = Arc::clone(&self.prev_ce_outputs);
+            let fences_for_cleanup = Arc::clone(&self.live_fences);
             let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 let mut map = map_for_cleanup.lock().unwrap();
+                let mut fences = fences_for_cleanup.lock().unwrap();
+                let ptr = Arc::as_ptr(&fence_for_cleanup) as usize;
                 for &buf in &all_outputs {
                     if let Some(f) = map.get(&buf) {
                         if Arc::ptr_eq(f, &fence_for_cleanup) {
                             map.remove(&buf);
+                            release_fence(&mut fences, ptr);
                         }
                     }
                 }
@@ -385,6 +418,16 @@ impl Commands {
         }
 
         encoder.raw.endEncoding();
+    }
+}
+
+/// Drop one buffer's reference to `ptr`, forgetting the fence once none remain.
+fn release_fence(fences: &mut Vec<LiveFence>, ptr: usize) {
+    if let Some(idx) = fences.iter().position(|f| f.ptr == ptr) {
+        fences[idx].buffers = fences[idx].buffers.saturating_sub(1);
+        if fences[idx].buffers == 0 {
+            fences.swap_remove(idx);
+        }
     }
 }
 
