@@ -1,6 +1,7 @@
 pub mod affine;
 pub mod binary;
 pub mod cast;
+pub mod conv_names;
 pub mod convolution;
 pub mod fill;
 pub mod indexing;
@@ -17,6 +18,7 @@ pub mod unary;
 pub use affine::*;
 pub use binary::{call_binary_contiguous, call_binary_strided};
 pub use cast::{call_cast_contiguous, call_cast_strided};
+pub use conv_names::ConvKernel;
 pub use convolution::*;
 pub use fill::*;
 pub use indexing::*;

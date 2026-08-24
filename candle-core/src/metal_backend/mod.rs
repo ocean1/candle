@@ -7,7 +7,7 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 use candle_metal_kernels::kernels::binary::contiguous;
 use candle_metal_kernels::{
     metal::{Buffer, Commands, Device, ResidencySet},
-    BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
+    BufferOffset, CallConvTranspose2dCfg, ConvKernel, Kernels, RESOURCE_OPTIONS,
 };
 use objc2_foundation::NSRange;
 #[cfg(feature = "metal-debug-labels")]
@@ -25,6 +25,27 @@ pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffse
     BufferOffset {
         buffer,
         offset_in_bytes: l.start_offset() * dtype.size_in_bytes(),
+    }
+}
+
+/// Resolve a `conv.metal` kernel name for `dtype`, or report the op as
+/// unimplemented for it.
+///
+/// The name comes from [`ConvKernel`], which is the single Rust-side
+/// declaration of the conv family's `[[host_name]]` strings and is checked
+/// against the compiled Metal library by `conv_names_resolve` in
+/// `candle-metal-kernels`. Previously each of these call sites carried its own
+/// `match dtype` table of string literals, so a rename in `conv.metal` or a
+/// dtype added on one side only surfaced as a runtime `LoadFunctionError`.
+///
+/// `op` is the caller's name for the error message, which is not always the
+/// kernel stem — `conv1d` dispatches the `im2col1d` kernel, and reporting
+/// "im2col1d not implemented" to a user who called `conv1d` would be worse than
+/// the string duplication it saves.
+fn conv_kernel_name(kernel: ConvKernel, dtype: DType, op: &'static str) -> Result<&'static str> {
+    match kernel.name(dtype.as_str()) {
+        Some(name) => Ok(name),
+        None => crate::bail!("Metal {op} {dtype:?} not implemented"),
     }
 }
 /// Simple way to catch lock error without
@@ -930,14 +951,7 @@ impl BackendStorage for MetalStorage {
             .with_label("conv1d_im2col")
             .build()?;
         let encoder = self.device.command_encoder()?;
-        let name = match self.dtype {
-            DType::F32 => "im2col1d_f32",
-            DType::F16 => "im2col1d_f16",
-            DType::BF16 => "im2col1d_bf16",
-            DType::U8 => "im2col1d_u8",
-            DType::U32 => "im2col1d_u32",
-            dtype => crate::bail!("Metal conv1d {dtype:?} not implemented"),
-        };
+        let name = conv_kernel_name(ConvKernel::IM2COL1D, self.dtype, "conv1d")?;
         let src = buffer_o(&self.buffer, layout, self.dtype);
         candle_metal_kernels::call_im2col1d_strided(
             &self.device.device,
@@ -1010,16 +1024,15 @@ impl BackendStorage for MetalStorage {
             ));
         }
 
-        let name = match self.dtype {
-            DType::F32 => "conv1d_depthwise_f32",
-            DType::F16 => "conv1d_depthwise_f16",
-            DType::BF16 => "conv1d_depthwise_bf16",
-            dtype => {
-                return Err(crate::Error::UnsupportedDTypeForOp(
-                    dtype,
-                    "conv1d_depthwise",
-                ))
-            }
+        // Unlike the other conv entry points this returns `UnsupportedDTypeForOp`
+        // rather than bailing: `conv1d` inspects the error to decide whether to
+        // fall back to the generic im2col path, so the dtype refusal has to stay
+        // a typed error.
+        let Some(name) = ConvKernel::CONV1D_DEPTHWISE.name(self.dtype.as_str()) else {
+            return Err(crate::Error::UnsupportedDTypeForOp(
+                self.dtype,
+                "conv1d_depthwise",
+            ));
         };
 
         let dims = layout.shape().dims();
@@ -1091,14 +1104,7 @@ impl BackendStorage for MetalStorage {
                 .with_label("conv_transpose1d")
                 .build()?;
 
-            let name = match self.dtype {
-                DType::F32 => "col2im1d_f32",
-                DType::F16 => "col2im1d_f16",
-                DType::BF16 => "col2im1d_bf16",
-                DType::U32 => "col2im1d_u32",
-                DType::U8 => "col2im1d_u8",
-                dtype => crate::bail!("metal col2im1d {dtype:?} not implemented"),
-            };
+            let name = conv_kernel_name(ConvKernel::COL2IM1D, self.dtype, "col2im1d")?;
             let col = {
                 // This merges the last two dimensions of the kernel together.
                 let kernel_l_mm = Layout::new(
@@ -1141,14 +1147,8 @@ impl BackendStorage for MetalStorage {
                 .build()?;
 
             let encoder = self.device.command_encoder()?;
-            let name = match self.dtype {
-                DType::F32 => "conv_transpose1d_f32",
-                DType::F16 => "conv_transpose1d_f16",
-                DType::BF16 => "conv_transpose1d_bf16",
-                DType::U32 => "conv_transpose1d_u32",
-                DType::U8 => "conv_transpose1d_u8",
-                dtype => crate::bail!("Metal conv_transpose1d {dtype:?} not implemented"),
-            };
+            let name =
+                conv_kernel_name(ConvKernel::CONV_TRANSPOSE1D, self.dtype, "conv_transpose1d")?;
             candle_metal_kernels::call_conv_transpose1d(
                 &self.device.device,
                 &encoder,
@@ -1206,14 +1206,7 @@ impl BackendStorage for MetalStorage {
             .with_label("conv2d_im2col")
             .build()?;
         let encoder = self.device.command_encoder()?;
-        let name = match self.dtype {
-            DType::F32 => "im2col_f32",
-            DType::F16 => "im2col_f16",
-            DType::BF16 => "im2col_bf16",
-            DType::U8 => "im2col_u8",
-            DType::U32 => "im2col_u32",
-            dtype => crate::bail!("Metal conv2d {dtype:?} not implemented"),
-        };
+        let name = conv_kernel_name(ConvKernel::IM2COL, self.dtype, "conv2d")?;
         let src = buffer_o(&self.buffer, layout, self.dtype);
         candle_metal_kernels::call_im2col_strided(
             &self.device.device,
@@ -1294,12 +1287,7 @@ impl BackendStorage for MetalStorage {
 
         let encoder = self.device.command_encoder()?;
 
-        let name = match self.dtype {
-            DType::F32 => "conv_transpose2d_f32",
-            DType::F16 => "conv_transpose2d_f16",
-            DType::BF16 => "conv_transpose2d_bf16",
-            dtype => crate::bail!("Metal conv_transpose2d {dtype:?} not implemented"),
-        };
+        let name = conv_kernel_name(ConvKernel::CONV_TRANSPOSE2D, self.dtype, "conv_transpose2d")?;
 
         candle_metal_kernels::call_conv_transpose2d(
             &self.device.device,
@@ -1339,14 +1327,7 @@ impl BackendStorage for MetalStorage {
         let shape = inp_l.shape();
         let (b_size, channels, width, height) = shape.dims4()?;
         let strides = inp_l.stride();
-        let name = match self.dtype {
-            DType::F32 => "avg_pool2d_f32",
-            DType::F16 => "avg_pool2d_f16",
-            DType::BF16 => "avg_pool2d_bf16",
-            DType::U8 => "avg_pool2d_u8",
-            DType::U32 => "avg_pool2d_u32",
-            dtype => crate::bail!("Metal avg_pool2d {dtype:?} not implemented"),
-        };
+        let name = conv_kernel_name(ConvKernel::AVG_POOL2D, self.dtype, "avg_pool2d")?;
         let out_w = (width - w_k) / w_stride + 1;
         let out_h = (height - h_k) / h_stride + 1;
         let dst_el = out_w * out_h * b_size * channels;
@@ -1386,14 +1367,7 @@ impl BackendStorage for MetalStorage {
         let shape = inp_l.shape();
         let (b_size, channels, width, height) = shape.dims4()?;
         let strides = inp_l.stride();
-        let name = match self.dtype {
-            DType::F32 => "max_pool2d_f32",
-            DType::F16 => "max_pool2d_f16",
-            DType::BF16 => "max_pool2d_bf16",
-            DType::U8 => "max_pool2d_u8",
-            DType::U32 => "max_pool2d_u32",
-            dtype => crate::bail!("Metal max_pool2d {dtype:?} not implemented"),
-        };
+        let name = conv_kernel_name(ConvKernel::MAX_POOL2D, self.dtype, "max_pool2d")?;
         let out_w = (width - w_k) / w_stride + 1;
         let out_h = (height - h_k) / h_stride + 1;
         let dst_el = out_w * out_h * b_size * channels;
@@ -1436,14 +1410,11 @@ impl BackendStorage for MetalStorage {
         if dims.len() != 4 {
             crate::bail!("unexpected input shape for upsample {dims:?}")
         }
-        let name = match self.dtype {
-            DType::F32 => "upsample_nearest2d_f32",
-            DType::F16 => "upsample_nearest2d_f16",
-            DType::BF16 => "upsample_nearest2d_bf16",
-            DType::U8 => "upsample_nearest2d_u8",
-            DType::U32 => "upsample_nearest2d_u32",
-            dtype => crate::bail!("Metal upsample_nearest2d {dtype:?} not implemented"),
-        };
+        let name = conv_kernel_name(
+            ConvKernel::UPSAMPLE_NEAREST2D,
+            self.dtype,
+            "upsample_nearest2d",
+        )?;
 
         let dst_el = out_w * out_h * dims[0] * dims[1];
         let buffer = self
@@ -1487,14 +1458,11 @@ impl BackendStorage for MetalStorage {
             crate::bail!("unexpected input shape for upsample_bilinear2d {dims:?}")
         }
 
-        let name = match self.dtype {
-            DType::F32 => "upsample_bilinear2d_f32",
-            DType::F16 => "upsample_bilinear2d_f16",
-            DType::BF16 => "upsample_bilinear2d_bf16",
-            DType::U8 => "upsample_bilinear2d_u8",
-            DType::U32 => "upsample_bilinear2d_u32",
-            dtype => crate::bail!("Metal upsample_bilinear2d {dtype:?} not implemented"),
-        };
+        let name = conv_kernel_name(
+            ConvKernel::UPSAMPLE_BILINEAR2D,
+            self.dtype,
+            "upsample_bilinear2d",
+        )?;
 
         let dst_el = out_w * out_h * dims[0] * dims[1];
         let buffer = self

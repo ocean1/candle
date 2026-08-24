@@ -2491,3 +2491,116 @@ fn residency_set_batch_insert_remove() {
     set.remove_batch(std::iter::empty());
     assert_eq!(raw.allocationCount(), base);
 }
+
+/// Every name [`ConvKernel`] declares must exist in the compiled `conv.metal`
+/// library.
+///
+/// This is the check that makes the table in `conv_names.rs` load-bearing
+/// rather than decorative. The two sides — the `[[host_name]]` strings that
+/// `conv.metal`'s macros expand to, and the Rust strings callers pass to
+/// `load_pipeline` — were previously hand-synced with nothing comparing them,
+/// so a rename or a dtype added to one side only surfaced as a runtime
+/// `LoadFunctionError` in the middle of a forward pass.
+///
+/// `conv.metal` is compiled from source at runtime, so the library this test
+/// queries is the same one a real dispatch resolves against: the oracle is the
+/// actual compiled metallib, not a second copy of the list.
+#[test]
+fn conv_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let mut checked = 0usize;
+    for family in ConvKernel::ALL {
+        for (suffix, name) in family.variants() {
+            kernels
+                .load_pipeline(&device, Source::Conv, name)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "conv.metal has no kernel named {name:?} \
+                         (declared by ConvKernel::{} for {suffix:?}): {e:?}",
+                        family.stem(),
+                    )
+                });
+            checked += 1;
+        }
+    }
+
+    // Guards against the table being emptied or a family silently dropping all
+    // its variants — an all-green run over zero names would otherwise pass.
+    // 5 dtypes each for im2col1d, im2col, col2im1d, conv_transpose1d,
+    // upsample_nearest2d, upsample_bilinear2d, max_pool2d and avg_pool2d, plus
+    // 3 each for the float-only conv1d_depthwise and conv_transpose2d.
+    assert_eq!(
+        checked, 46,
+        "expected 46 declared conv variants, found {checked}"
+    );
+}
+
+/// Each declared name must be its family's stem followed by its dtype suffix,
+/// and each suffix must appear once per family.
+///
+/// The names are stored verbatim so they can be grepped against `conv.metal`,
+/// which means a row could pair one family's suffix with another family's name
+/// and still resolve — `conv_names_resolve` would pass while
+/// [`ConvKernel::name`] handed callers the wrong kernel. Checking the spelling
+/// against the stem closes that, and the duplicate check catches a copy-pasted
+/// row that shadows the one below it.
+#[test]
+fn conv_names_match_their_stem_and_suffix() {
+    for family in ConvKernel::ALL {
+        let mut seen: Vec<&str> = Vec::new();
+        for (suffix, name) in family.variants() {
+            assert_eq!(
+                name,
+                format!("{}_{suffix}", family.stem()),
+                "ConvKernel::{} declares {name:?} for {suffix:?}",
+                family.stem(),
+            );
+            assert!(
+                !seen.contains(&suffix),
+                "ConvKernel::{} declares {suffix:?} twice",
+                family.stem(),
+            );
+            seen.push(suffix);
+        }
+        assert!(
+            !seen.is_empty(),
+            "ConvKernel::{} declares no variants",
+            family.stem(),
+        );
+    }
+}
+
+/// A dtype a family does not declare must not produce a name.
+///
+/// `i64` and `f64` are instantiated nowhere in `conv.metal`, and the float-only
+/// families reject the integer suffixes. Returning `None` is what keeps an
+/// unsupported dtype from reaching `load_pipeline` as a string that will fail
+/// to resolve — the caller reports it against its own dtype enum instead.
+#[test]
+fn conv_undeclared_dtype_has_no_name() {
+    for family in ConvKernel::ALL {
+        for suffix in ["i64", "f64", "i32", "not_a_dtype"] {
+            assert_eq!(
+                family.name(suffix),
+                None,
+                "ConvKernel::{} named {suffix:?}, which conv.metal does not instantiate",
+                family.stem(),
+            );
+        }
+    }
+
+    // The float-only families specifically: `conv.metal` declares no integer
+    // instantiation for either, and both are on the LFM2 decode path.
+    assert_eq!(ConvKernel::CONV1D_DEPTHWISE.name("u8"), None);
+    assert_eq!(ConvKernel::CONV1D_DEPTHWISE.name("u32"), None);
+    assert_eq!(ConvKernel::CONV_TRANSPOSE2D.name("u8"), None);
+    assert_eq!(ConvKernel::CONV_TRANSPOSE2D.name("u32"), None);
+
+    // And the positive case, so the assertions above are not vacuous.
+    assert_eq!(
+        ConvKernel::CONV1D_DEPTHWISE.name("f16"),
+        Some("conv1d_depthwise_f16")
+    );
+}
