@@ -6,7 +6,7 @@ use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 use candle_metal_kernels::kernels::binary::contiguous;
 use candle_metal_kernels::{
-    metal::{Buffer, Commands, Device, ResidencySet},
+    metal::{Buffer, BufferPool, Commands, Device, PooledBuffer, ResidencySet},
     BufferOffset, CallConvTranspose2dCfg, ConvKernel, Kernels, RESOURCE_OPTIONS,
 };
 use objc2_foundation::NSRange;
@@ -14,7 +14,6 @@ use objc2_foundation::NSRange;
 use objc2_foundation::NSString;
 #[cfg(feature = "metal-debug-labels")]
 use objc2_metal::MTLCommandQueue;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 
@@ -99,7 +98,7 @@ impl From<String> for MetalError {
 #[derive(Debug, Clone)]
 pub struct MetalStorage {
     /// The actual buffer containing the data.
-    buffer: Arc<Buffer>,
+    buffer: Arc<PooledBuffer>,
     /// a reference to the device owning this buffer
     device: MetalDevice,
     /// The count of allocated elements in the buffer
@@ -1973,7 +1972,7 @@ impl BackendStorage for MetalStorage {
 }
 
 impl MetalStorage {
-    pub fn new(buffer: Arc<Buffer>, device: MetalDevice, count: usize, dtype: DType) -> Self {
+    pub fn new(buffer: Arc<PooledBuffer>, device: MetalDevice, count: usize, dtype: DType) -> Self {
         Self {
             buffer,
             device,
@@ -2113,8 +2112,8 @@ impl BackendDevice for MetalDevice {
             id: DeviceId::new(),
             device,
             commands: Arc::new(commands),
-            buffers: Arc::new(RwLock::new(HashMap::new())),
-            private_buffers: Arc::new(RwLock::new(HashMap::new())),
+            buffers: BufferPool::new(),
+            private_buffers: BufferPool::new(),
             kernels,
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),

@@ -1,13 +1,13 @@
 use super::{GgmlDType, QStorage};
 use crate::backend::BackendStorage;
 use crate::{DType, Layout, MetalDevice, MetalStorage, Result, Shape, D};
-use candle_metal_kernels::metal::Buffer;
+use candle_metal_kernels::metal::{Buffer, PooledBuffer};
 use std::sync::Arc;
 
 pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
-    buffer: Arc<Buffer>,
+    buffer: Arc<PooledBuffer>,
 }
 
 impl QMetalStorage {

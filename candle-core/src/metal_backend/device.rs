@@ -4,8 +4,8 @@ use crate::{DType, Result};
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        BlitCommandsGuard, Buffer, BufferMap, Commands, CommandsGuard, Device, MTLResourceOptions,
-        ResidencySet,
+        BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
+        PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet,
     },
     Kernels,
 };
@@ -40,24 +40,25 @@ pub struct MetalDevice {
 
     pub(crate) commands: Arc<Commands>,
 
-    /// Simple allocator struct.
-    /// The buffers are stored in size buckets since ML tends to use similar shapes over and over.
-    /// We store the buffers in [`Arc`] because it's much faster than Obj-c internal ref counting
-    /// (could be linked to FFI communication overhead).
+    /// Shared-storage buffer pool (`RESOURCE_OPTIONS`), for buffers the CPU
+    /// also reads.
     ///
-    /// Whenever a buffer has a strong_count==1, we can reuse it, it means it was dropped in the
-    /// graph calculation, and only we the allocator kept a reference to it, therefore it's free
-    /// to be reused. However, in order for this to work, we need to guarantee the order of
-    /// operation, so that this buffer is not being used by another kernel at the same time.
-    /// Arc is the CPU reference count, it doesn't mean anything on the GPU side of things.
-    ///
-    /// Whenever we actually allocate a new buffer, we make a full sweep to clean up unused buffers
-    /// (strong_count = 1).
-    pub(crate) buffers: Arc<RwLock<BufferMap>>,
+    /// Buffers return themselves here when their last handle drops; see
+    /// [`candle_metal_kernels::metal::buffer_pool`]. Reclamation is automatic
+    /// and requires nothing of callers.
+    pub(crate) buffers: BufferPool,
 
-    /// Same as `buffers` but uses `PRIVATE_RESOURCE_OPTIONS` (StorageModePrivate on macOS).
-    /// Intermediate compute buffers don't need CPU access so Private avoids coherency overhead.
-    pub(crate) private_buffers: Arc<RwLock<BufferMap>>,
+    /// Private-storage pool (`PRIVATE_RESOURCE_OPTIONS`, StorageModePrivate on
+    /// macOS). Intermediate compute buffers do not need CPU access, so Private
+    /// avoids coherency overhead.
+    ///
+    /// Despite the name this is the *activation* path, and it is where reuse
+    /// matters most: it takes every intermediate a forward pass produces. It
+    /// also holds the resident weights, because `to_dtype` on load allocates
+    /// through it -- but those are held by live tensors for the process
+    /// lifetime, so they are never in the free list and never looked at by a
+    /// lookup. Reclaimability separates them, not pool identity.
+    pub(crate) private_buffers: BufferPool,
 
     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
     /// Heavily used by [`candle_metal_kernels`]
@@ -128,30 +129,39 @@ impl MetalDevice {
         &self.device
     }
 
-    fn drop_unused_buffers(&self) -> Result<()> {
-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-        for subbuffers in buffers.values_mut() {
-            subbuffers.retain(|s| {
-                if Arc::strong_count(s) == 1 {
-                    self.residency_set.remove(s);
-                    false
-                } else {
-                    true
-                }
-            });
+    /// Destroys every buffer currently sitting in a free list.
+    ///
+    /// This is the old `drop_unused_buffers` sweep, and the change is that it
+    /// is no longer on the allocation path. It used to run on every
+    /// `wait_until_completed`, walking every buffer in both pools to discover
+    /// by `strong_count` which had become free -- so the pool oscillated
+    /// between growing and being swept, and the sweep *destroyed* buffers that
+    /// would immediately be re-created by the next allocation.
+    ///
+    /// Now a free buffer is already known to be free, so this exists only to
+    /// hand memory back under pressure. Nothing calls it on the hot path.
+    pub fn trim_unused_buffers(&self) {
+        for buffer in self.buffers.trim() {
+            self.residency_set.remove(&buffer);
         }
-        let mut private_buffers = self.private_buffers.write().map_err(MetalError::from)?;
-        for subbuffers in private_buffers.values_mut() {
-            subbuffers.retain(|s| {
-                if Arc::strong_count(s) == 1 {
-                    self.residency_set.remove(s);
-                    false
-                } else {
-                    true
-                }
-            });
+        for buffer in self.private_buffers.trim() {
+            self.residency_set.remove(&buffer);
         }
-        Ok(())
+    }
+
+    /// Scan and reuse counters for both pools. See `buffer_pool`.
+    pub fn pool_counters(&self) -> (PoolCounters, PoolCounters) {
+        (self.buffers.counters(), self.private_buffers.counters())
+    }
+
+    pub fn reset_pool_counters(&self) {
+        self.buffers.reset_counters();
+        self.private_buffers.reset_counters();
+    }
+
+    /// Live and free occupancy for both pools, shared first.
+    pub fn pool_occupancy(&self) -> (PoolOccupancySnapshot, PoolOccupancySnapshot) {
+        (self.buffers.occupancy(), self.private_buffers.occupancy())
     }
 
     pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
@@ -171,8 +181,10 @@ impl MetalDevice {
         self.commands
             .wait_until_completed()
             .map_err(MetalError::from)?;
-
-        self.drop_unused_buffers()?;
+        // No sweep here any more. Buffers freed while this was waiting have
+        // already returned themselves to their pool, so there is nothing to
+        // discover -- and destroying them, which is what the sweep did, only
+        // forced the next allocation to re-create them.
         Ok(())
     }
 
@@ -181,8 +193,6 @@ impl MetalDevice {
         self.commands
             .flush_and_wait_current()
             .map_err(MetalError::from)?;
-
-        self.drop_unused_buffers()?;
         Ok(())
     }
 
@@ -224,23 +234,18 @@ impl MetalDevice {
         element_count: usize,
         dtype: DType,
         _name: &str,
-    ) -> Result<Arc<Buffer>> {
+    ) -> Result<Arc<PooledBuffer>> {
         let size = element_count * dtype.size_in_bytes();
-        let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, &buffers) {
-            return Ok(b.clone());
+        if let Some(b) = self.private_buffers.acquire(size) {
+            return Ok(b);
         }
         let size = buf_size(size);
-        let subbuffers = buffers.entry(size).or_insert(vec![]);
-
         let new_buffer = self
             .device
             .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
-        subbuffers.push(new_buffer.clone());
-        Ok(new_buffer)
+        Ok(self.private_buffers.adopt(new_buffer, size))
     }
 
     /// Creates a new private buffer (not necessarily zeroed).
@@ -251,38 +256,37 @@ impl MetalDevice {
         element_count: usize,
         dtype: DType,
         _name: &str,
-    ) -> Result<Arc<Buffer>> {
+    ) -> Result<Arc<PooledBuffer>> {
         let size = element_count * dtype.size_in_bytes();
         let buffer = self
             .device
             .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        let buffer = Arc::new(buffer);
         self.residency_set.insert(&buffer);
-        Ok(buffer)
+        // Deliberately not pooled: this exists for persistent buffers, so it
+        // returns a handle with no pool behind it. Dropping it frees the buffer
+        // outright rather than offering it for reuse.
+        Ok(Arc::new(PooledBuffer::unpooled(buffer, size)))
     }
 
     /// Creates a new buffer from data.
     ///
     /// Does not require synchronization, as [newBufferWithBytes](https://developer.apple.com/documentation/metal/mtldevice/1433429-newbufferwithbytes)
     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
-    pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
+    pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
         let size = core::mem::size_of_val(data);
         let new_buffer = self
             .device
             .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-
-        let subbuffers = buffers.entry(size).or_insert(vec![]);
-
-        let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
-        subbuffers.push(new_buffer.clone());
-        Ok(new_buffer)
+        // Adopted at its exact size rather than an aligned one: this buffer was
+        // created by `newBufferWithBytes`, so its length is `size`, and that is
+        // the bucket a later request must find it in.
+        Ok(self.buffers.adopt(new_buffer, size))
     }
 
-    pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {
+    pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<PooledBuffer>> {
         let buffer = self.allocate_buffer(size_in_bytes)?;
         let mut blit = self.blit_command_encoder()?;
         blit.set_label("zeros");
@@ -307,23 +311,17 @@ impl MetalDevice {
     }
 
     /// The critical allocator algorithm
-    pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, &buffers) {
-            // Cloning also ensures we increment the strong count
-            return Ok(b.clone());
+    pub fn allocate_buffer(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+        if let Some(b) = self.buffers.acquire(size) {
+            return Ok(b);
         }
         let size = buf_size(size);
-        let subbuffers = buffers.entry(size).or_insert(vec![]);
-
         let new_buffer = self
             .device
             .new_buffer(size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
-        subbuffers.push(new_buffer.clone());
-        Ok(new_buffer)
+        Ok(self.buffers.adopt(new_buffer, size))
     }
 
     /// Create a metal GPU capture trace on [`path`].
@@ -386,7 +384,7 @@ fn buffer_label(buffer: &Buffer, label: Option<&str>) {
 #[inline]
 fn buffer_label(_buffer: &Buffer, _label: Option<&str>) {}
 
-type DataUpload<'a> = Box<dyn FnOnce(&MetalDevice) -> Result<Arc<Buffer>> + 'a>;
+type DataUpload<'a> = Box<dyn FnOnce(&MetalDevice) -> Result<Arc<PooledBuffer>> + 'a>;
 
 enum BufferInit<'a> {
     Typed { elem_count: usize, dtype: DType },
@@ -461,7 +459,7 @@ impl<'a> ReadyBufferBuilder<'a> {
         self
     }
 
-    pub fn build(self) -> Result<Arc<Buffer>> {
+    pub fn build(self) -> Result<Arc<PooledBuffer>> {
         let buffer = match self.init {
             BufferInit::Typed { elem_count, dtype } => {
                 self.device.new_buffer(elem_count, dtype, "")?
@@ -516,20 +514,4 @@ mod tests {
         // 2-byte buffer. It must not be rounded down.
         assert!(buf_size(2) >= 2);
     }
-}
-
-fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
-    let mut best_buffer: Option<&Arc<Buffer>> = None;
-    let mut best_buffer_size = usize::MAX;
-    for (buffer_size, subbuffers) in buffers.iter() {
-        if buffer_size >= &size && buffer_size < &best_buffer_size {
-            for sub in subbuffers {
-                if Arc::strong_count(sub) == 1 {
-                    best_buffer = Some(sub);
-                    best_buffer_size = *buffer_size;
-                }
-            }
-        }
-    }
-    best_buffer.cloned()
 }

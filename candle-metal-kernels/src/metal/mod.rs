@@ -1,4 +1,5 @@
 pub mod buffer;
+pub mod buffer_pool;
 pub mod command_buffer;
 pub mod commands;
 pub mod compute_pipeline;
@@ -9,6 +10,7 @@ pub mod library;
 pub mod residency_set;
 
 pub use buffer::*;
+pub use buffer_pool::*;
 pub use command_buffer::*;
 pub use commands::*;
 pub use compute_pipeline::*;
