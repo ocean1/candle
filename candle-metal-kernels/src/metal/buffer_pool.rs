@@ -254,6 +254,12 @@ pub struct PoolCounters {
     pub drained: u64,
     /// Buffers currently parked waiting for the GPU.
     pub pending: u64,
+    /// PROBE (issue #23): hits that handed back a buffer whose epoch had not
+    /// completed. The acceptance criterion is that this stays 0.
+    pub probe_hits_with_pending_writer: u64,
+    /// PROBE (issue #23): hits with no recorded release epoch, which would mean
+    /// a buffer reached a free list without passing through the pending list.
+    pub probe_hits_without_epoch: u64,
 }
 
 struct PoolState {
@@ -286,6 +292,11 @@ struct PoolState {
     /// nothing has to sort it.
     pending: std::collections::VecDeque<PendingBuffer>,
 
+    /// PROBE (issue #23): buffer ptr -> the epoch it was waiting on when it
+    /// entered a free list. Read by `acquire` to check that the epoch really
+    /// had completed. Not part of the fix; this branch is instrumentation.
+    released_epoch: std::collections::HashMap<usize, u64>,
+
     counters: PoolCounters,
 }
 
@@ -312,6 +323,7 @@ impl PoolInner {
                 live_buffers: 0,
                 live_bytes: 0,
                 pending: std::collections::VecDeque::new(),
+                released_epoch: std::collections::HashMap::new(),
                 counters: PoolCounters::default(),
             }),
             clock,
@@ -380,6 +392,11 @@ impl PoolInner {
                 .pending
                 .pop_front()
                 .expect("front() just returned Some");
+            // PROBE (issue #23): remember which epoch this buffer was waiting
+            // on, so `acquire` can check the GPU really had finished with it.
+            state
+                .released_epoch
+                .insert(entry.buffer.raw_ptr() as usize, entry.epoch);
             state.free.entry(entry.size).or_default().push(entry.buffer);
             drained += 1;
         }
@@ -467,6 +484,28 @@ impl BufferPool {
         };
 
         let (buffer, bucket_size) = found?;
+
+        // PROBE (issue #23): the acceptance criterion. Issue #19 measured 17406
+        // of 17409 hits handing back a buffer whose last writer had not
+        // completed; this counts the same thing. `is_complete` is asked *now*,
+        // at the moment the buffer is handed out, not when it was released.
+        {
+            let ptr = buffer.raw_ptr() as usize;
+            let epoch = state.released_epoch.remove(&ptr);
+            let outstanding = match epoch {
+                Some(e) => !self.inner.clock.is_complete(e),
+                // No record means it never went through the pending list, which
+                // should not happen for a hit. Counted separately rather than
+                // silently treated as safe.
+                None => {
+                    state.counters.probe_hits_without_epoch += 1;
+                    false
+                }
+            };
+            if outstanding {
+                state.counters.probe_hits_with_pending_writer += 1;
+            }
+        }
 
         // Drop the key when its bucket empties. This is what stops the map
         // from becoming a graveyard: the old pool's `retain` cleared a bucket's
