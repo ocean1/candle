@@ -517,7 +517,33 @@ fn main() -> Result<()> {
 /// walked": how many size buckets a lookup had to look at. It is the scan
 /// length, and it is the quantity issue #21 is about -- wall-clock hides it
 /// (`DESIGN.md` §6.7 §9).
+/// Resident set size of this process, in bytes.
+///
+/// Pool accounting alone cannot answer the footprint question: a buffer the
+/// pool has stopped tracking may still be resident, because the residency set
+/// holds a retain on everything registered with it. So the honest measure of
+/// "did the memory actually go back" is what the OS thinks the process is
+/// using, which is what issue #8's 7731 -> 5509 MB figure was about.
+fn process_rss_bytes() -> u64 {
+    // `ps` rather than a crate: one process spawn, once per phase, off any
+    // measured path.
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p"])
+        .arg(std::process::id().to_string())
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
 fn report_pool(device: &candle::MetalDevice, label: &str, phase: &str, decode_tokens: usize) {
+    println!(
+        "{phase}_rss label={label} rss_mb={:.1}",
+        process_rss_bytes() as f64 / (1024.0 * 1024.0)
+    );
+
     let (shared_c, private_c) = device.pool_counters();
     let (shared_o, private_o) = device.pool_occupancy();
 
