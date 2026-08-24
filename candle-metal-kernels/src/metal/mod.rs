@@ -14,6 +14,7 @@ pub mod fence;
 mod icb_tests;
 pub mod library;
 pub mod residency_set;
+pub mod trace;
 
 pub use arena::*;
 pub use buffer::*;
