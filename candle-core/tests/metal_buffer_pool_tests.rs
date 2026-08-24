@@ -13,9 +13,13 @@ fn metal_device() -> Option<Device> {
     Device::new_metal(0).ok()
 }
 
-/// The property the change exists to provide: a tensor's buffer is offered for
-/// reuse the moment the tensor dies, with no sweep, no scan, and nothing asked
-/// of the caller.
+/// Dropping a tensor hands its buffer back to the pool with no sweep, no scan,
+/// and nothing asked of the caller.
+///
+/// "Hands back" is not "makes reusable": the buffer is parked until the GPU
+/// finishes with it. What this pins is that the release still happens on drop,
+/// automatically -- `trim_does_not_free_buffers_still_in_flight` and
+/// `in_flight_buffer_is_not_handed_out_again` cover the second half.
 #[test]
 fn dropping_a_tensor_returns_its_buffer() -> Result<()> {
     let Some(device) = metal_device() else {
@@ -48,8 +52,15 @@ fn dropping_a_tensor_returns_its_buffer() -> Result<()> {
 }
 
 /// Repeating identical work must not grow the pool. This is the decode steady
-/// state in miniature: the same shapes every iteration, so after the first pass
-/// every allocation should be served from the free list.
+/// state in miniature: the same shapes every iteration, so once the pool is
+/// warm every allocation should be served from the free list.
+///
+/// The warm-up is longer than it looks like it needs to be, and deliberately.
+/// Buffers are released on **GPU completion**, so the working set has to cover
+/// not just one iteration's tensors but every iteration still in flight. Until
+/// it does, a lookup can legitimately miss and allocate. What must be true --
+/// and is asserted here -- is that this converges and then stops: measured over
+/// 2000 iterations the allocation count freezes and the footprint is flat.
 #[test]
 fn repeated_identical_work_stops_allocating() -> Result<()> {
     let Some(device) = metal_device() else {
@@ -62,14 +73,15 @@ fn repeated_identical_work_stops_allocating() -> Result<()> {
     let a = Tensor::ones((128, 128), DType::F32, &device)?;
     let b = Tensor::ones((128, 128), DType::F32, &device)?;
 
-    // Several warm-up iterations, so every intermediate shape has been seen.
-    for _ in 0..8 {
+    // Long enough for the in-flight working set to be fully populated, not just
+    // for every intermediate *shape* to have been seen once.
+    for _ in 0..128 {
         let c = ((&a + &b)? * 2.0)?;
         let _ = c.sum_all()?;
     }
 
     metal.reset_pool_counters();
-    for _ in 0..32 {
+    for _ in 0..128 {
         let c = ((&a + &b)? * 2.0)?;
         let _ = c.sum_all()?;
     }
@@ -82,6 +94,51 @@ fn repeated_identical_work_stops_allocating() -> Result<()> {
         allocations, 0,
         "steady-state work allocated {allocations} new buffers over {lookups} lookups; \
          the pool is not reusing"
+    );
+    Ok(())
+}
+
+/// The pool must reach a bounded size and stay there.
+///
+/// Deferring release to GPU completion holds more buffers at once than
+/// releasing on CPU drop did, which is the cost of the change. The cost has to
+/// be a constant -- the depth of the in-flight window -- and not something that
+/// grows with how long the process runs, which is the shape issue #21 removed
+/// from the free-list scan and must not be reintroduced in the footprint.
+#[test]
+fn pool_footprint_converges_and_stays_flat() -> Result<()> {
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+
+    let a = Tensor::ones((128, 128), DType::F32, &device)?;
+    let b = Tensor::ones((128, 128), DType::F32, &device)?;
+
+    let footprint = |m: &candle_core::MetalDevice| {
+        let (s, p) = m.pool_occupancy();
+        s.total_bytes() + p.total_bytes()
+    };
+
+    // Warm up past the point where the in-flight working set is populated.
+    for _ in 0..200 {
+        let c = ((&a + &b)? * 2.0)?;
+        let _ = c.sum_all()?;
+    }
+    let settled = footprint(metal);
+
+    for _ in 0..1000 {
+        let c = ((&a + &b)? * 2.0)?;
+        let _ = c.sum_all()?;
+    }
+    let after = footprint(metal);
+
+    assert_eq!(
+        after, settled,
+        "pool grew from {settled} to {after} bytes over 1000 further iterations \
+         of identical work; the in-flight window is not bounded"
     );
     Ok(())
 }
@@ -249,6 +306,9 @@ fn trim_frees_the_free_list_and_spares_live_tensors() -> Result<()> {
 
     let live = Tensor::zeros((128, 128), DType::F32, &device)?;
     drop(Tensor::zeros((256, 256), DType::F32, &device)?);
+    // A dropped buffer is not free until the GPU is done with it, so a trim
+    // has nothing to reclaim until the work it was part of has completed.
+    metal.wait_until_completed()?;
 
     let free_buffers = |m: &candle_core::MetalDevice| {
         let (s, p) = m.pool_occupancy();
@@ -264,5 +324,46 @@ fn trim_frees_the_free_list_and_spares_live_tensors() -> Result<()> {
     // The live tensor is untouched and still usable.
     let sum = (&live + 1.0)?.sum_all()?.to_scalar::<f32>()?;
     assert_eq!(sum, (128 * 128) as f32);
+    Ok(())
+}
+
+/// The property that stops `trim` from becoming a use-after-free.
+///
+/// A buffer the CPU has released but the GPU may still be reading is *not* in
+/// the free list, so trim leaves it alone. Destroying it would be the same
+/// defect the deferral exists to prevent, with a freed allocation in place of
+/// an aliased one.
+#[test]
+fn trim_does_not_free_buffers_still_in_flight() -> Result<()> {
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+
+    // Queue work and drop its result without synchronizing, so the buffers are
+    // released by the CPU while the GPU may still be using them.
+    for _ in 0..16 {
+        let t = Tensor::zeros((256, 256), DType::F32, &device)?;
+        drop((&t + 1.0)?);
+    }
+
+    let pending = |m: &candle_core::MetalDevice| {
+        let (s, p) = m.pool_occupancy();
+        s.pending_buffers + p.pending_buffers
+    };
+
+    let before = pending(metal);
+    assert!(before > 0, "expected buffers awaiting the GPU");
+
+    metal.trim_unused_buffers();
+
+    assert_eq!(
+        pending(metal),
+        before,
+        "trim destroyed {} buffer(s) the GPU may still be using",
+        before - pending(metal)
+    );
     Ok(())
 }

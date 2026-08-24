@@ -95,6 +95,20 @@ impl CommandBuffer {
     pub fn wait_until_completed(&self) {
         self.raw.waitUntilCompleted();
     }
+
+    /// Run `f` once this command buffer has completed on the GPU.
+    ///
+    /// Must be called before `commit`: Metal rejects handlers added to a buffer
+    /// that has already been committed.
+    pub fn on_completion<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        use block2::RcBlock;
+        use std::ptr::NonNull;
+
+        let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| f());
+        // SAFETY: `addCompletedHandler` copies the block, and `RcBlock` keeps it
+        // alive until Metal releases it. The block captures only owned state.
+        unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
+    }
 }
 
 impl AsRef<ProtocolObject<dyn MTLCommandBuffer>> for CommandBuffer {
