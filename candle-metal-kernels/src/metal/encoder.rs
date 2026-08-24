@@ -98,16 +98,28 @@ impl ComputeCommandEncoder {
     /// encoder already records every buffer it binds, so the wait can be
     /// limited to buffers this encoder actually touches.
     fn wait_for_buffer(&self, ptr: usize) {
-        let fence = {
+        use crate::metal::profile::{record_bind_probe, BindProbeOutcome};
+
+        let (fence, map_len) = {
             let map = self.prev_ce_outputs.lock().unwrap();
-            map.get(&ptr).cloned()
+            // Read the length under the lock the probe already holds, so the
+            // instrumentation adds no synchronization of its own. `len` on a
+            // `HashMap` is a field read.
+            (map.get(&ptr).cloned(), map.len())
         };
-        let Some(fence) = fence else { return };
+        let Some(fence) = fence else {
+            record_bind_probe(map_len, BindProbeOutcome::NoPendingWriter);
+            return;
+        };
 
         let mut state = self.state.lock().unwrap();
         if state.waited_fences.insert(Arc::as_ptr(&fence) as usize) {
             drop(state);
             self.raw.waitForFence(fence.raw());
+            record_bind_probe(map_len, BindProbeOutcome::Waited);
+        } else {
+            drop(state);
+            record_bind_probe(map_len, BindProbeOutcome::AlreadyWaited);
         }
     }
 
@@ -142,6 +154,12 @@ impl ComputeCommandEncoder {
     #[inline]
     fn record_dispatch(&self) {
         if !crate::metal::profile::enabled() {
+            return;
+        }
+        // Without the inventory there is no name to fetch, so the state mutex
+        // and the `Arc` clone are both skipped and the count is one atomic.
+        if !crate::metal::profile::kernel_inventory_enabled() {
+            crate::metal::profile::record_dispatch("");
             return;
         }
         let name = {
@@ -222,7 +240,11 @@ impl ComputeCommandEncoder {
     /// Remember which kernel is bound, so the next dispatch can be attributed.
     #[inline]
     fn note_pipeline(&self, pipeline: &ComputePipeline) {
-        if !crate::metal::profile::enabled() {
+        // Gated on the inventory flag, not merely on profiling: `Arc::from(&str)`
+        // allocates and copies, once per pipeline bind, and the timing path has
+        // no use for the name. Attribution is opt-in so that measuring the
+        // per-bind cost is not itself a per-bind allocation.
+        if !crate::metal::profile::kernel_inventory_enabled() {
             return;
         }
         let name = pipeline.name().map(Arc::from);
@@ -294,6 +316,15 @@ pub struct BlitCommandEncoder {
     prev_ce_outputs: PrevCeOutputs,
     /// Buffer pointers written by this blit encoder (registered in global map at end_encoding).
     tracked_outputs: Vec<usize>,
+    /// Fences already waited on by this encoder, by identity.
+    ///
+    /// `Commands::blit_command_encoder` walks `live_fences` and waits on each
+    /// before handing the encoder out, so this records what that blanket wait
+    /// covered. A per-buffer wait can then tell whether it is adding an edge the
+    /// blanket wait already has, which is what distinguishes a redundant wait
+    /// from the blit-after-blit case `live_fences` cannot see (lloom #25).
+    /// Only populated when profiling; the wait itself is emitted regardless.
+    waited_fences: Vec<usize>,
 }
 
 impl AsRef<BlitCommandEncoder> for BlitCommandEncoder {
@@ -313,11 +344,16 @@ impl BlitCommandEncoder {
             fence,
             prev_ce_outputs,
             tracked_outputs: Vec::new(),
+            waited_fences: Vec::new(),
         }
     }
 
     /// Wait for a fence before continuing execution.
-    pub fn wait_for_fence(&self, fence: &Fence) {
+    pub fn wait_for_fence(&mut self, fence: &Fence) {
+        if crate::metal::profile::enabled() {
+            self.waited_fences
+                .push(fence.raw() as *const _ as *const () as usize);
+        }
         self.raw.waitForFence(fence.raw());
     }
 
@@ -347,8 +383,70 @@ impl BlitCommandEncoder {
         self.raw.setLabel(Some(&NSString::from_str(label)))
     }
 
-    /// Copy bytes from src to dst. Waits on any fence that wrote to src_buffer to ensure
-    /// correct ordering for HazardTrackingModeUntracked buffers.
+    /// Wait on the last writer of each of `ptrs`, skipping repeats.
+    ///
+    /// `Commands::blit_command_encoder` already waits on every fence in
+    /// `live_fences` before handing this encoder out, which covers every
+    /// *compute* encoder that has ended. It does not cover a prior *blit*:
+    /// `BlitCommandEncoder::end_encoding` registers its outputs in
+    /// `prev_ce_outputs` but never adds its fence to `live_fences`, so a
+    /// blit-after-blit dependency is visible only here. That gap is why these
+    /// per-buffer waits are not redundant with the blanket one (lloom #25).
+    ///
+    /// Distinct fences are waited on once. Metal tolerates a repeated
+    /// `waitForFence`, but two of the three call shapes below pass two buffers
+    /// that frequently share a writer, and the dedup keeps that from emitting a
+    /// redundant wait on the common path.
+    /// Returns, per input ptr, whether it had a registered writer and whether
+    /// that writer was *not* already covered by this encoder's blanket wait.
+    fn wait_for_last_writers(&mut self, ptrs: &[usize]) -> Vec<(bool, bool)> {
+        use objc2_metal::MTLBlitCommandEncoder as _;
+
+        let (fences, found): (Vec<Arc<Fence>>, Vec<(bool, bool)>) = {
+            let map = self.prev_ce_outputs.lock().unwrap();
+            let mut out: Vec<Arc<Fence>> = Vec::new();
+            let mut found = Vec::with_capacity(ptrs.len());
+            for ptr in ptrs {
+                match map.get(ptr) {
+                    Some(f) => {
+                        let raw = f.raw() as *const _ as *const () as usize;
+                        let covered = self.waited_fences.contains(&raw);
+                        if !out.iter().any(|seen| Arc::ptr_eq(seen, f)) {
+                            out.push(Arc::clone(f));
+                        }
+                        found.push((true, !covered));
+                    }
+                    None => found.push((false, false)),
+                }
+            }
+            (out, found)
+        };
+        for fence in fences {
+            let raw = fence.raw() as *const _ as *const () as usize;
+            if crate::metal::profile::enabled() && !self.waited_fences.contains(&raw) {
+                self.waited_fences.push(raw);
+            }
+            self.raw.waitForFence(fence.raw());
+        }
+        found
+    }
+
+    /// Copy bytes from src to dst, ordered after the last writer of *either*.
+    ///
+    /// The source wait is the obvious one: the copy reads it. The destination
+    /// wait matters because the destination of a copy is typically a buffer the
+    /// pool has just recycled, which is exactly the case where a pending writer
+    /// is likely -- and under `HazardTrackingModeUntracked` a missed dependency
+    /// corrupts silently rather than failing (`DESIGN.md` §3.5). `fill_buffer`
+    /// waits on its destination; this did not, and the asymmetry was not
+    /// deliberate (lloom #25).
+    ///
+    /// This does **not** fix lloom #19. That corruption is the buffer pool
+    /// aliasing two tensors onto one allocation while the first is in flight,
+    /// which no fence can see: at the aliasing instant no encoder has bound the
+    /// buffer, and by the time one does it looks freshly allocated
+    /// (`DESIGN.md` §2.3.8b). Measured in PR #20 at 11/30 unstable with and
+    /// without this wait.
     pub fn copy_from_buffer(
         &mut self,
         src_buffer: &Buffer,
@@ -358,16 +456,14 @@ impl BlitCommandEncoder {
         size: usize,
     ) {
         let src_ptr = src_buffer.raw_ptr() as usize;
-        let fence_to_wait = {
-            let map = self.prev_ce_outputs.lock().unwrap();
-            map.get(&src_ptr).cloned()
-        };
-        if let Some(fence) = fence_to_wait {
-            use objc2_metal::MTLBlitCommandEncoder as _;
-            self.raw.waitForFence(fence.raw());
-        }
+        let dst_ptr = dst_buffer.raw_ptr() as usize;
+        let found = self.wait_for_last_writers(&[src_ptr, dst_ptr]);
+        // found[1] is the destination: (had a writer, that writer was not
+        // already covered by the blanket `live_fences` wait).
+        let (dst_pending, dst_uncovered) = found.get(1).copied().unwrap_or((false, false));
+        crate::metal::profile::record_blit_copy(dst_pending, dst_uncovered);
 
-        self.tracked_outputs.push(dst_buffer.raw_ptr() as usize);
+        self.tracked_outputs.push(dst_ptr);
 
         unsafe {
             self.raw
@@ -383,14 +479,7 @@ impl BlitCommandEncoder {
 
     pub fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
         let ptr = buffer.raw_ptr() as usize;
-        let fence_to_wait = {
-            let map = self.prev_ce_outputs.lock().unwrap();
-            map.get(&ptr).cloned()
-        };
-        if let Some(fence) = fence_to_wait {
-            use objc2_metal::MTLBlitCommandEncoder as _;
-            self.raw.waitForFence(fence.raw());
-        }
+        self.wait_for_last_writers(&[ptr]);
         self.tracked_outputs.push(ptr);
 
         self.raw.fillBuffer_range_value(

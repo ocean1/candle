@@ -69,15 +69,143 @@ static COMMAND_BUFFERS: AtomicU64 = AtomicU64::new(0);
 /// dispatch count rather than being inferred from it.
 static ENCODERS: AtomicU64 = AtomicU64::new(0);
 
+// ---- per-bind fence probe (lloom issue #24) --------------------------------
+//
+// `ComputeCommandEncoder::wait_for_buffer` runs once per bound buffer, from
+// both `set_input_buffer` and `set_output_buffer`. Issue #24 asks which of its
+// five steps dominates: the map mutex, the lookup, the `Arc` clone on a hit,
+// the second mutex, and the `waited_fences` dedup.
+//
+// These are counts, not timers, and that is deliberate. A `Instant::now()` pair
+// costs 43 ns on this machine, measured, against a probe whose whole body is
+// tens of nanoseconds -- so timing each call would measure the timer
+// (`CONTRIBUTING.md` §3.2, `DESIGN.md` §2.4). Counting is one relaxed atomic
+// increment, and the per-operation cost comes from an isolated microbenchmark
+// where the timer can be amortized over a long loop instead.
+//
+// The three counters partition every call, so `binds == miss + dedup + wait`
+// is an invariant a reader can check rather than trust.
+
+/// Calls to `wait_for_buffer`, i.e. buffers bound. Both bind sites funnel here.
+static BIND_PROBES: AtomicU64 = AtomicU64::new(0);
+/// Probes that found no pending writer: one mutex, one failed lookup, return.
+/// The cheapest path, and the issue's hypothesis is that it is also the common
+/// one ("most binds hit buffers with no pending writer at all").
+static BIND_PROBE_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Probes that found a fence already waited on this encoder session: the full
+/// cost of a hit (mutex, lookup, `Arc` clone, second mutex, `HashSet` probe)
+/// for no emitted wait.
+static BIND_PROBE_DEDUPED: AtomicU64 = AtomicU64::new(0);
+/// Probes that emitted `waitForFence`. The only ones that produce a fence edge.
+static BIND_PROBE_WAITS: AtomicU64 = AtomicU64::new(0);
+/// Entries in `prev_ce_outputs` at the moment of a probe, summed, so the mean
+/// map size is available. The lookup is a hash probe, so this does not set its
+/// cost -- it bounds how much memory the probe touches, and it is the figure
+/// that grew without bound in the issue #2 defect this map replaced.
+static BIND_PROBE_MAP_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Record one `wait_for_buffer` call and which of its three outcomes it took.
+///
+/// `map_len` is the size of `prev_ce_outputs` as observed under the lock that
+/// the probe already holds, so reading it adds no synchronization.
+#[inline]
+pub fn record_bind_probe(map_len: usize, outcome: BindProbeOutcome) {
+    if !enabled() {
+        return;
+    }
+    BIND_PROBES.fetch_add(1, Ordering::Relaxed);
+    BIND_PROBE_MAP_ENTRIES.fetch_add(map_len as u64, Ordering::Relaxed);
+    match outcome {
+        BindProbeOutcome::NoPendingWriter => &BIND_PROBE_MISSES,
+        BindProbeOutcome::AlreadyWaited => &BIND_PROBE_DEDUPED,
+        BindProbeOutcome::Waited => &BIND_PROBE_WAITS,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Which path a `wait_for_buffer` call took. Exhaustive: every call is one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindProbeOutcome {
+    /// No entry in `prev_ce_outputs` for this buffer.
+    NoPendingWriter,
+    /// A fence was found, but this encoder session had already waited on it.
+    AlreadyWaited,
+    /// A fence was found and `waitForFence` was emitted.
+    Waited,
+}
+
+// ---- blit destination wait (lloom issue #25) -------------------------------
+//
+// `copy_from_buffer` waited on its source but not its destination, where
+// `fill_buffer` waited on its destination. These count how often the added
+// destination wait finds a pending writer at all, so "is this edge ever
+// live?" is answered by measurement rather than by argument.
+
+/// `copy_from_buffer` calls.
+static BLIT_COPIES: AtomicU64 = AtomicU64::new(0);
+/// Of those, calls whose destination had a registered last writer.
+static BLIT_COPY_DST_PENDING: AtomicU64 = AtomicU64::new(0);
+/// Of those, calls whose destination writer was a *blit* fence -- the case the
+/// blanket `live_fences` wait in `blit_command_encoder` does not cover, because
+/// `BlitCommandEncoder::end_encoding` never registers its fence there.
+static BLIT_COPY_DST_UNCOVERED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one `copy_from_buffer` and what its destination wait found.
+#[inline]
+pub fn record_blit_copy(dst_had_writer: bool, dst_writer_uncovered: bool) {
+    if !enabled() {
+        return;
+    }
+    BLIT_COPIES.fetch_add(1, Ordering::Relaxed);
+    if dst_had_writer {
+        BLIT_COPY_DST_PENDING.fetch_add(1, Ordering::Relaxed);
+    }
+    if dst_writer_uncovered {
+        BLIT_COPY_DST_UNCOVERED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether the per-kernel dispatch inventory is wanted, read once.
+///
+/// Building it costs a `String` allocation and a `HashMap` probe *per
+/// dispatch* — 675 of each per decode token. Sampling the decode path showed
+/// that this is ~3.6 % of forward-pass CPU samples, which is the same order as
+/// the per-bind fence probe this profiler exists to measure. An instrument that
+/// large cannot sit inside the measurement of something that small
+/// (`CONTRIBUTING.md` §3.2, `DESIGN.md` §2.4), so the inventory is opt-in and
+/// off by default: `CANDLE_METAL_PROFILE=1` counts, and
+/// `CANDLE_METAL_PROFILE_KERNELS=1` additionally attributes.
+pub fn kernel_inventory_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CANDLE_METAL_PROFILE_KERNELS").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    })
+}
+
 /// Record that a dispatch was encoded, attributed to `label`.
+///
+/// The count is one relaxed atomic. The per-label attribution is skipped unless
+/// `CANDLE_METAL_PROFILE_KERNELS=1`, because it allocates.
 #[inline]
 pub fn record_dispatch(label: &str) {
     if !enabled() {
         return;
     }
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    if !kernel_inventory_enabled() {
+        return;
+    }
     let mut rec = recorder().lock().unwrap();
-    *rec.dispatches.entry(label.to_string()).or_insert(0) += 1;
+    // `entry` on a `&str` key still allocates on the miss path only; the
+    // repeated-label case that dominates decode takes the cheaper lookup.
+    if let Some(c) = rec.dispatches.get_mut(label) {
+        *c += 1;
+    } else {
+        rec.dispatches.insert(label.to_string(), 1);
+    }
 }
 
 /// Record that a compute encoder was opened.
@@ -161,6 +289,24 @@ pub struct Snapshot {
     pub gpu_span_s: f64,
     /// Dispatch counts by pipeline label, descending.
     pub by_label: Vec<(String, u64)>,
+    /// `wait_for_buffer` calls: one per bound buffer (lloom issue #24).
+    pub bind_probes: u64,
+    /// Of those, the ones that found no pending writer.
+    pub bind_probe_misses: u64,
+    /// Of those, the ones that found a fence already waited on this session.
+    pub bind_probe_deduped: u64,
+    /// Of those, the ones that emitted `waitForFence`. These are the fence
+    /// edges; none may be lost by an optimization (`DESIGN.md` §2.3.2).
+    pub bind_probe_waits: u64,
+    /// Mean entries in `prev_ce_outputs` when a probe ran.
+    pub bind_probe_mean_map_entries: f64,
+    /// `copy_from_buffer` calls (lloom issue #25).
+    pub blit_copies: u64,
+    /// Of those, calls whose destination had a registered last writer.
+    pub blit_copy_dst_pending: u64,
+    /// Of those, calls whose destination writer was not already covered by the
+    /// blanket `live_fences` wait -- the edge the added destination wait adds.
+    pub blit_copy_dst_uncovered: u64,
 }
 
 /// Take the current totals without clearing them.
@@ -178,6 +324,9 @@ pub fn snapshot() -> Snapshot {
         .collect();
     by_label.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+    let bind_probes = BIND_PROBES.load(Ordering::Relaxed);
+    let map_entries = BIND_PROBE_MAP_ENTRIES.load(Ordering::Relaxed);
+
     Snapshot {
         dispatches: DISPATCHES.load(Ordering::Relaxed),
         encoders: ENCODERS.load(Ordering::Relaxed),
@@ -187,6 +336,18 @@ pub fn snapshot() -> Snapshot {
         gpu_busy_union_s: union,
         gpu_span_s: span,
         by_label,
+        bind_probes,
+        bind_probe_misses: BIND_PROBE_MISSES.load(Ordering::Relaxed),
+        bind_probe_deduped: BIND_PROBE_DEDUPED.load(Ordering::Relaxed),
+        bind_probe_waits: BIND_PROBE_WAITS.load(Ordering::Relaxed),
+        bind_probe_mean_map_entries: if bind_probes == 0 {
+            0.0
+        } else {
+            map_entries as f64 / bind_probes as f64
+        },
+        blit_copies: BLIT_COPIES.load(Ordering::Relaxed),
+        blit_copy_dst_pending: BLIT_COPY_DST_PENDING.load(Ordering::Relaxed),
+        blit_copy_dst_uncovered: BLIT_COPY_DST_UNCOVERED.load(Ordering::Relaxed),
     }
 }
 
@@ -198,6 +359,14 @@ pub fn reset() {
     DISPATCHES.store(0, Ordering::Relaxed);
     ENCODERS.store(0, Ordering::Relaxed);
     COMMAND_BUFFERS.store(0, Ordering::Relaxed);
+    BIND_PROBES.store(0, Ordering::Relaxed);
+    BIND_PROBE_MISSES.store(0, Ordering::Relaxed);
+    BIND_PROBE_DEDUPED.store(0, Ordering::Relaxed);
+    BIND_PROBE_WAITS.store(0, Ordering::Relaxed);
+    BIND_PROBE_MAP_ENTRIES.store(0, Ordering::Relaxed);
+    BLIT_COPIES.store(0, Ordering::Relaxed);
+    BLIT_COPY_DST_PENDING.store(0, Ordering::Relaxed);
+    BLIT_COPY_DST_UNCOVERED.store(0, Ordering::Relaxed);
     let mut rec = recorder().lock().unwrap();
     rec.intervals.clear();
     rec.dispatches.clear();
@@ -304,5 +473,41 @@ mod tests {
     #[test]
     fn empty_is_zero() {
         assert_eq!(union_and_span(&mut []), (0.0, 0.0));
+    }
+
+    /// The three bind-probe outcomes must partition every call, so that
+    /// `probes == misses + deduped + waits` holds in the reported numbers. A
+    /// reader checking that sum is checking the instrumentation, not trusting
+    /// it, which is the point of reporting all four.
+    ///
+    /// Runs only when profiling is enabled, since the counters are inert
+    /// otherwise; the harness sets `CANDLE_METAL_PROFILE` before the first
+    /// `enabled()` call caches it.
+    #[test]
+    fn bind_probe_outcomes_partition_the_calls() {
+        if !enabled() {
+            // Not an skip-to-pass: with profiling off the counters are
+            // deliberately inert, and that is asserted instead.
+            record_bind_probe(7, BindProbeOutcome::Waited);
+            assert_eq!(BIND_PROBES.load(Ordering::Relaxed), 0);
+            return;
+        }
+        reset();
+        record_bind_probe(10, BindProbeOutcome::NoPendingWriter);
+        record_bind_probe(10, BindProbeOutcome::NoPendingWriter);
+        record_bind_probe(20, BindProbeOutcome::AlreadyWaited);
+        record_bind_probe(20, BindProbeOutcome::Waited);
+
+        let s = snapshot();
+        assert_eq!(s.bind_probes, 4);
+        assert_eq!(s.bind_probe_misses, 2);
+        assert_eq!(s.bind_probe_deduped, 1);
+        assert_eq!(s.bind_probe_waits, 1);
+        assert_eq!(
+            s.bind_probes,
+            s.bind_probe_misses + s.bind_probe_deduped + s.bind_probe_waits
+        );
+        assert_eq!(s.bind_probe_mean_map_entries, 15.0);
+        reset();
     }
 }

@@ -75,6 +75,14 @@ mod profile {
         pub gpu_busy_union_s: f64,
         pub gpu_span_s: f64,
         pub by_label: Vec<(String, u64)>,
+        pub bind_probes: u64,
+        pub bind_probe_misses: u64,
+        pub bind_probe_deduped: u64,
+        pub bind_probe_waits: u64,
+        pub bind_probe_mean_map_entries: f64,
+        pub blit_copies: u64,
+        pub blit_copy_dst_pending: u64,
+        pub blit_copy_dst_uncovered: u64,
     }
     pub fn enabled() -> bool {
         false
@@ -83,6 +91,26 @@ mod profile {
     pub fn snapshot() -> Snapshot {
         Snapshot::default()
     }
+}
+
+/// One token's per-bind fence-probe counts (lloom issue #24).
+///
+/// `probes` is one call to `ComputeCommandEncoder::wait_for_buffer`, i.e. one
+/// bound buffer, and the other three partition it: every probe either found no
+/// pending writer, found a fence this encoder had already waited on, or emitted
+/// a `waitForFence`. Reporting all four lets a reader check the partition
+/// instead of trusting the instrumentation.
+#[derive(Clone, Copy, Debug, Default)]
+struct BindCounts {
+    probes: u64,
+    misses: u64,
+    deduped: u64,
+    waits: u64,
+    mean_map_entries: f64,
+    /// `copy_from_buffer` calls and what their destination wait found (#25).
+    blit_copies: u64,
+    blit_dst_pending: u64,
+    blit_dst_uncovered: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -409,6 +437,10 @@ fn main() -> Result<()> {
 
     // Per token: (wall seconds, gpu busy seconds, dispatches).
     let mut steps: Vec<(f64, f64, u64)> = Vec::with_capacity(args.n);
+    // Per token, in the same order: the per-bind fence-probe counts (issue #24).
+    // Kept in a parallel vector rather than widened into the tuple above so the
+    // steady-state arithmetic that consumes `steps` is untouched.
+    let mut binds: Vec<BindCounts> = Vec::with_capacity(args.n);
     let mut tokens: Vec<u32> = Vec::with_capacity(args.n);
     let mut hit_eos = false;
     let mut last_token_kernels: Vec<(String, u64)> = Vec::new();
@@ -445,8 +477,19 @@ fn main() -> Result<()> {
             // after the loop there is nothing left to read. This is one token's
             // kernel mix, which is what the inventory should be.
             last_token_kernels = s.by_label.clone();
+            binds.push(BindCounts {
+                probes: s.bind_probes,
+                misses: s.bind_probe_misses,
+                deduped: s.bind_probe_deduped,
+                waits: s.bind_probe_waits,
+                mean_map_entries: s.bind_probe_mean_map_entries,
+                blit_copies: s.blit_copies,
+                blit_dst_pending: s.blit_copy_dst_pending,
+                blit_dst_uncovered: s.blit_copy_dst_uncovered,
+            });
             (s.gpu_busy_union_s, s.dispatches)
         } else {
+            binds.push(BindCounts::default());
             (0.0, 0)
         };
 
@@ -583,6 +626,88 @@ fn main() -> Result<()> {
             );
         }
         println!();
+
+        // ---- per-bind fence probe (lloom issue #24) ----------------------
+        //
+        // Counts only. The per-operation price comes from the `bind_cost`
+        // microbenchmark, because a timer pair costs ~43 ns against a probe
+        // body of the same order (`CONTRIBUTING.md` §3.2).
+        let steady_binds = &binds[warmup.min(binds.len())..];
+        if !steady_binds.is_empty() && steady_binds.iter().any(|b| b.probes > 0) {
+            let nb = steady_binds.len() as f64;
+            let probes = steady_binds.iter().map(|b| b.probes as f64).sum::<f64>() / nb;
+            let misses = steady_binds.iter().map(|b| b.misses as f64).sum::<f64>() / nb;
+            let deduped = steady_binds.iter().map(|b| b.deduped as f64).sum::<f64>() / nb;
+            let waits = steady_binds.iter().map(|b| b.waits as f64).sum::<f64>() / nb;
+            let map_entries = steady_binds.iter().map(|b| b.mean_map_entries).sum::<f64>() / nb;
+            let probe_min = steady_binds.iter().map(|b| b.probes).min().unwrap_or(0);
+            let probe_max = steady_binds.iter().map(|b| b.probes).max().unwrap_or(0);
+
+            println!("=== per-bind fence probe (issue #24) ===");
+            println!(
+                "wait_for_buffer calls {probes:.1} / token  (min {probe_min}, max {probe_max})"
+            );
+            if disp_mean > 0.0 {
+                println!("  per dispatch        {:.2}", probes / disp_mean);
+            }
+            let pct = |x: f64| {
+                if probes > 0.0 {
+                    100.0 * x / probes
+                } else {
+                    0.0
+                }
+            };
+            println!(
+                "  no pending writer   {misses:.1}  ({:.1}%)  -- one mutex, one failed lookup",
+                pct(misses)
+            );
+            println!(
+                "  hit, already waited {deduped:.1}  ({:.1}%)  -- full probe cost, no edge emitted",
+                pct(deduped)
+            );
+            println!(
+                "  waitForFence issued {waits:.1}  ({:.1}%)  -- the actual fence edges",
+                pct(waits)
+            );
+            println!("  mean map entries    {map_entries:.1}");
+
+            // lloom #25: how often the destination wait added to
+            // `copy_from_buffer` actually finds an edge. `uncovered` is the
+            // subset the blanket `live_fences` wait in `blit_command_encoder`
+            // does not already provide, i.e. the edge this change adds.
+            let copies = steady_binds
+                .iter()
+                .map(|b| b.blit_copies as f64)
+                .sum::<f64>()
+                / nb;
+            let dst_pending = steady_binds
+                .iter()
+                .map(|b| b.blit_dst_pending as f64)
+                .sum::<f64>()
+                / nb;
+            let dst_uncovered = steady_binds
+                .iter()
+                .map(|b| b.blit_dst_uncovered as f64)
+                .sum::<f64>()
+                / nb;
+            println!("  copy_from_buffer    {copies:.1} / token");
+            println!("    dst had a writer  {dst_pending:.1}");
+            println!("    of those, not already covered by the blanket wait  {dst_uncovered:.1}");
+            // The partition is an invariant of the instrumentation; print the
+            // check rather than asserting it, so a violation is visible in the
+            // artifact instead of aborting a 200-token run.
+            let sum = misses + deduped + waits;
+            println!(
+                "  partition check     {sum:.1} == {probes:.1}  {}",
+                if (sum - probes).abs() < 1e-9 {
+                    "ok"
+                } else {
+                    "MISMATCH"
+                }
+            );
+            println!();
+        }
+
         println!("=== roofline ===");
         println!("weights per token     {:.3} GB", weight_bytes as f64 / 1e9);
         if gpu_mean > 0.0 {
@@ -619,12 +744,31 @@ fn main() -> Result<()> {
             println!("{count:6}  {name}");
         }
         println!();
+    } else if profiling {
+        // Say so rather than leaving a silently absent section: the inventory
+        // costs a String allocation per dispatch, which is the same order as
+        // the per-bind costs this profile measures, so it is off by default.
+        println!(
+            "=== kernels in one decode token ===\n(off; \
+             set CANDLE_METAL_PROFILE_KERNELS=1 to attribute dispatches to kernels.\n\
+             It allocates per dispatch, so it is excluded from timed runs.)\n"
+        );
     }
+
+    let steady_binds = &binds[warmup.min(binds.len())..];
+    let nb = steady_binds.len().max(1) as f64;
+    let bind_mean = |f: fn(&BindCounts) -> u64| -> f64 {
+        steady_binds.iter().map(|b| f(b) as f64).sum::<f64>() / nb
+    };
 
     println!(
         "RESULT label={} n={} warmup={} wall_ms_per_token={:.4} gpu_ms_per_token={:.4} \
          nongpu_ms_per_token={:.4} dispatches_per_token={:.1} prefill_ms={:.2} \
-         prompt_tokens={} weight_bytes={} dtype={:?} hit_eos={} profiling={}",
+         prompt_tokens={} weight_bytes={} dtype={:?} hit_eos={} profiling={} \
+         bind_probes_per_token={:.1} bind_misses_per_token={:.1} \
+         bind_deduped_per_token={:.1} bind_waits_per_token={:.1} \
+         bind_mean_map_entries={:.1} blit_copies_per_token={:.1} \
+         blit_dst_pending_per_token={:.1} blit_dst_uncovered_per_token={:.1}",
         args.label,
         args.n,
         warmup,
@@ -638,6 +782,14 @@ fn main() -> Result<()> {
         dtype,
         hit_eos,
         profiling,
+        bind_mean(|b| b.probes),
+        bind_mean(|b| b.misses),
+        bind_mean(|b| b.deduped),
+        bind_mean(|b| b.waits),
+        steady_binds.iter().map(|b| b.mean_map_entries).sum::<f64>() / nb,
+        bind_mean(|b| b.blit_copies),
+        bind_mean(|b| b.blit_dst_pending),
+        bind_mean(|b| b.blit_dst_uncovered),
     );
 
     Ok(())

@@ -217,12 +217,19 @@ impl Commands {
         }
 
         let fence = Arc::new(Fence::new(&self.device));
-        let encoder = state_guard
+        let mut encoder = state_guard
             .current
             .blit_command_encoder(&fence, &self.prev_ce_outputs);
 
         // Wait for all prior encoder fences before any blit commands execute.
         // Required for HazardTrackingModeUntracked: GPU caches are not auto-flushed.
+        //
+        // This covers every *compute* encoder that has ended, since
+        // `Commands::end_encoding` adds its fence to `live_fences`. It does not
+        // cover a prior *blit*: `BlitCommandEncoder::end_encoding` registers its
+        // outputs in `prev_ce_outputs` but never adds its fence here. The
+        // per-buffer waits in `copy_from_buffer` / `fill_buffer` close that
+        // gap, which is why they are not redundant with this one (lloom #25).
         {
             let fences = self.live_fences.lock().unwrap();
             for live in fences.iter() {
