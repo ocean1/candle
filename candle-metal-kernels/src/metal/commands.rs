@@ -187,6 +187,22 @@ impl Commands {
             .unwrap_or(false)
     }
 
+    /// Issue-19 probe: is this buffer currently bound in the OPEN encoder, i.e.
+    /// is the pool recycling a buffer that the encoder still being built is
+    /// going to read or write? `prev_ce_outputs` only knows about encoders that
+    /// have already ended, so this is the case no fence can cover.
+    pub fn probe_bound_in_open_encoder(&self, buffer: &Buffer) -> (bool, bool) {
+        let ptr = buffer.raw_ptr() as usize;
+        let state = self.state.lock().unwrap();
+        match state.current_encoder.as_ref() {
+            None => (false, false),
+            Some(enc) => {
+                let s = enc.state.lock().unwrap();
+                (s.all_inputs.contains(&ptr), s.all_outputs.contains(&ptr))
+            }
+        }
+    }
+
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
@@ -207,6 +223,15 @@ impl Commands {
             let enc = state_guard
                 .current
                 .compute_command_encoder(&fence, &self.prev_ce_outputs);
+            // ISSUE-19 EXPERIMENT ONLY: restore upstream's blanket wait on every
+            // live fence at encoder creation, on top of the per-buffer waits.
+            // If the corruption survives this, the defect is not the narrowing.
+            if std::env::var("ISSUE19_BLANKET_WAIT").is_ok() {
+                let fences = self.live_fences.lock().unwrap();
+                for live in fences.iter() {
+                    enc.wait_for_fence(&live.fence);
+                }
+            }
             state_guard.current_encoder = Some(enc);
         }
 
@@ -369,7 +394,21 @@ impl Commands {
 
         let all_outputs = {
             let s = encoder.state.lock().unwrap();
-            s.all_outputs.clone()
+            // ISSUE-19 EXPERIMENT: a buffer this encoder only READ is never in
+            // all_outputs, so it is never registered in prev_ce_outputs. When
+            // the pool recycles it (CPU strong_count == 1) while this encoder's
+            // read is still in flight, the next encoder that WRITES it finds no
+            // fence to wait on -- a write-after-read hazard across encoders that
+            // neither the per-buffer wait nor upstream's blanket wait can see,
+            // because both only ever track writers. Registering readers under
+            // this encoder's fence closes that edge.
+            if std::env::var("ISSUE19_TRACK_READS").is_ok() {
+                let mut both = s.all_outputs.clone();
+                both.extend(s.all_inputs.iter().copied());
+                both
+            } else {
+                s.all_outputs.clone()
+            }
         };
 
         {

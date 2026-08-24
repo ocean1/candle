@@ -165,6 +165,13 @@ impl MetalDevice {
         if self.commands.probe_has_pending_writer(b) {
             reuse_probe::HITS_WITH_PENDING_WRITER.fetch_add(1, Ordering::Relaxed);
         }
+        let (read_open, written_open) = self.commands.probe_bound_in_open_encoder(b);
+        if read_open {
+            reuse_probe::HITS_READ_BY_OPEN_ENCODER.fetch_add(1, Ordering::Relaxed);
+        }
+        if written_open {
+            reuse_probe::HITS_WRITTEN_BY_OPEN_ENCODER.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
@@ -534,6 +541,11 @@ mod tests {
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+    // ISSUE-19 EXPERIMENT: disable pool reuse entirely. If the corruption
+    // survives with every allocation fresh, the buffer pool is not the cause.
+    if reuse_probe::NO_REUSE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
     for (buffer_size, subbuffers) in buffers.iter() {
@@ -557,22 +569,35 @@ pub mod reuse_probe {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     pub static ENABLED: AtomicBool = AtomicBool::new(false);
+    /// Issue-19 experiment: make `find_available_buffer` always miss.
+    pub static NO_REUSE: AtomicBool = AtomicBool::new(false);
     pub static POOL_HITS: AtomicUsize = AtomicUsize::new(0);
     pub static HITS_WITH_PENDING_WRITER: AtomicUsize = AtomicUsize::new(0);
+    /// Recycled while the still-open encoder has it bound as a read.
+    pub static HITS_READ_BY_OPEN_ENCODER: AtomicUsize = AtomicUsize::new(0);
+    /// Recycled while the still-open encoder has it bound as a write.
+    pub static HITS_WRITTEN_BY_OPEN_ENCODER: AtomicUsize = AtomicUsize::new(0);
 
     pub fn enable() {
         ENABLED.store(true, Ordering::Relaxed);
+        if std::env::var("ISSUE19_NO_REUSE").is_ok() {
+            NO_REUSE.store(true, Ordering::Relaxed);
+        }
     }
 
-    pub fn snapshot() -> (usize, usize) {
+    pub fn snapshot() -> (usize, usize, usize, usize) {
         (
             POOL_HITS.load(Ordering::Relaxed),
             HITS_WITH_PENDING_WRITER.load(Ordering::Relaxed),
+            HITS_READ_BY_OPEN_ENCODER.load(Ordering::Relaxed),
+            HITS_WRITTEN_BY_OPEN_ENCODER.load(Ordering::Relaxed),
         )
     }
 
     pub fn reset() {
         POOL_HITS.store(0, Ordering::Relaxed);
         HITS_WITH_PENDING_WRITER.store(0, Ordering::Relaxed);
+        HITS_READ_BY_OPEN_ENCODER.store(0, Ordering::Relaxed);
+        HITS_WRITTEN_BY_OPEN_ENCODER.store(0, Ordering::Relaxed);
     }
 }

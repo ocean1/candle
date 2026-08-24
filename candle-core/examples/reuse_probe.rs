@@ -61,14 +61,14 @@ fn main() -> candle_core::Result<()> {
                 .collect::<candle_core::Result<Vec<_>>>()?;
             set.insert(digest(&Tensor::cat(&parts, 1)?)?);
         }
-        let (hits, pending) = reuse_probe::snapshot();
+        let (hits, pending, read_open, written_open) = reuse_probe::snapshot();
         let pct = if hits == 0 {
             0.0
         } else {
             100.0 * pending as f64 / hits as f64
         };
         println!(
-            "{c:>6}  {:>8}  {hits:>10}  {pending:>24}  {pct:>6.1}%",
+            "{c:>6}  {:>8}  {hits:>10}  {pending:>24}  {pct:>6.1}%  open-read={read_open} open-write={written_open}",
             set.len()
         );
     }
