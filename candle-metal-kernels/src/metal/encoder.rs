@@ -313,8 +313,58 @@ impl BlitCommandEncoder {
         self.raw.setLabel(Some(&NSString::from_str(label)))
     }
 
-    /// Copy bytes from src to dst. Waits on any fence that wrote to src_buffer to ensure
-    /// correct ordering for HazardTrackingModeUntracked buffers.
+    /// Wait on the last writer of each of `ptrs`, emitting each distinct fence
+    /// once.
+    ///
+    /// `Commands::blit_command_encoder` already waits on every fence in
+    /// `live_fences` before handing this encoder out, which covers every
+    /// *compute* encoder that has ended. It does not cover a prior *blit*:
+    /// `end_encoding` below registers this encoder's outputs in
+    /// `prev_ce_outputs` but never adds its fence to `live_fences`. So a
+    /// blit-after-blit dependency is recorded only in the map, and consulting
+    /// the map here is what closes that gap.
+    ///
+    /// Metal tolerates a repeated `waitForFence`, but `copy_from_buffer` passes
+    /// two buffers that often share a writer, so the dedup avoids emitting the
+    /// same wait twice on the common path.
+    fn wait_for_last_writers(&self, ptrs: &[usize]) {
+        use objc2_metal::MTLBlitCommandEncoder as _;
+
+        let fences: Vec<Arc<Fence>> = {
+            let map = self.prev_ce_outputs.lock().unwrap();
+            let mut out: Vec<Arc<Fence>> = Vec::new();
+            for ptr in ptrs {
+                if let Some(f) = map.get(ptr) {
+                    if !out.iter().any(|seen| Arc::ptr_eq(seen, f)) {
+                        out.push(Arc::clone(f));
+                    }
+                }
+            }
+            out
+        };
+        for fence in fences {
+            self.raw.waitForFence(fence.raw());
+        }
+    }
+
+    /// Copy bytes from src to dst, ordered after the last writer of *either*.
+    ///
+    /// The source wait is the obvious one: the copy reads it. The destination
+    /// wait matters because a copy's destination is typically a buffer the pool
+    /// has just recycled, which is where a pending writer is most likely -- and
+    /// under `HazardTrackingModeUntracked` a missed dependency corrupts
+    /// silently rather than failing (`DESIGN.md` §3.5). The sibling
+    /// `fill_buffer` already waited on its destination; this did not, and the
+    /// asymmetry was not deliberate.
+    ///
+    /// Measured on LFM2 decode, the destination has a registered writer in 0 of
+    /// its calls, so this closes a hole rather than removing an observed bug.
+    ///
+    /// This does **not** fix the grouped-convolution corruption: that is the
+    /// buffer pool aliasing two tensors onto one in-flight allocation, which no
+    /// fence can observe -- at the aliasing instant no encoder has bound the
+    /// buffer, and by the time one does it looks freshly allocated
+    /// (`DESIGN.md` §2.3.8b). Measured at 11/30 unstable with and without.
     pub fn copy_from_buffer(
         &mut self,
         src_buffer: &Buffer,
@@ -324,16 +374,10 @@ impl BlitCommandEncoder {
         size: usize,
     ) {
         let src_ptr = src_buffer.raw_ptr() as usize;
-        let fence_to_wait = {
-            let map = self.prev_ce_outputs.lock().unwrap();
-            map.get(&src_ptr).cloned()
-        };
-        if let Some(fence) = fence_to_wait {
-            use objc2_metal::MTLBlitCommandEncoder as _;
-            self.raw.waitForFence(fence.raw());
-        }
+        let dst_ptr = dst_buffer.raw_ptr() as usize;
+        self.wait_for_last_writers(&[src_ptr, dst_ptr]);
 
-        self.tracked_outputs.push(dst_buffer.raw_ptr() as usize);
+        self.tracked_outputs.push(dst_ptr);
 
         unsafe {
             self.raw
@@ -349,14 +393,7 @@ impl BlitCommandEncoder {
 
     pub fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
         let ptr = buffer.raw_ptr() as usize;
-        let fence_to_wait = {
-            let map = self.prev_ce_outputs.lock().unwrap();
-            map.get(&ptr).cloned()
-        };
-        if let Some(fence) = fence_to_wait {
-            use objc2_metal::MTLBlitCommandEncoder as _;
-            self.raw.waitForFence(fence.raw());
-        }
+        self.wait_for_last_writers(&[ptr]);
         self.tracked_outputs.push(ptr);
 
         self.raw.fillBuffer_range_value(
