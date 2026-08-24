@@ -33,6 +33,9 @@ pub struct EncoderState {
     /// Fences already waited on this session, so a buffer bound repeatedly does
     /// not re-emit the same wait.
     pub waited_fences: HashSet<usize>,
+    /// Name of the pipeline most recently bound, so a dispatch can be attributed
+    /// to a kernel when profiling. Only populated when profiling is enabled.
+    pub current_pipeline: Option<Arc<str>>,
 }
 
 impl EncoderState {
@@ -46,6 +49,7 @@ impl EncoderState {
             all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
             waited_fences: HashSet::new(),
+            current_pipeline: None,
         }
     }
 }
@@ -113,6 +117,7 @@ impl ComputeCommandEncoder {
 
     pub fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
         self.auto_barrier();
+        self.record_dispatch();
         self.raw
             .dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup)
     }
@@ -123,10 +128,27 @@ impl ComputeCommandEncoder {
         threads_per_threadgroup: MTLSize,
     ) {
         self.auto_barrier();
+        self.record_dispatch();
         self.raw.dispatchThreadgroups_threadsPerThreadgroup(
             threadgroups_per_grid,
             threads_per_threadgroup,
         )
+    }
+
+    /// Attribute this dispatch to the currently bound pipeline, when profiling.
+    ///
+    /// Both dispatch entry points funnel through here so the count cannot drift
+    /// from the number of dispatches actually encoded.
+    #[inline]
+    fn record_dispatch(&self) {
+        if !crate::metal::profile::enabled() {
+            return;
+        }
+        let name = {
+            let s = self.state.lock().unwrap();
+            s.current_pipeline.clone()
+        };
+        crate::metal::profile::record_dispatch(name.as_deref().unwrap_or("<unnamed>"));
     }
 
     fn auto_barrier(&self) {
@@ -193,7 +215,18 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_compute_pipeline_state(&self, pipeline: &ComputePipeline) {
+        self.note_pipeline(pipeline);
         self.raw.setComputePipelineState(pipeline.as_ref());
+    }
+
+    /// Remember which kernel is bound, so the next dispatch can be attributed.
+    #[inline]
+    fn note_pipeline(&self, pipeline: &ComputePipeline) {
+        if !crate::metal::profile::enabled() {
+            return;
+        }
+        let name = pipeline.name().map(Arc::from);
+        self.state.lock().unwrap().current_pipeline = name;
     }
 
     /// Insert a memory barrier at buffers scope.
@@ -219,6 +252,7 @@ impl ComputeCommandEncoder {
 
     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
         use MTLComputeCommandEncoder as _;
+        self.note_pipeline(pipeline);
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
 
