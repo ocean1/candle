@@ -371,6 +371,20 @@ fn main() -> Result<()> {
     let mut hit_eos = false;
     let mut turns_run = 0usize;
 
+    // Pool counters are reported per phase rather than for the whole run.
+    // Prefill and decode allocate very differently -- prefill fills the pool
+    // from empty, decode reuses a warm one -- and averaging them together is
+    // the mistake that produced the 27 ms/token figure (`DESIGN.md` §6.6).
+    // The number issue #21 is about is the steady-state decode one, so the
+    // counters are zeroed once the first prefill has finished and the pool has
+    // reached its working size.
+    let metal_device = match &device {
+        Device::Metal(d) => Some(d.clone()),
+        _ => None,
+    };
+    let mut decode_tokens_measured = 0usize;
+    let mut pool_stats_armed = false;
+
     'turns: for turn in 0..args.turns.max(1) {
         // Turn 0 prefills the initial prompt; later turns append a follow-up to
         // the same cache, so KV state is reused rather than rebuilt.
@@ -393,6 +407,14 @@ fn main() -> Result<()> {
             .squeeze(0)?;
         kv_len += turn_ids.len();
         turns_run = turn + 1;
+
+        if !pool_stats_armed {
+            if let Some(d) = &metal_device {
+                report_pool(d, &args.label, "PREFILL", 0);
+                d.reset_pool_counters();
+            }
+            pool_stats_armed = true;
+        }
 
         loop {
             if tokens.len() >= args.n {
@@ -432,12 +454,17 @@ fn main() -> Result<()> {
                 .context("decode forward pass")?
                 .squeeze(0)?;
             kv_len += 1;
+            decode_tokens_measured += 1;
         }
     }
 
     let elapsed = start.elapsed();
     let token_digest = sha256::hex(&token_hasher.finalize());
     let logits_digest = sha256::hex(&logits_hasher.finalize());
+
+    if let Some(d) = &metal_device {
+        report_pool(d, &args.label, "DECODE", decode_tokens_measured);
+    }
 
     if args.dump_tokens {
         for (i, (tok, digest, kv)) in per_step.iter().enumerate() {
@@ -481,4 +508,65 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+
+/// One line per pool, plus a per-token normalization for the decode phase.
+///
+/// `buckets_probed` is the figure comparable to the old pool's "buckets
+/// walked": how many size buckets a lookup had to look at. It is the scan
+/// length, and it is the quantity issue #21 is about -- wall-clock hides it
+/// (`DESIGN.md` §6.7 §9).
+fn report_pool(device: &candle::MetalDevice, label: &str, phase: &str, decode_tokens: usize) {
+    let (shared_c, private_c) = device.pool_counters();
+    let (shared_o, private_o) = device.pool_occupancy();
+
+    for (name, c, o) in [
+        ("shared", shared_c, shared_o),
+        ("private", private_c, private_o),
+    ] {
+        println!(
+            "{phase}_pool label={label} pool={name} lookups={} hits={} hit_rate={:.4} \
+             buckets_probed={} probes_per_lookup={:.3} releases={} \
+             allocations={} allocated_mb={:.1} trims={} trimmed={} \
+             live_buffers={} live_mb={:.1} free_buffers={} free_mb={:.1} free_buckets={} \
+             total_buffers={} total_mb={:.1}",
+            c.lookups,
+            c.hits,
+            if c.lookups == 0 { 0.0 } else { c.hits as f64 / c.lookups as f64 },
+            c.buckets_probed,
+            if c.lookups == 0 { 0.0 } else { c.buckets_probed as f64 / c.lookups as f64 },
+            c.releases,
+            c.allocations,
+            c.allocated_bytes as f64 / (1024.0 * 1024.0),
+            c.trims,
+            c.trimmed,
+            o.live_buffers,
+            o.live_bytes as f64 / (1024.0 * 1024.0),
+            o.free_buffers,
+            o.free_bytes as f64 / (1024.0 * 1024.0),
+            o.free_buckets,
+            o.total_buffers(),
+            o.total_bytes() as f64 / (1024.0 * 1024.0),
+        );
+    }
+
+    if decode_tokens > 0 {
+        let n = decode_tokens as f64;
+        let lookups = shared_c.lookups + private_c.lookups;
+        let probed = shared_c.buckets_probed + private_c.buckets_probed;
+        let allocs = shared_c.allocations + private_c.allocations;
+        let releases = shared_c.releases + private_c.releases;
+        println!(
+            "DECODE_PER_TOKEN label={label} decode_tokens={decode_tokens} \
+             lookups_per_token={:.1} buckets_probed_per_token={:.1} \
+             allocations_per_token={:.2} releases_per_token={:.1} \
+             total_pool_mb={:.1}",
+            lookups as f64 / n,
+            probed as f64 / n,
+            allocs as f64 / n,
+            releases as f64 / n,
+            (shared_o.total_bytes() + private_o.total_bytes()) as f64 / (1024.0 * 1024.0),
+        );
+    }
 }
