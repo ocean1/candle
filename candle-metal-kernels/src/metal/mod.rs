@@ -6,6 +6,7 @@ pub mod device;
 pub mod encoder;
 pub mod fence;
 pub mod library;
+pub mod profile;
 pub mod residency_set;
 
 pub use buffer::*;
