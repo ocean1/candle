@@ -169,7 +169,11 @@ impl Kernels {
             let func = self.load_function(device, source, name.as_ref(), constants.as_ref())?;
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&func)
-                .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
+                .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?
+                // Kept so profiling can attribute a dispatch to a kernel. Done
+                // here because this is the last point where the name is in hand;
+                // the pipeline is cached, so the cost is once per variant.
+                .with_name(name.as_ref());
             pipelines.insert((source, name, constants), pipeline.clone());
 
             Ok(pipeline)
