@@ -5,7 +5,7 @@ using namespace metal;
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
 template <typename T>
-METAL_FUNC void im2col(
+[[kernel]] void im2col(
     constant size_t &dst_numel,
     constant size_t &h_out,
     constant size_t &w_out,
@@ -69,7 +69,7 @@ METAL_FUNC void im2col(
 }
 
 template <typename T>
-METAL_FUNC void col2im1d(
+[[kernel]] void col2im1d(
     constant size_t &dst_el,
     constant size_t &l_out,
     constant size_t &l_in,
@@ -113,7 +113,7 @@ METAL_FUNC void col2im1d(
 }
 
 template <typename T>
-METAL_FUNC void im2col1d(
+[[kernel]] void im2col1d(
     constant size_t &dst_numel,
     constant size_t &l_out,
     constant size_t &l_k,
@@ -159,7 +159,7 @@ METAL_FUNC void im2col1d(
 }
 
 template <typename T>
-METAL_FUNC void upsample_nearest2d(
+[[kernel]] void upsample_nearest2d(
     constant size_t &w_out,
     constant size_t &h_out,
     constant float &w_scale,
@@ -199,19 +199,22 @@ METAL_FUNC void upsample_nearest2d(
   dst[tid] = src[src_i];
 }
 
+// Buffer indices are explicit here because the macro that used to generate this
+// kernel's signature spelled them out; keeping them pinned means the binding
+// layout stays fixed even if a parameter is added above.
 template <typename T>
-METAL_FUNC void upsample_bilinear2d(
-    constant size_t &w_out,
-    constant size_t &h_out,
-    constant bool &align_corners,
-    constant bool &has_scale_h,
-    constant float &scale_h_factor,
-    constant bool &has_scale_w,
-    constant float &scale_w_factor,
-    constant size_t *src_dims,
-    constant size_t *src_s,
-    device const T *src,
-    device T *dst,
+[[kernel]] void upsample_bilinear2d(
+    constant size_t &w_out [[buffer(0)]],
+    constant size_t &h_out [[buffer(1)]],
+    constant bool &align_corners [[buffer(2)]],
+    constant bool &has_scale_h [[buffer(3)]],
+    constant float &scale_h_factor [[buffer(4)]],
+    constant bool &has_scale_w [[buffer(5)]],
+    constant float &scale_w_factor [[buffer(6)]],
+    constant size_t *src_dims [[buffer(7)]],
+    constant size_t *src_s [[buffer(8)]],
+    device const T *src [[buffer(9)]],
+    device T *dst [[buffer(10)]],
     uint tid [[thread_position_in_grid]]
 ) {
     // src: (b_size, c_in, h_in, w_in)  // Standard NCHW layout
@@ -283,92 +286,8 @@ METAL_FUNC void upsample_bilinear2d(
     dst[tid] = T(value);
 }
 
-#define IM2COL_OP(T, FN_NAME) \
-kernel void FN_NAME(  \
-    constant size_t &dst_numel, \
-    constant size_t &h_out, \
-    constant size_t &w_out, \
-    constant size_t &h_k, \
-    constant size_t &w_k, \
-    constant size_t &stride, \
-    constant size_t &padding, \
-    constant size_t &dilation, \
-    constant size_t *src_dims, \
-    constant size_t *src_strides, \
-    device const T *src, \
-    device T *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) {  \
-  im2col<T>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, src_dims, src_strides, src, dst, tid); \
-} \
-
-#define IM2COL1D_OP(T, FN_NAME) \
-kernel void FN_NAME(  \
-    constant size_t &dst_numel, \
-    constant size_t &l_out, \
-    constant size_t &l_k, \
-    constant size_t &stride, \
-    constant size_t &padding, \
-    constant size_t &dilation, \
-    constant size_t *src_dims, \
-    constant size_t *src_strides, \
-    device const T *src, \
-    device T *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) {  \
-  im2col1d<T>(dst_numel, l_out, l_k, stride, padding, dilation, src_dims, src_strides, src, dst, tid); \
-} \
-
-#define COL2IM1D_OP(T, FN_NAME) \
-kernel void FN_NAME(  \
-    constant size_t &dst_el, \
-    constant size_t &l_out, \
-    constant size_t &l_in, \
-    constant size_t &c_out, \
-    constant size_t &k_size, \
-    constant size_t &stride, \
-    device const T *src, \
-    device T *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) {  \
-  col2im1d<T>(dst_el, l_out, l_in, c_out, k_size, stride, src, dst, tid); \
-} \
-
-#define UPSAMPLE_NEAREST2D_OP(TYPENAME, FN_NAME) \
-kernel void FN_NAME(  \
-    constant size_t &w_out, \
-    constant size_t &h_out, \
-    constant float &w_scale, \
-    constant float &h_scale, \
-    constant size_t *dims, \
-    constant size_t *strides, \
-    device const TYPENAME *src, \
-    device TYPENAME *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) {  \
-  upsample_nearest2d<TYPENAME>(w_out, h_out, w_scale, h_scale, dims, strides, src, dst, tid); \
-} \
-
-#define UPSAMPLE_BILINEAR2D_OP(TYPENAME, FN_NAME) \
-kernel void FN_NAME(  \
-    constant size_t &w_out [[buffer(0)]], \
-    constant size_t &h_out [[buffer(1)]], \
-    constant bool &align_corners [[buffer(2)]], \
-    constant bool &has_scale_h [[buffer(3)]], \
-    constant float &scale_h_factor [[buffer(4)]], \
-    constant bool &has_scale_w [[buffer(5)]], \
-    constant float &scale_w_factor [[buffer(6)]], \
-    constant size_t *src_dims [[buffer(7)]], \
-    constant size_t *src_s [[buffer(8)]], \
-    device const TYPENAME *src [[buffer(9)]], \
-    device TYPENAME *dst [[buffer(10)]], \
-    uint tid [[thread_position_in_grid]] \
-) {  \
-  upsample_bilinear2d<TYPENAME>(w_out, h_out, align_corners, has_scale_h, scale_h_factor, has_scale_w, scale_w_factor, src_dims, src_s, src, dst, tid); \
-} \
-
 template <typename T, typename A>
-METAL_FUNC void avg_pool2d(
+[[kernel]] void avg_pool2d(
     constant size_t &w_k,
     constant size_t &h_k,
     constant size_t &w_stride,
@@ -413,23 +332,8 @@ METAL_FUNC void avg_pool2d(
   dst[tid] = static_cast<T>(d / (w_k * h_k));
 }
 
-#define AVGPOOL2D_OP(TYPENAME, TYPEACC, FN_NAME) \
-kernel void FN_NAME( \
-    constant size_t &w_k, \
-    constant size_t &h_k, \
-    constant size_t &w_s, \
-    constant size_t &h_s, \
-    constant size_t *src_dims, \
-    constant size_t *src_s, \
-    device const TYPENAME *src, \
-    device TYPENAME *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) { \
-  avg_pool2d<TYPENAME, TYPEACC>(w_k, h_k, w_s, h_s, src_dims, src_s, src, dst, tid); \
-} \
-
 template <typename T>
-METAL_FUNC void max_pool2d(
+[[kernel]] void max_pool2d(
     constant size_t &w_k,
     constant size_t &h_k,
     constant size_t &w_stride,
@@ -481,25 +385,10 @@ METAL_FUNC void max_pool2d(
   dst[tid] = d;
 }
 
-#define MAXPOOL2D_OP(TYPENAME, FN_NAME) \
-kernel void FN_NAME( \
-    constant size_t &w_k, \
-    constant size_t &h_k, \
-    constant size_t &w_s, \
-    constant size_t &h_s, \
-    constant size_t *src_dims, \
-    constant size_t *src_s, \
-    device const TYPENAME *src, \
-    device TYPENAME *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) { \
-  max_pool2d<TYPENAME>(w_k, h_k, w_s, h_s, src_dims, src_s, src, dst, tid); \
-} \
-
 
 // Naive implementation of conv_transpose1d.
 template <typename T, typename A>
-METAL_FUNC void conv_transpose1d(
+[[kernel]] void conv_transpose1d(
     constant size_t &l_out,
     constant size_t &stride,
     constant size_t &padding,
@@ -547,27 +436,8 @@ METAL_FUNC void conv_transpose1d(
   dst[tid] = static_cast<T>(d);
 }
 
-#define CONVT1D_OP(TYPENAME, TYPEACC, FN_NAME) \
-kernel void FN_NAME(  \
-    constant size_t &l_out, \
-    constant size_t &stride, \
-    constant size_t &padding, \
-    constant size_t &out_padding, \
-    constant size_t &dilation, \
-    constant size_t *src_dims, \
-    constant size_t *src_strides, \
-    constant size_t *k_dims, \
-    constant size_t *k_strides, \
-    device const TYPENAME *src, \
-    device const TYPENAME *k, \
-    device TYPENAME *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) {  \
-  conv_transpose1d<TYPENAME, TYPEACC>(l_out, stride, padding, out_padding, dilation, src_dims, src_strides, k_dims, k_strides, src, k, dst, tid); \
-} \
-
 template <typename T, typename A>
-METAL_FUNC void conv_transpose2d(
+[[kernel]] void conv_transpose2d(
   constant size_t &w_out,
   constant size_t &h_out,
   constant size_t &stride,
@@ -626,42 +496,6 @@ METAL_FUNC void conv_transpose2d(
   dst[tid] = static_cast<T>(d);
 }
 
-#define CONVT2D_OP(TYPENAME, TYPEACC, FN_NAME) \
-kernel void FN_NAME(  \
-    constant size_t &w_out, \
-    constant size_t &h_out, \
-    constant size_t &stride, \
-    constant size_t &padding, \
-    constant size_t &out_padding, \
-    constant size_t &dilation, \
-    constant size_t *input_dims, \
-    constant size_t *input_stride, \
-    constant size_t *k_dims, \
-    constant size_t *k_stride, \
-    device const TYPENAME *src, \
-    device const TYPENAME *k, \
-    device TYPENAME *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) {  \
-  conv_transpose2d<TYPENAME, TYPEACC>(w_out, h_out, stride, padding, out_padding, dilation, input_dims, input_stride, k_dims, k_stride, src, k, dst, tid); \
-} \
-
-IM2COL_OP(float, im2col_f32)
-IM2COL_OP(half, im2col_f16)
-IM2COL_OP(uint8_t, im2col_u8)
-IM2COL_OP(uint32_t, im2col_u32)
-#if defined(__HAVE_BFLOAT__)
-IM2COL_OP(bfloat, im2col_bf16)
-#endif
-
-COL2IM1D_OP(float, col2im1d_f32)
-COL2IM1D_OP(half, col2im1d_f16)
-COL2IM1D_OP(uint8_t, col2im1d_u8)
-COL2IM1D_OP(uint32_t, col2im1d_u32)
-#if defined(__HAVE_BFLOAT__)
-COL2IM1D_OP(bfloat, col2im1d_bf16)
-#endif
-
 // Depthwise 1D convolution, fused.
 //
 // The generic path builds an im2col matrix, runs a matmul, then transposes the
@@ -673,7 +507,7 @@ COL2IM1D_OP(bfloat, col2im1d_bf16)
 // dispatches. This does the whole layer in one, writing straight to the final
 // (b, c, l_out) layout so no transpose copy is needed.
 template <typename T, typename A>
-METAL_FUNC void conv1d_depthwise(
+[[kernel]] void conv1d_depthwise(
     constant size_t &dst_numel,
     constant size_t &l_out,
     constant size_t &k_size,
@@ -723,80 +557,126 @@ METAL_FUNC void conv1d_depthwise(
   dst[tid] = static_cast<T>(acc);
 }
 
-#define CONV1D_DEPTHWISE_OP(T, A, FN_NAME) \
-kernel void FN_NAME(  \
-    constant size_t &dst_numel, \
-    constant size_t &l_out, \
-    constant size_t &k_size, \
-    constant size_t &stride, \
-    constant size_t &padding, \
-    constant size_t &dilation, \
-    constant size_t *src_dims, \
-    constant size_t *src_strides, \
-    device const T *src, \
-    device const T *weight, \
-    device T *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) {  \
-  conv1d_depthwise<T, A>(dst_numel, l_out, k_size, stride, padding, dilation, src_dims, src_strides, src, weight, dst, tid); \
-} \
+// Explicit instantiation. `decltype(func<...>)` restates the template's own
+// signature, so a variant is declared by naming the type arguments and the
+// `[[host_name]]` string only — the parameter list is written once, in the
+// template. The macro-per-family form this replaces spelled every signature
+// twice, and the two could drift silently.
+//
+// Same spelling as unary.metal, binary.metal and affine.metal, which candle
+// already migrated.
+#define init_kernel(name, func, ...) \
+  template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
 
-CONV1D_DEPTHWISE_OP(float, float, conv1d_depthwise_f32)
-CONV1D_DEPTHWISE_OP(half, float, conv1d_depthwise_f16)
+// bfloat is gated per family exactly as before this conversion: the depthwise
+// kernel on __METAL_VERSION__ >= 310, every other family on __HAVE_BFLOAT__.
+// The two guards are not interchangeable, so they are kept as they were rather
+// than unified.
+#define init_conv1d_depthwise(tname, t, acc) \
+    init_kernel("conv1d_depthwise_" #tname, conv1d_depthwise, t, acc)
+
+#define init_im2col1d(tname, t) \
+    init_kernel("im2col1d_" #tname, im2col1d, t)
+
+#define init_im2col(tname, t) \
+    init_kernel("im2col_" #tname, im2col, t)
+
+#define init_col2im1d(tname, t) \
+    init_kernel("col2im1d_" #tname, col2im1d, t)
+
+#define init_upsample_nearest2d(tname, t) \
+    init_kernel("upsample_nearest2d_" #tname, upsample_nearest2d, t)
+
+#define init_upsample_bilinear2d(tname, t) \
+    init_kernel("upsample_bilinear2d_" #tname, upsample_bilinear2d, t)
+
+#define init_max_pool2d(tname, t) \
+    init_kernel("max_pool2d_" #tname, max_pool2d, t)
+
+#define init_avg_pool2d(tname, t, acc) \
+    init_kernel("avg_pool2d_" #tname, avg_pool2d, t, acc)
+
+#define init_conv_transpose1d(tname, t, acc) \
+    init_kernel("conv_transpose1d_" #tname, conv_transpose1d, t, acc)
+
+#define init_conv_transpose2d(tname, t, acc) \
+    init_kernel("conv_transpose2d_" #tname, conv_transpose2d, t, acc)
+
+init_im2col(f32, float);
+init_im2col(f16, half);
+init_im2col(u8, uint8_t);
+init_im2col(u32, uint32_t);
+#if defined(__HAVE_BFLOAT__)
+init_im2col(bf16, bfloat);
+#endif
+
+init_col2im1d(f32, float);
+init_col2im1d(f16, half);
+init_col2im1d(u8, uint8_t);
+init_col2im1d(u32, uint32_t);
+#if defined(__HAVE_BFLOAT__)
+init_col2im1d(bf16, bfloat);
+#endif
+
+init_conv1d_depthwise(f32, float, float);
+init_conv1d_depthwise(f16, half, float);
 #if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
-CONV1D_DEPTHWISE_OP(bfloat, float, conv1d_depthwise_bf16)
+init_conv1d_depthwise(bf16, bfloat, float);
 #endif
 
-IM2COL1D_OP(float, im2col1d_f32)
-IM2COL1D_OP(half, im2col1d_f16)
-IM2COL1D_OP(uint8_t, im2col1d_u8)
-IM2COL1D_OP(uint32_t, im2col1d_u32)
+init_im2col1d(f32, float);
+init_im2col1d(f16, half);
+init_im2col1d(u8, uint8_t);
+init_im2col1d(u32, uint32_t);
 #if defined(__HAVE_BFLOAT__)
-IM2COL1D_OP(bfloat, im2col1d_bf16)
+init_im2col1d(bf16, bfloat);
 #endif
 
-UPSAMPLE_NEAREST2D_OP(float, upsample_nearest2d_f32)
-UPSAMPLE_NEAREST2D_OP(half, upsample_nearest2d_f16)
-UPSAMPLE_NEAREST2D_OP(uint8_t, upsample_nearest2d_u8)
-UPSAMPLE_NEAREST2D_OP(uint32_t, upsample_nearest2d_u32)
+init_upsample_nearest2d(f32, float);
+init_upsample_nearest2d(f16, half);
+init_upsample_nearest2d(u8, uint8_t);
+init_upsample_nearest2d(u32, uint32_t);
 #if defined(__HAVE_BFLOAT__)
-UPSAMPLE_NEAREST2D_OP(bfloat, upsample_nearest2d_bf16)
+init_upsample_nearest2d(bf16, bfloat);
 #endif
 
-UPSAMPLE_BILINEAR2D_OP(float, upsample_bilinear2d_f32)
-UPSAMPLE_BILINEAR2D_OP(half, upsample_bilinear2d_f16)
-UPSAMPLE_BILINEAR2D_OP(uint8_t, upsample_bilinear2d_u8)
-UPSAMPLE_BILINEAR2D_OP(uint32_t, upsample_bilinear2d_u32)
+init_upsample_bilinear2d(f32, float);
+init_upsample_bilinear2d(f16, half);
+init_upsample_bilinear2d(u8, uint8_t);
+init_upsample_bilinear2d(u32, uint32_t);
 #if defined(__HAVE_BFLOAT__)
-UPSAMPLE_BILINEAR2D_OP(bfloat, upsample_bilinear2d_bf16)
+init_upsample_bilinear2d(bf16, bfloat);
 #endif
 
-MAXPOOL2D_OP(float, max_pool2d_f32)
-MAXPOOL2D_OP(half, max_pool2d_f16)
-MAXPOOL2D_OP(uint32_t, max_pool2d_u32)
-MAXPOOL2D_OP(uint8_t, max_pool2d_u8)
+init_max_pool2d(f32, float);
+init_max_pool2d(f16, half);
+init_max_pool2d(u32, uint32_t);
+init_max_pool2d(u8, uint8_t);
 #if defined(__HAVE_BFLOAT__)
-MAXPOOL2D_OP(bfloat, max_pool2d_bf16)
+init_max_pool2d(bf16, bfloat);
 #endif
 
-AVGPOOL2D_OP(float, float, avg_pool2d_f32)
-AVGPOOL2D_OP(half, float, avg_pool2d_f16)
-AVGPOOL2D_OP(uint32_t, uint32_t, avg_pool2d_u32)
-AVGPOOL2D_OP(uint8_t, uint8_t, avg_pool2d_u8)
+// Accumulator types differ per dtype and are load-bearing: the integer
+// instantiations accumulate in their own type, so their averaging truncates
+// exactly as it did before. Widening them would be a behaviour change.
+init_avg_pool2d(f32, float, float);
+init_avg_pool2d(f16, half, float);
+init_avg_pool2d(u32, uint32_t, uint32_t);
+init_avg_pool2d(u8, uint8_t, uint8_t);
 #if defined(__HAVE_BFLOAT__)
-AVGPOOL2D_OP(bfloat, float, avg_pool2d_bf16)
+init_avg_pool2d(bf16, bfloat, float);
 #endif
 
-CONVT1D_OP(float, float, conv_transpose1d_f32)
-CONVT1D_OP(half, float, conv_transpose1d_f16)
-CONVT1D_OP(uint8_t, uint8_t, conv_transpose1d_u8)
-CONVT1D_OP(uint32_t, uint32_t, conv_transpose1d_u32)
+init_conv_transpose1d(f32, float, float);
+init_conv_transpose1d(f16, half, float);
+init_conv_transpose1d(u8, uint8_t, uint8_t);
+init_conv_transpose1d(u32, uint32_t, uint32_t);
 #if defined(__HAVE_BFLOAT__)
-CONVT1D_OP(bfloat, float, conv_transpose1d_bf16)
+init_conv_transpose1d(bf16, bfloat, float);
 #endif
 
-CONVT2D_OP(float, float, conv_transpose2d_f32)
-CONVT2D_OP(half, float, conv_transpose2d_f16)
+init_conv_transpose2d(f32, float, float);
+init_conv_transpose2d(f16, half, float);
 #if defined(__HAVE_BFLOAT__)
-CONVT2D_OP(bfloat, float, conv_transpose2d_bf16)
+init_conv_transpose2d(bf16, bfloat, float);
 #endif
