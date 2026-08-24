@@ -280,10 +280,28 @@ impl MetalDevice {
             .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&new_buffer);
-        // Adopted at its exact size rather than an aligned one: this buffer was
-        // created by `newBufferWithBytes`, so its length is `size`, and that is
-        // the bucket a later request must find it in.
-        Ok(self.buffers.adopt(new_buffer, size))
+
+        // Deliberately not pooled.
+        //
+        // This path always calls `newBufferWithBytes` and never consults the
+        // free list, so a buffer parked here is only reachable by an
+        // `allocate_buffer` request for the same size -- and `allocate_buffer`
+        // has three callers, all on quantized dequantize paths. Nothing in an
+        // f16 forward pass ever asks for one.
+        //
+        // In practice these are weight tensors staged from safetensors, which
+        // `to_dtype` immediately converts into `private_buffers`; the staging
+        // buffer is then dropped and never wanted again. Measured on an LFM2
+        // load that is 276 buffers holding 5145 MB. The old allocator reclaimed
+        // them only as a side effect of its sweep, so with the sweep off the
+        // allocation path, pooling them would double the footprint and undo
+        // issue #8's 7731 -> 5509 MB.
+        //
+        // Freeing on drop keeps that reclamation without reintroducing a scan.
+        // Note this is a property of the *path*, not of buffer size: these
+        // average 18.6 MB, so a size threshold does not separate them from
+        // activations.
+        Ok(Arc::new(PooledBuffer::unpooled(new_buffer, size)))
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<PooledBuffer>> {

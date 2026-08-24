@@ -229,6 +229,7 @@ impl PoolInner {
         state.counters.releases += 1;
         state.live_buffers = state.live_buffers.saturating_sub(1);
         state.live_bytes = state.live_bytes.saturating_sub(size);
+
         state.free.entry(size).or_default().push(buffer);
     }
 }
