@@ -1,4 +1,4 @@
-use crate::metal::{Buffer, ComputePipeline, Fence};
+use crate::metal::{trace, Buffer, ComputePipeline, Fence};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
@@ -15,6 +15,10 @@ use std::{
 /// Shared cross-encoder output map: maps buffer pointer -> fence of the last encoder that wrote it.
 /// Used by subsequent encoders to call waitForFence before reading those buffers.
 pub type PrevCeOutputs = Arc<Mutex<HashMap<usize, Arc<Fence>>>>;
+
+fn size_tuple(size: MTLSize) -> (usize, usize, usize) {
+    (size.width, size.height, size.depth)
+}
 
 /// Barrier tracking state for one encoder session.
 /// Owned by ComputeCommandEncoder via Arc<Mutex<>> so clones share state.
@@ -113,6 +117,11 @@ impl ComputeCommandEncoder {
 
     pub fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
         self.auto_barrier();
+        trace::record_dispatch(
+            size_tuple(threads_per_grid),
+            size_tuple(threads_per_threadgroup),
+            false,
+        );
         self.raw
             .dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup)
     }
@@ -123,6 +132,11 @@ impl ComputeCommandEncoder {
         threads_per_threadgroup: MTLSize,
     ) {
         self.auto_barrier();
+        trace::record_dispatch(
+            size_tuple(threadgroups_per_grid),
+            size_tuple(threads_per_threadgroup),
+            true,
+        );
         self.raw.dispatchThreadgroups_threadsPerThreadgroup(
             threadgroups_per_grid,
             threads_per_threadgroup,
@@ -147,6 +161,7 @@ impl ComputeCommandEncoder {
     pub fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
+            trace::record_binding(index, ptr, offset, false);
             // Read-after-write against an earlier encoder: order against that
             // buffer's last writer only.
             self.wait_for_buffer(ptr);
@@ -166,6 +181,7 @@ impl ComputeCommandEncoder {
     pub fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
+            trace::record_binding(index, ptr, offset, true);
             // Write-after-write or write-after-read against an earlier encoder.
             self.wait_for_buffer(ptr);
             let mut s = self.state.lock().unwrap();
@@ -193,6 +209,7 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_compute_pipeline_state(&self, pipeline: &ComputePipeline) {
+        trace::record_pipeline(pipeline.name());
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
 
@@ -219,6 +236,7 @@ impl ComputeCommandEncoder {
 
     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
         use MTLComputeCommandEncoder as _;
+        trace::record_pipeline(pipeline.name());
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
 

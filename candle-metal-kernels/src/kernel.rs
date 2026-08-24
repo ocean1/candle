@@ -168,7 +168,7 @@ impl Kernels {
             let (source, name, constants) = key;
             let func = self.load_function(device, source, name.as_ref(), constants.as_ref())?;
             let pipeline = device
-                .new_compute_pipeline_state_with_function(&func)
+                .new_compute_pipeline_state_with_function(&func, name.as_ref())
                 .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
             pipelines.insert((source, name, constants), pipeline.clone());
 

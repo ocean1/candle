@@ -7,6 +7,7 @@ pub mod encoder;
 pub mod fence;
 pub mod library;
 pub mod residency_set;
+pub mod trace;
 
 pub use buffer::*;
 pub use command_buffer::*;
