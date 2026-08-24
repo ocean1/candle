@@ -2612,3 +2612,121 @@ fn conv_undeclared_dtype_has_no_name() {
         Some("conv1d_depthwise_f16")
     );
 }
+
+/// Every name [`ReduceKernel`] declares must exist in the compiled
+/// `reduce.metal` library.
+///
+/// The `reduce.metal` counterpart of `conv_names_resolve`, and it earned its
+/// place immediately: converting the file's `impl_*` macros to template
+/// instantiations introduced `init_reduce` rows whose `#op` stringized to the
+/// operator *type* (`Sum`), emitting `fast_Sum_f32` where every caller asks for
+/// `fast_sum_f32`. That compiles and links; all 48 reduction variants were
+/// simply absent from the library. Without this test the first symptom would
+/// have been a `LoadFunctionError` inside an LFM2 forward pass.
+#[test]
+fn reduce_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let mut checked = 0usize;
+    for family in ReduceKernel::ALL {
+        for (suffix, name) in family.variants() {
+            kernels
+                .load_pipeline(&device, Source::Reduce, name)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "reduce.metal has no kernel named {name:?} \
+                         (declared by ReduceKernel::{}{} for {suffix:?}): {e:?}",
+                        family.stem(),
+                        family.tail(),
+                    )
+                });
+            checked += 1;
+        }
+    }
+
+    // Guards against the table being emptied or a family silently dropping all
+    // its variants — an all-green run over zero names would otherwise pass.
+    // 6 dtypes each for sum, mul, min, max, argmin and argmax in both their
+    // contiguous and strided forms (12 families), plus 3 float dtypes each for
+    // softmax, rmsnorm, layernorm, rope, rope_i and rope_thd.
+    assert_eq!(
+        checked, 90,
+        "expected 90 declared reduce variants, found {checked}"
+    );
+}
+
+/// Each declared name must be its family's stem, then its dtype suffix, then
+/// the family's tail, and each suffix must appear once per family.
+///
+/// Resolution alone cannot catch a row that names a *different* real kernel.
+/// That matters more here than it did for conv, because the strided and
+/// contiguous forms of a reduction differ by a suffix and take different
+/// argument lists: a `_strided` row pointing at the contiguous kernel resolves
+/// perfectly well and then reads a `strides` argument that was never bound.
+#[test]
+fn reduce_names_match_their_stem_and_suffix() {
+    for family in ReduceKernel::ALL {
+        let mut seen: Vec<&str> = Vec::new();
+        for (suffix, name) in family.variants() {
+            assert_eq!(
+                name,
+                format!("{}_{suffix}{}", family.stem(), family.tail()),
+                "ReduceKernel::{}{} declares {name:?} for {suffix:?}",
+                family.stem(),
+                family.tail(),
+            );
+            assert!(
+                !seen.contains(&suffix),
+                "ReduceKernel::{}{} declares {suffix:?} twice",
+                family.stem(),
+                family.tail(),
+            );
+            seen.push(suffix);
+        }
+        assert!(
+            !seen.is_empty(),
+            "ReduceKernel::{}{} declares no variants",
+            family.stem(),
+            family.tail(),
+        );
+    }
+}
+
+/// A dtype a family does not declare must not produce a name.
+///
+/// Softmax, the norms and RoPE are float-only in `reduce.metal`, so the integer
+/// suffixes must be refused here rather than reaching `load_pipeline`.
+#[test]
+fn reduce_undeclared_dtype_has_no_name() {
+    for family in [
+        ReduceKernel::SOFTMAX,
+        ReduceKernel::RMSNORM,
+        ReduceKernel::LAYERNORM,
+        ReduceKernel::ROPE,
+        ReduceKernel::ROPE_I,
+        ReduceKernel::ROPE_THD,
+    ] {
+        for suffix in ["u8", "u32", "i64", "f64", "not_a_dtype"] {
+            assert_eq!(
+                family.name(suffix),
+                None,
+                "ReduceKernel::{} named {suffix:?}, which reduce.metal does not instantiate",
+                family.stem(),
+            );
+        }
+    }
+
+    // f64 is instantiated nowhere in reduce.metal, including for the families
+    // that do carry the integer dtypes.
+    for family in ReduceKernel::ALL {
+        assert_eq!(family.name("f64"), None);
+    }
+
+    // And the positive cases, so the assertions above are not vacuous.
+    assert_eq!(ReduceKernel::SUM.name("f16"), Some("fast_sum_f16"));
+    assert_eq!(
+        ReduceKernel::SUM_STRIDED.name("f16"),
+        Some("fast_sum_f16_strided")
+    );
+}

@@ -10,6 +10,7 @@ pub mod mlx_gemm;
 pub mod quantized;
 pub mod random;
 pub mod reduce;
+pub mod reduce_names;
 pub mod sdpa;
 pub mod sort;
 pub mod ternary;
@@ -28,6 +29,7 @@ pub use quantized::{
 };
 pub use random::*;
 pub use reduce::*;
+pub use reduce_names::ReduceKernel;
 pub use sdpa::{call_sdpa_full, call_sdpa_vector, call_sdpa_vector_2pass, SdpaDType};
 pub use sort::{call_arg_sort, call_mlx_arg_sort};
 pub use ternary::call_where_cond;

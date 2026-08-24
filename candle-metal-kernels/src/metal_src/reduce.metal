@@ -601,68 +601,111 @@ METAL_FUNC void reduce(
     store(result);
 }
 
-#define reduce_switch(CASE_MACRO, OP, T, R, INDEXER)    \
-    switch (max_shared_mem<T>(block_dim)) {             \
-        CASE_MACRO(OP, T, R, 1024, INDEXER)             \
-        CASE_MACRO(OP, T, R,  512, INDEXER)             \
-        CASE_MACRO(OP, T, R,  256, INDEXER)             \
-        CASE_MACRO(OP, T, R,  128, INDEXER)             \
-        CASE_MACRO(OP, T, R,   64, INDEXER)             \
-        CASE_MACRO(OP, T, R,   32, INDEXER)             \
-        CASE_MACRO(OP, T, R,   16, INDEXER)             \
-        CASE_MACRO(OP, T, R,    8, INDEXER)             \
-        CASE_MACRO(OP, T, R,    4, INDEXER)             \
-        CASE_MACRO(OP, T, R,    2, INDEXER)             \
-        CASE_MACRO(OP, T, R,    1, INDEXER)             \
+// The threadgroup-size switch below is not the dtype axis that `conv.metal`'s
+// conversion dealt with, and it does not fold into the kernel name.
+//
+// `threadgroup R shared[N]` needs a compile-time `N`, but the threadgroup size
+// is chosen per dispatch on the CPU from the tensor shape
+// (`kernels/reduce.rs`: `min(max_total_threads_per_threadgroup,
+// (work_per_threadgroup / 2).next_power_of_two())`) and reaches the kernel as
+// `block_dim`. So one entry point covers every block size by switching on it
+// and calling the matching `BLOCKSIZE` instantiation — eleven instantiations
+// behind one `[[host_name]]`, selected at runtime.
+//
+// Lifting `N` into the name would mean either recomputing `max_shared_mem`'s
+// clamp on the Rust side to pick the variant — duplicating a rule that lives in
+// exactly one place today, which is the coupling issue #8 removed — or fixing
+// `N`, which changes occupancy and is a performance change. Both are out of
+// scope for a conversion whose acceptance criterion is no behaviour change, so
+// the switch stays exactly as it was and only the wrapper duplication goes.
+// Two spellings because the clamp is on the type actually held in threadgroup
+// memory, which is not always `T`: the reduce, arg-reduce and softmax families
+// clamp on `T`, while `rms_norm` and `layer_norm` accumulate in `float` and
+// clamp on that. The macro form spelled this difference out per family
+// (`max_shared_mem<float>` in `impl_rms_norm` / `impl_layer_norm`); it is
+// preserved rather than unified, since collapsing the two would change which
+// block size a half-precision norm selects.
+#define reduce_switch_on(A, CASE_MACRO)                 \
+    switch (max_shared_mem<A>(block_dim)) {             \
+        CASE_MACRO(1024)                                \
+        CASE_MACRO( 512)                                \
+        CASE_MACRO( 256)                                \
+        CASE_MACRO( 128)                                \
+        CASE_MACRO(  64)                                \
+        CASE_MACRO(  32)                                \
+        CASE_MACRO(  16)                                \
+        CASE_MACRO(   8)                                \
+        CASE_MACRO(   4)                                \
+        CASE_MACRO(   2)                                \
+        CASE_MACRO(   1)                                \
     }
 
-#define reduce_case(OP, T, R, N, INDEXER)                               \
+#define reduce_switch(CASE_MACRO) reduce_switch_on(T, CASE_MACRO)
+
+#define reduce_case(N)                                                  \
 case N: {                                                               \
-    threadgroup T shared[N];                                            \
-    reduce<T, R, OP<R>, N>(                                             \
-        INDEXER, src_numel, el_per_block, src, dst, shared, tid, dst_id \
+    threadgroup R shared[N];                                            \
+    reduce<T, R, OP, N>(                                                \
+        indexer, src_numel, el_per_block, src, dst, shared, tid, dst_id \
     );                                                                  \
     break;                                                              \
 }
 
-#define impl_reduce_inner(OP, NAME, T)              \
-kernel void NAME(                                   \
-    constant uint &src_numel,                       \
-    constant uint &num_dims,                        \
-    constant uint *dims,                            \
-    constant uint &el_per_block,                    \
-    device const T *src,                            \
-    device T *dst,                                  \
-    uint tid [[ thread_index_in_threadgroup ]],     \
-    uint dst_id [[ threadgroup_position_in_grid ]], \
-    uint block_dim [[ threads_per_threadgroup ]]    \
-) {                                                 \
-    indexer_t<uint, false> indexer;                 \
-    reduce_switch(reduce_case, OP, T, T, indexer)   \
+// `OP` is the reduction operator already applied to the accumulator type
+// (`Sum<float>`), not a template-template parameter as the macro form took it.
+// The macro spelled `OP<R>` at each use site; naming the applied type once in
+// the instantiation keeps the accumulator visible in exactly one place per
+// variant, which is what `avg_pool2d`'s per-dtype accumulators needed in #9.
+template<typename T, typename R, typename OP>
+[[kernel]] void reduce_kernel(
+    constant uint &src_numel,
+    constant uint &num_dims,
+    constant uint *dims,
+    constant uint &el_per_block,
+    device const T *src,
+    device R *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    indexer_t<uint, false> indexer;
+    reduce_switch(reduce_case)
 }
 
-#define impl_reduce_strided(OP, NAME, T)            \
-kernel void NAME##_strided(                         \
-    constant uint &src_numel,                       \
-    constant uint &num_dims,                        \
-    constant uint *dims,                            \
-    constant uint *strides,                         \
-    constant uint &el_per_block,                    \
-    device const T *src,                            \
-    device T *dst,                                  \
-    uint tid [[ thread_index_in_threadgroup ]],     \
-    uint dst_id [[ threadgroup_position_in_grid ]], \
-    uint block_dim [[ threads_per_threadgroup ]]    \
-) {                                                 \
-    indexer_t<uint, true> indexer {                 \
-        num_dims, dims, strides, dims[num_dims - 1] \
-    };                                              \
-    reduce_switch(reduce_case, OP, T, T, indexer)   \
+template<typename T, typename R, typename OP>
+[[kernel]] void reduce_kernel_strided(
+    constant uint &src_numel,
+    constant uint &num_dims,
+    constant uint *dims,
+    constant uint *strides,
+    constant uint &el_per_block,
+    device const T *src,
+    device R *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    indexer_t<uint, true> indexer {
+        num_dims, dims, strides, dims[num_dims - 1]
+    };
+    reduce_switch(reduce_case)
 }
 
-#define impl_reduce(OP, NAME, T)                    \
-impl_reduce_inner(OP, NAME, T)                      \
-impl_reduce_strided(OP, NAME, T)
+#define init_kernel(name, func, ...) \
+  template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
+
+// Both the contiguous and strided entry points for one (op, dtype), matching
+// the pair `impl_reduce` used to generate.
+//
+// `opname` is spelled separately from the operator type rather than stringized
+// from it: the type is `Sum` while the kernel is `fast_sum_*`, so `#op` would
+// produce `fast_Sum_f32` — a name that compiles, resolves nowhere, and fails
+// only when a dispatch asks for it. The registry test in `reduce_names.rs` is
+// what catches that; it caught exactly this while this file was being written.
+#define init_reduce(op, opname, tname, t)                               \
+    init_kernel("fast_" #opname "_" #tname, reduce_kernel, t, t, op<t>) \
+    init_kernel("fast_" #opname "_" #tname "_strided",                  \
+                reduce_kernel_strided, t, t, op<t>)
 
 template<
     typename T,
@@ -707,11 +750,10 @@ METAL_FUNC void reduce(
     store(result);
 }
 
-#define arg_reduce_case(OP, T, R, N, INDEXER)           \
+#define arg_reduce_case(N)                              \
 case N: {                                               \
-    using I = indexed<R>;                               \
     threadgroup I shared[N];                            \
-    reduce<T, OP<I>, N>(                                \
+    reduce<T, OP, N>(                                   \
         indexer,                                        \
         src_numel,                                      \
         el_per_block,                                   \
@@ -723,46 +765,53 @@ case N: {                                               \
     break;                                              \
 }
 
-#define impl_arg_reduce_inner(OP, NAME, T)              \
-kernel void NAME(                                       \
-    constant uint &src_numel,                           \
-    constant uint &num_dims,                            \
-    constant uint *dims,                                \
-    constant uint &el_per_block,                        \
-    device const T *src,                                \
-    device uint *dst,                                   \
-    uint tid [[ thread_index_in_threadgroup ]],         \
-    uint dst_id [[ threadgroup_position_in_grid ]],     \
-    uint block_dim [[ threads_per_threadgroup ]]        \
-) {                                                     \
-    indexer_t<uint, false> indexer {                    \
-        dims[num_dims - 1]                              \
-    };                                                  \
-    reduce_switch(arg_reduce_case, OP, T, T, indexer)   \
-}                                                       \
-
-#define impl_arg_reduce_strided(OP, NAME, T)            \
-kernel void NAME##_strided(                             \
-    constant uint &src_numel,                           \
-    constant uint &num_dims,                            \
-    constant uint *dims,                                \
-    constant uint *strides,                             \
-    constant uint &el_per_block,                        \
-    device const T *src,                                \
-    device uint *dst,                                   \
-    uint tid [[ thread_index_in_threadgroup ]],         \
-    uint dst_id [[ threadgroup_position_in_grid ]],     \
-    uint block_dim [[ threads_per_threadgroup ]]        \
-) {                                                     \
-    indexer_t<uint, true> indexer {                     \
-        num_dims, dims, strides, dims[num_dims - 1]     \
-    };                                                  \
-    reduce_switch(arg_reduce_case, OP, T, T, indexer)   \
+// `OP` is again the applied operator, here over the `indexed<T>` accumulator
+// (`Min<indexed<float>>`), which is what carries the tie-breaking index
+// alongside the value.
+template<typename T, typename OP>
+[[kernel]] void arg_reduce_kernel(
+    constant uint &src_numel,
+    constant uint &num_dims,
+    constant uint *dims,
+    constant uint &el_per_block,
+    device const T *src,
+    device uint *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    using I = indexed<T>;
+    indexer_t<uint, false> indexer {
+        dims[num_dims - 1]
+    };
+    reduce_switch(arg_reduce_case)
 }
 
-#define impl_arg_reduce(OP, NAME, T)                    \
-impl_arg_reduce_inner(OP, NAME, T)                      \
-impl_arg_reduce_strided(OP, NAME, T)
+template<typename T, typename OP>
+[[kernel]] void arg_reduce_kernel_strided(
+    constant uint &src_numel,
+    constant uint &num_dims,
+    constant uint *dims,
+    constant uint *strides,
+    constant uint &el_per_block,
+    device const T *src,
+    device uint *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    using I = indexed<T>;
+    indexer_t<uint, true> indexer {
+        num_dims, dims, strides, dims[num_dims - 1]
+    };
+    reduce_switch(arg_reduce_case)
+}
+
+#define init_arg_reduce(op, opname, tname, t)                                 \
+    init_kernel("fast_" #opname "_" #tname,                                   \
+                arg_reduce_kernel, t, op<indexed<t>>)                         \
+    init_kernel("fast_" #opname "_" #tname "_strided",                        \
+                arg_reduce_kernel_strided, t, op<indexed<t>>)
 
 // Contains the intermediate results for the online softmax calculation.
 // m: max
@@ -891,7 +940,7 @@ METAL_FUNC void softmax(
     softmax_finalize(src, dst, md_total, thread_id, stop_idx);
 }
 
-#define softmax_case(T, N)                              \
+#define softmax_case(N)                                 \
 case N: {                                               \
     threadgroup MD<T> shared[N];                        \
     threadgroup MD<T> md_total;                         \
@@ -907,30 +956,21 @@ case N: {                                               \
     break;                                              \
 }
 
-#define impl_softmax(NAME, T)                           \
-kernel void NAME(                                       \
-    constant uint &src_numel,                           \
-    constant uint &el_per_block,                        \
-    device const T *src,                                \
-    device T *dst,                                      \
-    uint tid [[ thread_index_in_threadgroup ]],         \
-    uint dst_id [[ threadgroup_position_in_grid ]],     \
-    uint block_dim [[ threads_per_threadgroup ]]        \
-) {                                                     \
-    switch (max_shared_mem<T>(block_dim)) {             \
-        softmax_case(T, 1024);                          \
-        softmax_case(T,  512);                          \
-        softmax_case(T,  256);                          \
-        softmax_case(T,  128);                          \
-        softmax_case(T,   64);                          \
-        softmax_case(T,   32);                          \
-        softmax_case(T,   16);                          \
-        softmax_case(T,    8);                          \
-        softmax_case(T,    4);                          \
-        softmax_case(T,    2);                          \
-        softmax_case(T,    1);                          \
-    }                                                   \
+template<typename T>
+[[kernel]] void softmax_kernel(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    reduce_switch(softmax_case)
 }
+
+#define init_softmax(tname, t) \
+    init_kernel("softmax_" #tname, softmax_kernel, t)
 
 
 template<typename T>
@@ -1109,7 +1149,7 @@ METAL_FUNC void rms_norm(
 }
 
 
-#define rms_norm_case(T, N)                             \
+#define rms_norm_case(N)                                \
 case N: {                                               \
     threadgroup RMS<float> shared[N];                   \
     threadgroup float total;                            \
@@ -1127,32 +1167,23 @@ case N: {                                               \
     break;                                              \
 }
 
-#define impl_rms_norm(NAME, T)                          \
-kernel void NAME(                                       \
-    constant uint &src_numel,                           \
-    constant uint &el_per_block,                        \
-    device const T *src,                                \
-    device T *dst,                                      \
-    device const T *alpha,                              \
-    constant float &eps,                                \
-    uint tid [[ thread_index_in_threadgroup ]],         \
-    uint dst_id [[ threadgroup_position_in_grid ]],     \
-    uint block_dim [[ threads_per_threadgroup ]]        \
-) {                                                     \
-    switch (max_shared_mem<float>(block_dim)) {         \
-        rms_norm_case(T, 1024);                         \
-        rms_norm_case(T,  512);                         \
-        rms_norm_case(T,  256);                         \
-        rms_norm_case(T,  128);                         \
-        rms_norm_case(T,   64);                         \
-        rms_norm_case(T,   32);                         \
-        rms_norm_case(T,   16);                         \
-        rms_norm_case(T,    8);                         \
-        rms_norm_case(T,    4);                         \
-        rms_norm_case(T,    2);                         \
-        rms_norm_case(T,    1);                         \
-    }                                                   \
+template<typename T>
+[[kernel]] void rms_norm_kernel(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    constant float &eps,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    reduce_switch_on(float, rms_norm_case)
 }
+
+#define init_rms_norm(tname, t) \
+    init_kernel("rmsnorm_" #tname, rms_norm_kernel, t)
 
 template<typename T>
 struct LayerNormValue {
@@ -1306,7 +1337,7 @@ METAL_FUNC void layer_norm(
     }
 }
 
-#define layer_norm_case(T, N)                           \
+#define layer_norm_case(N)                              \
 case N: {                                               \
     threadgroup LayerNormValue<float> shared[N];        \
     threadgroup float mu;                               \
@@ -1328,34 +1359,25 @@ case N: {                                               \
     break;                                              \
 }
 
-#define impl_layer_norm(NAME, T)                        \
-kernel void NAME(                                       \
-    constant uint &src_numel,                           \
-    constant uint &el_per_block,                        \
-    device const T *src,                                \
-    device T *dst,                                      \
-    device const T *alpha,                              \
-    device const T *beta,                               \
-    constant float &eps,                                \
-    uint tid [[ thread_index_in_threadgroup ]],         \
-    uint dst_id [[ threadgroup_position_in_grid ]],     \
-    uint lane_id [[thread_index_in_simdgroup]],         \
-    uint block_dim [[ threads_per_threadgroup ]]        \
-) {                                                     \
-    switch (max_shared_mem<float>(block_dim)) {         \
-        layer_norm_case(T, 1024);                       \
-        layer_norm_case(T,  512);                       \
-        layer_norm_case(T,  256);                       \
-        layer_norm_case(T,  128);                       \
-        layer_norm_case(T,   64);                       \
-        layer_norm_case(T,   32);                       \
-        layer_norm_case(T,   16);                       \
-        layer_norm_case(T,    8);                       \
-        layer_norm_case(T,    4);                       \
-        layer_norm_case(T,    2);                       \
-        layer_norm_case(T,    1);                       \
-    }                                                   \
+template<typename T>
+[[kernel]] void layer_norm_kernel(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *beta,
+    constant float &eps,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    reduce_switch_on(float, layer_norm_case)
 }
+
+#define init_layer_norm(tname, t) \
+    init_kernel("layernorm_" #tname, layer_norm_kernel, t)
 
 template<typename T>
 METAL_FUNC void ropei(
@@ -1446,109 +1468,127 @@ METAL_FUNC void rope_thd(
     dst[i2] = src[i1] * s + src[i2] * c;
 }
 
-#define ROPE(FN_NAME, FN_NAME_I, FN_NAME_THD, TYPENAME) \
-kernel void FN_NAME_I( \
-    constant size_t &bh, \
-    constant size_t &td, \
-    constant size_t &stride_b, \
-    device const TYPENAME *src,  \
-    device const TYPENAME *cos,  \
-    device const TYPENAME *sin,  \
-    device TYPENAME *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) { \
-    ropei<TYPENAME>(bh, td, stride_b, src, cos, sin, dst, tid); \
-}\
-kernel void FN_NAME( \
-    constant size_t &bh, \
-    constant size_t &td, \
-    constant size_t &d, \
-    constant size_t &stride_b, \
-    device const TYPENAME *src,  \
-    device const TYPENAME *cos,  \
-    device const TYPENAME *sin,  \
-    device TYPENAME *dst, \
-    uint idx [[ thread_position_in_grid ]] \
-) { \
-    rope<TYPENAME>(bh, td, d, stride_b, src, cos, sin, dst, idx); \
-}\
-kernel void FN_NAME_THD( \
-    constant size_t &b, \
-    constant size_t &t, \
-    constant size_t &h, \
-    constant size_t &d, \
-    constant size_t &stride_b, \
-    device const TYPENAME *src,  \
-    device const TYPENAME *cos,  \
-    device const TYPENAME *sin,  \
-    device TYPENAME *dst, \
-    uint idx [[ thread_position_in_grid ]] \
-) { \
-    rope_thd<TYPENAME>(b, t, h, d, stride_b, src, cos, sin, dst, idx); \
-}\
+template<typename T>
+[[kernel]] void rope_i_kernel(
+    constant size_t &bh,
+    constant size_t &td,
+    constant size_t &stride_b,
+    device const T *src,
+    device const T *cos,
+    device const T *sin,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    ropei<T>(bh, td, stride_b, src, cos, sin, dst, tid);
+}
 
-impl_rms_norm(rmsnorm_f32, float)
-impl_rms_norm(rmsnorm_f16, half)
-impl_layer_norm(layernorm_f32, float)
-impl_layer_norm(layernorm_f16, half)
-ROPE(rope_f32, rope_i_f32, rope_thd_f32, float)
-ROPE(rope_f16, rope_i_f16, rope_thd_f16, half)
+template<typename T>
+[[kernel]] void rope_kernel(
+    constant size_t &bh,
+    constant size_t &td,
+    constant size_t &d,
+    constant size_t &stride_b,
+    device const T *src,
+    device const T *cos,
+    device const T *sin,
+    device T *dst,
+    uint idx [[ thread_position_in_grid ]]
+) {
+    rope<T>(bh, td, d, stride_b, src, cos, sin, dst, idx);
+}
 
-impl_reduce(Sum, fast_sum_f32, float)
-impl_reduce(Sum, fast_sum_u32, uint)
-impl_reduce(Sum, fast_sum_f16, half)
-impl_reduce(Sum, fast_sum_u8, uint8_t)
+template<typename T>
+[[kernel]] void rope_thd_kernel(
+    constant size_t &b,
+    constant size_t &t,
+    constant size_t &h,
+    constant size_t &d,
+    constant size_t &stride_b,
+    device const T *src,
+    device const T *cos,
+    device const T *sin,
+    device T *dst,
+    uint idx [[ thread_position_in_grid ]]
+) {
+    rope_thd<T>(b, t, h, d, stride_b, src, cos, sin, dst, idx);
+}
 
-impl_reduce(Mul, fast_mul_f32, float)
-impl_reduce(Mul, fast_mul_u32, uint)
-impl_reduce(Mul, fast_mul_f16, half)
-impl_reduce(Mul, fast_mul_u8, uint8_t)
+// The three variants a single `ROPE(...)` used to generate. Note the name
+// shapes differ between them — `rope_f32`, `rope_i_f32`, `rope_thd_f32` — so
+// the dtype suffix is not a common tail and each is spelled out.
+#define init_rope(tname, t)                                     \
+    init_kernel("rope_" #tname, rope_kernel, t)                 \
+    init_kernel("rope_i_" #tname, rope_i_kernel, t)             \
+    init_kernel("rope_thd_" #tname, rope_thd_kernel, t)
 
-impl_reduce(Max, fast_max_f32, float)
-impl_reduce(Max, fast_max_u32, uint)
-impl_reduce(Max, fast_max_f16, half)
-impl_reduce(Max, fast_max_u8, uint8_t)
+init_rms_norm(f32, float)
+init_rms_norm(f16, half)
+init_layer_norm(f32, float)
+init_layer_norm(f16, half)
+init_rope(f32, float)
+init_rope(f16, half)
 
-impl_reduce(Min, fast_min_f32, float)
-impl_reduce(Min, fast_min_u32, uint)
-impl_reduce(Min, fast_min_f16, half)
-impl_reduce(Min, fast_min_u8, uint8_t)
+init_reduce(Sum, sum, f32, float)
+init_reduce(Sum, sum, u32, uint)
+init_reduce(Sum, sum, f16, half)
+init_reduce(Sum, sum, u8, uint8_t)
 
-impl_arg_reduce(Min, fast_argmin_f32, float)
-impl_arg_reduce(Min, fast_argmin_f16, half)
-impl_arg_reduce(Min, fast_argmin_u32, uint)
-impl_arg_reduce(Min, fast_argmin_u8, uint8_t)
+init_reduce(Mul, mul, f32, float)
+init_reduce(Mul, mul, u32, uint)
+init_reduce(Mul, mul, f16, half)
+init_reduce(Mul, mul, u8, uint8_t)
 
-impl_arg_reduce(Max, fast_argmax_f32, float)
-impl_arg_reduce(Max, fast_argmax_f16, half)
-impl_arg_reduce(Max, fast_argmax_u32, uint)
-impl_arg_reduce(Max, fast_argmax_u8, uint8_t)
+init_reduce(Max, max, f32, float)
+init_reduce(Max, max, u32, uint)
+init_reduce(Max, max, f16, half)
+init_reduce(Max, max, u8, uint8_t)
 
-impl_softmax(softmax_f32, float)
-impl_softmax(softmax_f16, half)
+init_reduce(Min, min, f32, float)
+init_reduce(Min, min, u32, uint)
+init_reduce(Min, min, f16, half)
+init_reduce(Min, min, u8, uint8_t)
 
+init_arg_reduce(Min, argmin, f32, float)
+init_arg_reduce(Min, argmin, f16, half)
+init_arg_reduce(Min, argmin, u32, uint)
+init_arg_reduce(Min, argmin, u8, uint8_t)
+
+init_arg_reduce(Max, argmax, f32, float)
+init_arg_reduce(Max, argmax, f16, half)
+init_arg_reduce(Max, argmax, u32, uint)
+init_arg_reduce(Max, argmax, u8, uint8_t)
+
+init_softmax(f32, float)
+init_softmax(f16, half)
+
+// `int64_t` gains `simd_shuffle_down` and a valid-simd-type marking only at
+// Metal 2.2, so its variants are gated exactly as before.
 #if __METAL_VERSION__ >= 220
-impl_reduce(Sum, fast_sum_i64, int64_t)
-impl_reduce(Mul, fast_mul_i64, int64_t)
-impl_reduce(Min, fast_min_i64, int64_t)
-impl_reduce(Max, fast_max_i64, int64_t)
+init_reduce(Sum, sum, i64, int64_t)
+init_reduce(Mul, mul, i64, int64_t)
+init_reduce(Min, min, i64, int64_t)
+init_reduce(Max, max, i64, int64_t)
 
-impl_arg_reduce(Min, fast_argmin_i64, int64_t)
-impl_arg_reduce(Max, fast_argmax_i64, int64_t)
+init_arg_reduce(Min, argmin, i64, int64_t)
+init_arg_reduce(Max, argmax, i64, int64_t)
 #endif
 
+// `__HAVE_BFLOAT__`, not `__METAL_VERSION__ >= 310`. Both guards appear in this
+// tree and they are not interchangeable (#9 §1.2): everything bfloat in this
+// file is reached through the operator overloads and `simd_shuffle_down`
+// shim above, all of which are themselves under `__HAVE_BFLOAT__`.
 #if defined(__HAVE_BFLOAT__)
-impl_reduce(Sum, fast_sum_bf16, bfloat)
-impl_reduce(Mul, fast_mul_bf16, bfloat)
-impl_reduce(Max, fast_max_bf16, bfloat)
-impl_reduce(Min, fast_min_bf16, bfloat)
+init_reduce(Sum, sum, bf16, bfloat)
+init_reduce(Mul, mul, bf16, bfloat)
+init_reduce(Max, max, bf16, bfloat)
+init_reduce(Min, min, bf16, bfloat)
 
-impl_arg_reduce(Min, fast_argmin_bf16, bfloat)
-impl_arg_reduce(Max, fast_argmax_bf16, bfloat)
+init_arg_reduce(Min, argmin, bf16, bfloat)
+init_arg_reduce(Max, argmax, bf16, bfloat)
 
-impl_softmax(softmax_bf16, bfloat)
+init_softmax(bf16, bfloat)
 
-impl_rms_norm(rmsnorm_bf16, bfloat)
-impl_layer_norm(layernorm_bf16, bfloat)
-ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
+init_rms_norm(bf16, bfloat)
+init_layer_norm(bf16, bfloat)
+init_rope(bf16, bfloat)
 #endif
