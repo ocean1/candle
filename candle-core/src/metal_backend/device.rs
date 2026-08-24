@@ -154,6 +154,19 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Issue-19 instrumentation: record that the pool handed back `b`, and
+    /// whether its last writer's fence is still registered at that instant.
+    fn note_pool_hit(&self, b: &Arc<Buffer>) {
+        use std::sync::atomic::Ordering;
+        if !reuse_probe::ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        reuse_probe::POOL_HITS.fetch_add(1, Ordering::Relaxed);
+        if self.commands.probe_has_pending_writer(b) {
+            reuse_probe::HITS_WITH_PENDING_WRITER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
         let command_encoder = self.commands.command_encoder().map_err(MetalError::from)?;
         Ok(command_encoder)
@@ -228,6 +241,7 @@ impl MetalDevice {
         let size = element_count * dtype.size_in_bytes();
         let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
         if let Some(b) = find_available_buffer(size, &buffers) {
+            self.note_pool_hit(&b);
             return Ok(b.clone());
         }
         let size = buf_size(size);
@@ -311,6 +325,7 @@ impl MetalDevice {
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
         if let Some(b) = find_available_buffer(size, &buffers) {
             // Cloning also ensures we increment the strong count
+            self.note_pool_hit(&b);
             return Ok(b.clone());
         }
         let size = buf_size(size);
@@ -532,4 +547,32 @@ fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>
         }
     }
     best_buffer.cloned()
+}
+
+/// Instrumentation for lloom issue #19. Counts pool reuse and, of those, how
+/// many handed back a buffer with an in-flight writer still registered.
+/// Off every path but the probe: the counters are only incremented, and the
+/// `probe_has_pending_writer` lookup happens only when `REUSE_PROBE` is on.
+pub mod reuse_probe {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    pub static ENABLED: AtomicBool = AtomicBool::new(false);
+    pub static POOL_HITS: AtomicUsize = AtomicUsize::new(0);
+    pub static HITS_WITH_PENDING_WRITER: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn enable() {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn snapshot() -> (usize, usize) {
+        (
+            POOL_HITS.load(Ordering::Relaxed),
+            HITS_WITH_PENDING_WRITER.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        POOL_HITS.store(0, Ordering::Relaxed);
+        HITS_WITH_PENDING_WRITER.store(0, Ordering::Relaxed);
+    }
 }

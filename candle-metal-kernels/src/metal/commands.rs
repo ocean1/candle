@@ -175,6 +175,18 @@ impl Commands {
         })
     }
 
+    /// Probe hook: is `ptr` currently registered as written-by-an-encoder whose
+    /// GPU work has not yet completed? Used by the issue-19 reuse probe to ask
+    /// whether the bind-time per-buffer wait can find a fence for a recycled
+    /// buffer. Not on any hot path.
+    pub fn probe_has_pending_writer(&self, buffer: &Buffer) -> bool {
+        let ptr = buffer.raw_ptr() as usize;
+        self.prev_ce_outputs
+            .lock()
+            .map(|m| m.contains_key(&ptr))
+            .unwrap_or(false)
+    }
+
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
