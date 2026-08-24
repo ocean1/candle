@@ -222,6 +222,13 @@ impl Commands {
 
         // Wait for all prior encoder fences before any blit commands execute.
         // Required for HazardTrackingModeUntracked: GPU caches are not auto-flushed.
+        //
+        // This covers every *compute* encoder that has ended, because
+        // `Commands::end_encoding` adds its fence to `live_fences`. It does not
+        // cover a prior *blit*: `BlitCommandEncoder::end_encoding` registers its
+        // outputs in `prev_ce_outputs` but never adds its fence here. That is
+        // why the per-buffer waits in `copy_from_buffer` / `fill_buffer` are not
+        // redundant with this one.
         {
             let fences = self.live_fences.lock().unwrap();
             for live in fences.iter() {
