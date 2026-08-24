@@ -14,6 +14,7 @@ use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
+use super::pool_stats::{stats, PoolOccupancy, PoolStatsSnapshot};
 use super::MetalError;
 
 /// Unique identifier for metal devices.
@@ -129,10 +130,15 @@ impl MetalDevice {
     }
 
     fn drop_unused_buffers(&self) -> Result<()> {
+        let mut visits: u64 = 0;
+        let mut freed: u64 = 0;
+
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
         for subbuffers in buffers.values_mut() {
             subbuffers.retain(|s| {
+                visits += 1;
                 if Arc::strong_count(s) == 1 {
+                    freed += 1;
                     self.residency_set.remove(s);
                     false
                 } else {
@@ -143,7 +149,9 @@ impl MetalDevice {
         let mut private_buffers = self.private_buffers.write().map_err(MetalError::from)?;
         for subbuffers in private_buffers.values_mut() {
             subbuffers.retain(|s| {
+                visits += 1;
                 if Arc::strong_count(s) == 1 {
+                    freed += 1;
                     self.residency_set.remove(s);
                     false
                 } else {
@@ -151,7 +159,56 @@ impl MetalDevice {
                 }
             });
         }
+        stats().record_sweep(visits, freed);
         Ok(())
+    }
+
+    /// Samples live pool occupancy. Takes read locks only, so it is safe to
+    /// call between phases of a generation.
+    ///
+    /// `bytes` is summed from `Buffer::length()`, i.e. what Metal actually
+    /// allocated after `buf_size` alignment, not what the caller requested.
+    /// That is the figure issue #8 moved from 7731 MB to 5509 MB and the one
+    /// that must not regress.
+    pub fn pool_occupancy(&self) -> Result<PoolOccupancy> {
+        let mut occ = PoolOccupancy::default();
+
+        let buffers = self.buffers.read().map_err(MetalError::from)?;
+        occ.shared_buckets = buffers.len();
+        for subbuffers in buffers.values() {
+            if subbuffers.is_empty() {
+                occ.shared_empty_buckets += 1;
+            }
+            occ.shared_buffers += subbuffers.len();
+            for b in subbuffers {
+                occ.shared_bytes += b.length();
+            }
+        }
+        drop(buffers);
+
+        let private_buffers = self.private_buffers.read().map_err(MetalError::from)?;
+        occ.private_buckets = private_buffers.len();
+        for subbuffers in private_buffers.values() {
+            if subbuffers.is_empty() {
+                occ.private_empty_buckets += 1;
+            }
+            occ.private_buffers += subbuffers.len();
+            for b in subbuffers {
+                occ.private_bytes += b.length();
+            }
+        }
+
+        Ok(occ)
+    }
+
+    /// Current scan/sweep counters. See `pool_stats` for what each one means.
+    pub fn pool_stats(&self) -> PoolStatsSnapshot {
+        stats().snapshot()
+    }
+
+    /// Zeroes the counters so a later phase can be reported on its own.
+    pub fn reset_pool_stats(&self) {
+        stats().reset();
     }
 
     pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
@@ -237,6 +294,7 @@ impl MetalDevice {
             .device
             .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
+        stats().record_allocation(size as u64);
         let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
         subbuffers.push(new_buffer.clone());
@@ -320,6 +378,7 @@ impl MetalDevice {
             .device
             .new_buffer(size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
+        stats().record_allocation(size as u64);
         let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
         subbuffers.push(new_buffer.clone());
@@ -519,11 +578,21 @@ mod tests {
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+    // Counters only; the scan below is byte-for-byte the original algorithm.
+    // `buckets` counts every key the iterator visits -- the loop has no early
+    // exit, so that is every key in the map regardless of the size predicate.
+    // `examined` counts only buffers actually `strong_count`-tested, which is
+    // the inner loop's real cost.
+    let mut buckets: u64 = 0;
+    let mut examined: u64 = 0;
+
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
     for (buffer_size, subbuffers) in buffers.iter() {
+        buckets += 1;
         if buffer_size >= &size && buffer_size < &best_buffer_size {
             for sub in subbuffers {
+                examined += 1;
                 if Arc::strong_count(sub) == 1 {
                     best_buffer = Some(sub);
                     best_buffer_size = *buffer_size;
@@ -531,5 +600,6 @@ fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>
             }
         }
     }
+    stats().record_lookup(buckets, examined, best_buffer.is_some());
     best_buffer.cloned()
 }

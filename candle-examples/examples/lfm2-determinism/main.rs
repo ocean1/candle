@@ -371,6 +371,20 @@ fn main() -> Result<()> {
     let mut hit_eos = false;
     let mut turns_run = 0usize;
 
+    // Pool counters are reported per phase rather than for the whole run.
+    // Prefill and decode allocate very differently -- prefill fills the pool
+    // from empty, decode reuses a warm one -- and averaging them together is
+    // the mistake that produced the 27 ms/token figure (`DESIGN.md` §6.6).
+    // The number issue #21 is about is the steady-state decode one, so the
+    // counters are zeroed once the first prefill has finished and the pool has
+    // reached its working size.
+    let metal_device = match &device {
+        Device::Metal(d) => Some(d.clone()),
+        _ => None,
+    };
+    let mut decode_tokens_measured = 0usize;
+    let mut pool_stats_armed = false;
+
     'turns: for turn in 0..args.turns.max(1) {
         // Turn 0 prefills the initial prompt; later turns append a follow-up to
         // the same cache, so KV state is reused rather than rebuilt.
@@ -393,6 +407,24 @@ fn main() -> Result<()> {
             .squeeze(0)?;
         kv_len += turn_ids.len();
         turns_run = turn + 1;
+
+        // Arm after the first prefill only: by here the pool holds the weights
+        // and the activation buffers a forward pass needs, which is the state
+        // every subsequent decode token sees. Prefill's own scans are reported
+        // separately below.
+        if !pool_stats_armed {
+            if let Some(d) = &metal_device {
+                let prefill = d.pool_stats();
+                if prefill.lookups > 0 {
+                    println!("PREFILL_{}", prefill.report(&args.label));
+                }
+                if let Ok(occ) = d.pool_occupancy() {
+                    println!("PREFILL_{}", occ.report(&args.label));
+                }
+                d.reset_pool_stats();
+            }
+            pool_stats_armed = true;
+        }
 
         loop {
             if tokens.len() >= args.n {
@@ -432,12 +464,40 @@ fn main() -> Result<()> {
                 .context("decode forward pass")?
                 .squeeze(0)?;
             kv_len += 1;
+            decode_tokens_measured += 1;
         }
     }
 
     let elapsed = start.elapsed();
     let token_digest = sha256::hex(&token_hasher.finalize());
     let logits_digest = sha256::hex(&logits_hasher.finalize());
+
+    // Steady-state decode: everything since the first prefill completed. This
+    // is the phase issue #21 targets, and normalizing by the decode-token count
+    // gives the per-token scan length -- the quantity that should move, and the
+    // one wall-clock hides (§6.7 §9).
+    if let Some(d) = &metal_device {
+        let decode = d.pool_stats();
+        if decode.lookups > 0 {
+            println!("DECODE_{}", decode.report(&args.label));
+            let n = decode_tokens_measured.max(1) as f64;
+            println!(
+                "DECODE_PER_TOKEN label={} decode_tokens={} lookups_per_token={:.1} \
+                 buckets_walked_per_token={:.1} buffers_examined_per_token={:.1} \
+                 allocations_per_token={:.2} sweep_visits_per_token={:.1}",
+                args.label,
+                decode_tokens_measured,
+                decode.lookups as f64 / n,
+                decode.buckets_walked as f64 / n,
+                decode.buffers_examined as f64 / n,
+                decode.allocations as f64 / n,
+                decode.sweep_visits as f64 / n,
+            );
+        }
+        if let Ok(occ) = d.pool_occupancy() {
+            println!("FINAL_{}", occ.report(&args.label));
+        }
+    }
 
     if args.dump_tokens {
         for (i, (tok, digest, kv)) in per_step.iter().enumerate() {

@@ -21,6 +21,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 mod device;
 pub use device::{DeviceId, MetalDevice};
 
+pub mod pool_stats;
+pub use pool_stats::{PoolOccupancy, PoolStatsSnapshot};
+
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {
         buffer,
