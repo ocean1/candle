@@ -95,6 +95,58 @@ pub fn call_conv1d_depthwise(
     Ok(())
 }
 
+/// Fused depthwise 1D convolution, specialized for `stride == 1`,
+/// `dilation == 1` and a contiguous source.
+///
+/// Same result as [`call_conv1d_depthwise`]; the difference is that `k_size` is
+/// baked into the pipeline (so the tap loop unrolls) and the addressing is
+/// direct rather than going through `src_strides[]`. The caller picks the name
+/// via `ConvKernel::conv1d_depthwise_k(k_size)`, which returns `None` when no
+/// variant is instantiated for that `k` — that is the signal to use the generic
+/// entry point, not an error.
+///
+/// The preconditions are the caller's to enforce; this function cannot check
+/// them, because the layout is not passed in. `MetalStorage::conv1d_depthwise`
+/// is the single caller and checks all three.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv1d_depthwise_k(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    (k_size, padding): (usize, usize),
+    input: BufferOffset,
+    weight: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    // stride == 1 and dilation == 1 are preconditions, so this reduces to
+    // l_in + 2 * padding - (k_size - 1).
+    let l_out = shape[2] + 2 * padding - (k_size - 1);
+    let dst_el = shape[0] * shape[1] * l_out;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "conv1d_depthwise_k {name} dst_el={dst_el}");
+    set_params!(
+        encoder,
+        (
+            dst_el,
+            l_out,
+            padding,
+            shape,
+            &input,
+            &weight,
+            Output::new(output)
+        )
+    );
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_col2im1d(
     device: &Device,

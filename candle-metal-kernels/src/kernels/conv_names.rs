@@ -30,6 +30,16 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvKernel {
     stem: &'static str,
+    /// Trailing segment after the dtype suffix, for families carrying a
+    /// compile-tier axis in the name. Empty for the plain `<stem>_<dtype>`
+    /// families; `"_k3"` and friends for the `k_size`-specialized depthwise
+    /// variants, per `DESIGN.md` §7.4's `<op>_<dtype>_k<K>` convention.
+    ///
+    /// Kept as an explicit field rather than folded into the verbatim names so
+    /// that `conv_names_match_their_stem_and_suffix` still checks the full
+    /// spelling rule and does not have to be weakened to accommodate a longer
+    /// name.
+    tail: &'static str,
     /// `(dtype suffix, full `[[host_name]]`)`, one row per instantiation in
     /// `conv.metal`.
     ///
@@ -42,6 +52,7 @@ pub struct ConvKernel {
 impl ConvKernel {
     pub const IM2COL1D: Self = Self {
         stem: "im2col1d",
+        tail: "",
         variants: &[
             ("f32", "im2col1d_f32"),
             ("f16", "im2col1d_f16"),
@@ -53,6 +64,7 @@ impl ConvKernel {
 
     pub const IM2COL: Self = Self {
         stem: "im2col",
+        tail: "",
         variants: &[
             ("f32", "im2col_f32"),
             ("f16", "im2col_f16"),
@@ -64,6 +76,7 @@ impl ConvKernel {
 
     pub const COL2IM1D: Self = Self {
         stem: "col2im1d",
+        tail: "",
         variants: &[
             ("f32", "col2im1d_f32"),
             ("f16", "col2im1d_f16"),
@@ -77,6 +90,7 @@ impl ConvKernel {
     /// `float`, which the integer instantiations would not do meaningfully.
     pub const CONV1D_DEPTHWISE: Self = Self {
         stem: "conv1d_depthwise",
+        tail: "",
         variants: &[
             ("f32", "conv1d_depthwise_f32"),
             ("f16", "conv1d_depthwise_f16"),
@@ -84,8 +98,59 @@ impl ConvKernel {
         ],
     };
 
+    /// The `k_size`-specialized depthwise variants, one family per compile-time
+    /// `K`. Separate constants rather than one family because the `(dtype, K)`
+    /// pair is the key: `name()` looks up by dtype suffix alone, so each `K` is
+    /// its own family for that lookup to stay total.
+    ///
+    /// A `K` absent from this set is not an error — `conv1d_depthwise_k` refuses
+    /// and the caller uses the generic kernel — so the set is a performance
+    /// choice, never a correctness one.
+    pub const CONV1D_DEPTHWISE_K2: Self = Self {
+        stem: "conv1d_depthwise",
+        tail: "_k2",
+        variants: &[
+            ("f32", "conv1d_depthwise_f32_k2"),
+            ("f16", "conv1d_depthwise_f16_k2"),
+            ("bf16", "conv1d_depthwise_bf16_k2"),
+        ],
+    };
+
+    pub const CONV1D_DEPTHWISE_K3: Self = Self {
+        stem: "conv1d_depthwise",
+        tail: "_k3",
+        variants: &[
+            ("f32", "conv1d_depthwise_f32_k3"),
+            ("f16", "conv1d_depthwise_f16_k3"),
+            ("bf16", "conv1d_depthwise_bf16_k3"),
+        ],
+    };
+
+    pub const CONV1D_DEPTHWISE_K4: Self = Self {
+        stem: "conv1d_depthwise",
+        tail: "_k4",
+        variants: &[
+            ("f32", "conv1d_depthwise_f32_k4"),
+            ("f16", "conv1d_depthwise_f16_k4"),
+            ("bf16", "conv1d_depthwise_bf16_k4"),
+        ],
+    };
+
+    /// The specialized depthwise family for a compile-time `k_size`, or `None`
+    /// if no variant is instantiated for that `k`. `None` means "use the generic
+    /// kernel", not "unsupported".
+    pub fn conv1d_depthwise_k(k_size: usize) -> Option<Self> {
+        match k_size {
+            2 => Some(Self::CONV1D_DEPTHWISE_K2),
+            3 => Some(Self::CONV1D_DEPTHWISE_K3),
+            4 => Some(Self::CONV1D_DEPTHWISE_K4),
+            _ => None,
+        }
+    }
+
     pub const CONV_TRANSPOSE1D: Self = Self {
         stem: "conv_transpose1d",
+        tail: "",
         variants: &[
             ("f32", "conv_transpose1d_f32"),
             ("f16", "conv_transpose1d_f16"),
@@ -98,6 +163,7 @@ impl ConvKernel {
     /// Float-only: `conv.metal` declares no integer `CONVT2D_OP`.
     pub const CONV_TRANSPOSE2D: Self = Self {
         stem: "conv_transpose2d",
+        tail: "",
         variants: &[
             ("f32", "conv_transpose2d_f32"),
             ("f16", "conv_transpose2d_f16"),
@@ -107,6 +173,7 @@ impl ConvKernel {
 
     pub const UPSAMPLE_NEAREST2D: Self = Self {
         stem: "upsample_nearest2d",
+        tail: "",
         variants: &[
             ("f32", "upsample_nearest2d_f32"),
             ("f16", "upsample_nearest2d_f16"),
@@ -118,6 +185,7 @@ impl ConvKernel {
 
     pub const UPSAMPLE_BILINEAR2D: Self = Self {
         stem: "upsample_bilinear2d",
+        tail: "",
         variants: &[
             ("f32", "upsample_bilinear2d_f32"),
             ("f16", "upsample_bilinear2d_f16"),
@@ -129,6 +197,7 @@ impl ConvKernel {
 
     pub const MAX_POOL2D: Self = Self {
         stem: "max_pool2d",
+        tail: "",
         variants: &[
             ("f32", "max_pool2d_f32"),
             ("f16", "max_pool2d_f16"),
@@ -140,6 +209,7 @@ impl ConvKernel {
 
     pub const AVG_POOL2D: Self = Self {
         stem: "avg_pool2d",
+        tail: "",
         variants: &[
             ("f32", "avg_pool2d_f32"),
             ("f16", "avg_pool2d_f16"),
@@ -156,6 +226,9 @@ impl ConvKernel {
         Self::IM2COL,
         Self::COL2IM1D,
         Self::CONV1D_DEPTHWISE,
+        Self::CONV1D_DEPTHWISE_K2,
+        Self::CONV1D_DEPTHWISE_K3,
+        Self::CONV1D_DEPTHWISE_K4,
         Self::CONV_TRANSPOSE1D,
         Self::CONV_TRANSPOSE2D,
         Self::UPSAMPLE_NEAREST2D,
@@ -167,6 +240,12 @@ impl ConvKernel {
     /// The family's name without a dtype suffix, for diagnostics.
     pub const fn stem(&self) -> &'static str {
         self.stem
+    }
+
+    /// The segment following the dtype suffix — empty for the plain families,
+    /// `"_k3"` and friends for the `k_size`-specialized depthwise variants.
+    pub const fn tail(&self) -> &'static str {
+        self.tail
     }
 
     /// The `[[host_name]]` string for this family at `dtype_suffix`, or `None`

@@ -1048,25 +1048,51 @@ impl BackendStorage for MetalStorage {
             .with_label("conv1d_depthwise")
             .build()?;
 
+        // Prefer the k_size-specialized variant when every precondition it was
+        // compiled under holds. All three are required together: the kernel
+        // hard-codes stride and dilation to 1 and indexes the source as a
+        // contiguous (b, c, l_in), so a violation would read the wrong elements
+        // rather than merely run slower.
+        let specialized = if params.stride == 1 && params.dilation == 1 && layout.is_contiguous() {
+            ConvKernel::conv1d_depthwise_k(params.k_size)
+                .and_then(|family| family.name(self.dtype.as_str()))
+        } else {
+            None
+        };
+
         let encoder = self.device.command_encoder()?;
-        candle_metal_kernels::call_conv1d_depthwise(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            dims,
-            layout.stride(),
-            (
-                params.k_size,
-                params.stride,
-                params.padding,
-                params.dilation,
-            ),
-            buffer_o(&self.buffer, layout, self.dtype),
-            buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
-            &dst,
-        )
-        .map_err(MetalError::from)?;
+        match specialized {
+            Some(name) => candle_metal_kernels::call_conv1d_depthwise_k(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                dims,
+                (params.k_size, params.padding),
+                buffer_o(&self.buffer, layout, self.dtype),
+                buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+                &dst,
+            )
+            .map_err(MetalError::from)?,
+            None => candle_metal_kernels::call_conv1d_depthwise(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                dims,
+                layout.stride(),
+                (
+                    params.k_size,
+                    params.stride,
+                    params.padding,
+                    params.dilation,
+                ),
+                buffer_o(&self.buffer, layout, self.dtype),
+                buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+                &dst,
+            )
+            .map_err(MetalError::from)?,
+        }
 
         Ok(Self::new(dst, self.device.clone(), dst_el, self.dtype))
     }

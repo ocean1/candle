@@ -557,6 +557,75 @@ template <typename T, typename A>
   dst[tid] = static_cast<T>(acc);
 }
 
+// Depthwise 1D convolution, specialized for the common contiguous case.
+//
+// Same computation as `conv1d_depthwise` above, with three things moved from
+// runtime to compile time:
+//
+//   - K_SIZE is a template parameter, so the tap loop has a constant trip count
+//     and unrolls. The generic kernel reads k_size from a buffer, so it cannot.
+//   - stride and dilation are fixed at 1, so `pos` is `l_idx + k` — one add,
+//     no multiplies.
+//   - the source is contiguous, so addressing is `(b*c + c_idx)*l_in + src_l`
+//     rather than three loads from src_strides[] and three multiplies.
+//
+// The padding branches stay, but they are now comparisons against compile-time
+// K_SIZE-derived values inside an unrolled body, so the compiler hoists what it
+// can. They are *not* eliminated: `l_idx` is a runtime value, so which taps fall
+// in the padding genuinely varies per thread. See the measurement note in the
+// issue-10 write-up — the branches diverge only in the simdgroups that straddle
+// an l_out boundary, which for a long prefill is a small minority.
+//
+// Preconditions the caller must check (see `call_conv1d_depthwise_k`):
+// stride == 1, dilation == 1, contiguous source, and K_SIZE matching an
+// instantiated variant. Anything else uses the generic kernel above.
+template <typename T, typename A, ushort K_SIZE>
+[[kernel]] void conv1d_depthwise_k(
+    constant size_t &dst_numel,
+    constant size_t &l_out,
+    constant size_t &padding,
+    constant size_t *src_dims,
+    device const T *src,
+    device const T *weight,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  if (tid >= dst_numel) {
+    return;
+  }
+
+  const size_t c = src_dims[1];
+  const size_t l_in = src_dims[2];
+
+  const size_t l_idx = tid % l_out;
+  const size_t tmp = tid / l_out;
+  const size_t c_idx = tmp % c;
+  const size_t b_idx = tmp / c;
+
+  // Accumulate in a wider type for the same reason the generic kernel does.
+  A acc = static_cast<A>(0);
+  // Contiguous (b, c, l_in): the row base is a single multiply-add.
+  const size_t src_base = (b_idx * c + c_idx) * l_in;
+  const size_t w_base = c_idx * K_SIZE;
+
+#pragma clang loop unroll(full)
+  for (ushort k = 0; k < K_SIZE; ++k) {
+    // stride == 1 and dilation == 1 are preconditions, so this is just l_idx + k.
+    const size_t pos = l_idx + k;
+    if (pos < padding) {
+      continue;
+    }
+    const size_t src_l = pos - padding;
+    if (src_l >= l_in) {
+      continue;
+    }
+    acc += static_cast<A>(src[src_base + src_l])
+         * static_cast<A>(weight[w_base + k]);
+  }
+
+  dst[tid] = static_cast<T>(acc);
+}
+
 // Explicit instantiation. `decltype(func<...>)` restates the template's own
 // signature, so a variant is declared by naming the type arguments and the
 // `[[host_name]]` string only — the parameter list is written once, in the
@@ -574,6 +643,12 @@ template <typename T, typename A>
 // than unified.
 #define init_conv1d_depthwise(tname, t, acc) \
     init_kernel("conv1d_depthwise_" #tname, conv1d_depthwise, t, acc)
+
+// The specialized variant carries k_size in its name, per DESIGN.md §7.4's
+// `<op>_<dtype>_k<K>` shape. K is a compile-tier axis: it fixes the tap loop's
+// trip count, so it changes the generated code and the register allocation.
+#define init_conv1d_depthwise_k(tname, t, acc, k) \
+    init_kernel("conv1d_depthwise_" #tname "_k" #k, conv1d_depthwise_k, t, acc, k)
 
 #define init_im2col1d(tname, t) \
     init_kernel("im2col1d_" #tname, im2col1d, t)
@@ -622,6 +697,21 @@ init_conv1d_depthwise(f32, float, float);
 init_conv1d_depthwise(f16, half, float);
 #if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
 init_conv1d_depthwise(bf16, bfloat, float);
+#endif
+
+// k = 2, 3, 4 covers the depthwise widths that occur in practice; LFM2 uses 3
+// (conv_L_cache). Anything outside the set falls back to the generic kernel
+// above, so the list is a performance choice and never a correctness one.
+init_conv1d_depthwise_k(f32, float, float, 2);
+init_conv1d_depthwise_k(f32, float, float, 3);
+init_conv1d_depthwise_k(f32, float, float, 4);
+init_conv1d_depthwise_k(f16, half, float, 2);
+init_conv1d_depthwise_k(f16, half, float, 3);
+init_conv1d_depthwise_k(f16, half, float, 4);
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
+init_conv1d_depthwise_k(bf16, bfloat, float, 2);
+init_conv1d_depthwise_k(bf16, bfloat, float, 3);
+init_conv1d_depthwise_k(bf16, bfloat, float, 4);
 #endif
 
 init_im2col1d(f32, float);

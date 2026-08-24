@@ -2530,15 +2530,16 @@ fn conv_names_resolve() {
     // its variants — an all-green run over zero names would otherwise pass.
     // 5 dtypes each for im2col1d, im2col, col2im1d, conv_transpose1d,
     // upsample_nearest2d, upsample_bilinear2d, max_pool2d and avg_pool2d, plus
-    // 3 each for the float-only conv1d_depthwise and conv_transpose2d.
+    // 3 each for the float-only conv1d_depthwise and conv_transpose2d, and 3
+    // each for the three k_size-specialized depthwise families (k = 2, 3, 4).
     assert_eq!(
-        checked, 46,
-        "expected 46 declared conv variants, found {checked}"
+        checked, 55,
+        "expected 55 declared conv variants, found {checked}"
     );
 }
 
-/// Each declared name must be its family's stem followed by its dtype suffix,
-/// and each suffix must appear once per family.
+/// Each declared name must be its family's stem, then its dtype suffix, then
+/// the family's tail, and each suffix must appear once per family.
 ///
 /// The names are stored verbatim so they can be grepped against `conv.metal`,
 /// which means a row could pair one family's suffix with another family's name
@@ -2546,6 +2547,12 @@ fn conv_names_resolve() {
 /// [`ConvKernel::name`] handed callers the wrong kernel. Checking the spelling
 /// against the stem closes that, and the duplicate check catches a copy-pasted
 /// row that shadows the one below it.
+///
+/// The tail carries a compile-tier axis for families that have one (`_k3` on
+/// the `k_size`-specialized depthwise variants). It is checked here rather than
+/// exempted, so those names are held to the same full spelling rule as the
+/// rest — a `_k3` row that resolved to a `_k2` kernel is exactly the
+/// wrong-kernel case this test exists to catch, and it would be silent.
 #[test]
 fn conv_names_match_their_stem_and_suffix() {
     for family in ConvKernel::ALL {
@@ -2553,9 +2560,10 @@ fn conv_names_match_their_stem_and_suffix() {
         for (suffix, name) in family.variants() {
             assert_eq!(
                 name,
-                format!("{}_{suffix}", family.stem()),
-                "ConvKernel::{} declares {name:?} for {suffix:?}",
+                format!("{}_{suffix}{}", family.stem(), family.tail()),
+                "ConvKernel::{}{} declares {name:?} for {suffix:?}",
                 family.stem(),
+                family.tail(),
             );
             assert!(
                 !seen.contains(&suffix),
