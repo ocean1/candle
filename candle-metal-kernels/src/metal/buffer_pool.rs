@@ -16,9 +16,9 @@
 //! # What changes
 //!
 //! The pool holds `Weak`, the caller holds the only strong reference, and
-//! `PooledBuffer::drop` **pushes** the buffer onto its bucket's free list at
-//! the exact moment the last user releases it. Lookup then pops from a free
-//! list instead of searching for a free buffer.
+//! `PooledBuffer::drop` **pushes** the buffer back at the exact moment the last
+//! user releases it. Lookup then pops from a free list instead of searching for
+//! a free buffer.
 //!
 //! Reclamation stays automatic and `Drop`-driven. **No caller is required to
 //! release a buffer by hand**, which is the property that makes candle's
@@ -29,7 +29,8 @@
 //! # Structure
 //!
 //! ```text
-//!   free: BTreeMap<usize, Vec<Buffer>>     size -> buffers ready to hand out
+//!   free:    BTreeMap<usize, Vec<Buffer>>  size -> buffers ready to hand out
+//!   pending: VecDeque<PendingBuffer>       released, waiting on the GPU
 //!   live_buffers / live_bytes: usize       what callers currently hold
 //! ```
 //!
@@ -40,25 +41,97 @@
 //! generation the old pool accumulated 1345 bucket keys of which 1324 were
 //! empty, and walked all of them on every allocation.
 //!
-//! # What this deliberately does not do
+//! # Reuse is decided on the GPU clock
 //!
-//! It does not make reuse GPU-liveness-aware. `PooledBuffer::drop` fires when
-//! the **CPU** releases its last reference, which is exactly when the old
-//! `strong_count == 1` predicate fired, so the reuse decision is made on the
-//! same clock as before and issue #19 is neither fixed nor worsened. That is
-//! intentional: #19 is a correctness bug with a different fix, and bundling
-//! them would make both unreviewable.
+//! A buffer becomes reusable when **the GPU is finished with it**, not when the
+//! CPU drops its last handle. Those are different instants, and the difference
+//! is a correctness bug (issue #19): the CPU routinely runs a long way ahead of
+//! the GPU, so a dropped buffer usually still has work outstanding on it. The
+//! pool used to hand it straight back, aliasing two unrelated tensors onto one
+//! allocation while the first was still being written. Measured, ~90 % of the
+//! wrong values that produced were exactly another operation's correct output.
 //!
-//! What this *does* provide is the seam where that fix lands. `release()` is
-//! the single point at which a buffer re-enters the free list, so returning a
-//! buffer on GPU completion rather than on CPU drop becomes a change to *when
-//! `release` is called* -- have `Drop` hand the buffer to the in-flight command
-//! buffer's completion handler instead of straight to the free list -- rather
-//! than a change to how lookup works. See `PoolInner::release`.
+//! No fence can fix that, which is why the fix is here rather than in the
+//! encoder. At the instant the pool aliases two tensors, no encoder has bound
+//! the buffer, so there is nothing to fence against; by the time one binds it,
+//! it looks like an ordinary fresh allocation. The dependency is real and
+//! invisible at every point where a fence could be emitted.
+//!
+//! So the release condition is GPU completion, and the CPU drop is not a second
+//! predicate beside it -- it is only the signal that the buffer has no *future*
+//! CPU user. One clock decides reuse. See [`GpuClock`] and `PoolInner::release`.
 
 use super::Buffer;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+/// Tracks how far the GPU has got through the command buffers submitted to it.
+///
+/// Command buffers on one queue complete **in order**, so a single monotone
+/// counter is enough: if buffer N has completed, every buffer before it has
+/// too. `Commands` already relies on this to wait only on the last in-flight
+/// buffer.
+///
+/// Two counters:
+///
+/// - `submitted` names the command buffer work is *currently being encoded
+///   into*. It is incremented when that buffer is committed and a fresh one
+///   takes its place.
+/// - `completed` is the highest epoch the GPU has finished.
+///
+/// A buffer dropped now may have been bound into any command buffer up to and
+/// including `submitted`, so `submitted` is the epoch it must outlive. That is
+/// conservative -- the buffer may have last been touched much earlier, or never
+/// touched at all -- and deliberately so: being wrong in this direction costs a
+/// little reuse latency, while being wrong in the other direction corrupts.
+#[derive(Debug, Default)]
+pub struct GpuClock {
+    submitted: AtomicU64,
+    completed: AtomicU64,
+}
+
+impl GpuClock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The epoch a buffer dropped right now must outlive.
+    pub fn current_epoch(&self) -> u64 {
+        self.submitted.load(Ordering::Acquire)
+    }
+
+    /// Opens a new epoch, because the command buffer holding the old one has
+    /// been committed. Returns the epoch just closed -- the one whose
+    /// completion handler should report back to [`Self::mark_completed`].
+    pub fn commit_epoch(&self) -> u64 {
+        self.submitted.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Records that the GPU has finished epoch `epoch`.
+    ///
+    /// Stored as `epoch + 1` -- a count of finished epochs -- so that the
+    /// initial zero means "nothing has completed" rather than "epoch 0 has",
+    /// which are different states and would otherwise be indistinguishable.
+    ///
+    /// Takes a max rather than a store because completion handlers for
+    /// different command buffers may be delivered on different threads;
+    /// in-order execution guarantees the ordering of the *work*, not of the
+    /// notification.
+    pub fn mark_completed(&self, epoch: u64) {
+        self.completed.fetch_max(epoch + 1, Ordering::AcqRel);
+    }
+
+    /// How many epochs have finished. Zero means none have.
+    pub fn completed_count(&self) -> u64 {
+        self.completed.load(Ordering::Acquire)
+    }
+
+    /// Whether work encoded in `epoch` is known to have finished.
+    fn is_complete(&self, epoch: u64) -> bool {
+        self.completed_count() > epoch
+    }
+}
 
 /// A buffer that returns itself to its pool when the last handle drops.
 ///
@@ -170,6 +243,17 @@ pub struct PoolCounters {
     pub trimmed: u64,
     /// Calls into `trim`.
     pub trims: u64,
+    /// Releases that had to wait for the GPU before becoming reusable.
+    ///
+    /// In steady-state decode this is essentially every release: the CPU runs
+    /// far enough ahead that a dropped buffer almost always still has work
+    /// outstanding. A number near zero here would mean the deferral is not
+    /// doing anything, and the corruption it prevents would still be reachable.
+    pub deferred: u64,
+    /// Buffers moved from the pending list into a free list on GPU completion.
+    pub drained: u64,
+    /// Buffers currently parked waiting for the GPU.
+    pub pending: u64,
 }
 
 struct PoolState {
@@ -192,34 +276,62 @@ struct PoolState {
     live_buffers: usize,
     live_bytes: usize,
 
+    /// Buffers the CPU has released but the GPU may still be using, with the
+    /// epoch each must outlive.
+    ///
+    /// Ordered by epoch, because that is the order they become reusable in:
+    /// draining is a prefix walk that stops at the first epoch still
+    /// outstanding, never a scan of the whole list. Epochs are assigned from a
+    /// monotone counter at push time, so the list is sorted by construction and
+    /// nothing has to sort it.
+    pending: std::collections::VecDeque<PendingBuffer>,
+
     counters: PoolCounters,
+}
+
+/// A buffer waiting for the GPU to finish with it.
+struct PendingBuffer {
+    buffer: Buffer,
+    /// Bucket to return to -- the allocated size, as for a live handle.
+    size: usize,
+    /// The epoch this must outlive before it can be handed out again.
+    epoch: u64,
 }
 
 pub struct PoolInner {
     state: Mutex<PoolState>,
+    /// How far the GPU has got. Shared with `Commands`, which advances it.
+    clock: Arc<GpuClock>,
 }
 
 impl PoolInner {
-    fn new() -> Self {
+    fn new(clock: Arc<GpuClock>) -> Self {
         Self {
             state: Mutex::new(PoolState {
                 free: BTreeMap::new(),
                 live_buffers: 0,
                 live_bytes: 0,
+                pending: std::collections::VecDeque::new(),
                 counters: PoolCounters::default(),
             }),
+            clock,
         }
     }
 
-    /// Returns a buffer to its bucket. Called only from `PooledBuffer::drop`.
+    /// Hands a buffer back. Called only from `PooledBuffer::drop`.
     ///
-    /// **This is the seam for issue #19.** The buffer becomes reusable the
-    /// moment this runs, and today that is CPU-drop time -- identical in
-    /// timing to the `strong_count == 1` predicate it replaces, so in-flight
-    /// reuse is neither introduced nor removed here. To make reuse
-    /// GPU-liveness-aware, defer *this call* until the last command buffer
-    /// that touched the buffer completes; nothing about lookup changes.
+    /// **This is where issue #19 is fixed.** The CPU dropping its last handle
+    /// says the buffer has no future CPU user; it says nothing about whether
+    /// the GPU has finished with it, and in decode it usually has not. So the
+    /// buffer does not go into the free list here unless the GPU is known to be
+    /// done -- otherwise it is parked until the epoch it was dropped in
+    /// completes.
+    ///
+    /// Lookup is untouched. This is a change to *when* a buffer is offered, not
+    /// to how one is found.
     fn release(&self, buffer: Buffer, size: usize) {
+        let epoch = self.clock.current_epoch();
+
         let Ok(mut state) = self.state.lock() else {
             // Poisoned: another thread panicked holding the lock. Dropping the
             // buffer here is safe -- Metal frees it -- and is better than
@@ -230,7 +342,51 @@ impl PoolInner {
         state.live_buffers = state.live_buffers.saturating_sub(1);
         state.live_bytes = state.live_bytes.saturating_sub(size);
 
-        state.free.entry(size).or_default().push(buffer);
+        // Always parks. There is deliberately no "the GPU is idle, hand it back
+        // now" fast path: the epoch a release is stamped with is the one still
+        // open, and an open epoch has by definition not completed, so such a
+        // branch would be unreachable. Anything that would have taken it is
+        // instead swept up by the next drain, which is O(1) amortized -- a
+        // `VecDeque` push here against a `BTreeMap` entry push there, so the
+        // branch would not have bought anything measurable either.
+        state.counters.deferred += 1;
+        state.pending.push_back(PendingBuffer {
+            buffer,
+            size,
+            epoch,
+        });
+        state.counters.pending = state.pending.len() as u64;
+    }
+
+    /// Moves everything whose epoch has completed into the free lists.
+    ///
+    /// Called from a command buffer's completion handler -- **once per command
+    /// buffer, not once per buffer**. A handler per pooled buffer would put
+    /// thousands of block allocations on the decode path; this puts one, and it
+    /// releases every buffer that command buffer was holding up.
+    ///
+    /// `pending` is ordered by epoch, so this stops at the first entry still
+    /// outstanding rather than walking the rest.
+    fn drain_completed(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let mut drained = 0u64;
+        while let Some(front) = state.pending.front() {
+            if !self.clock.is_complete(front.epoch) {
+                break;
+            }
+            let entry = state
+                .pending
+                .pop_front()
+                .expect("front() just returned Some");
+            state.free.entry(entry.size).or_default().push(entry.buffer);
+            drained += 1;
+        }
+        if drained > 0 {
+            state.counters.drained += drained;
+            state.counters.pending = state.pending.len() as u64;
+        }
     }
 }
 
@@ -249,10 +405,27 @@ impl Default for BufferPool {
 }
 
 impl BufferPool {
+    /// A pool with a private clock that nothing advances.
+    ///
+    /// Every release then parks, because no epoch ever completes. That is the
+    /// safe direction to fail, but it is not useful for a real device: use
+    /// [`Self::with_clock`] with the clock `Commands` advances.
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(GpuClock::new()))
+    }
+
+    /// A pool that decides reuse against `clock`.
+    pub fn with_clock(clock: Arc<GpuClock>) -> Self {
         Self {
-            inner: Arc::new(PoolInner::new()),
+            inner: Arc::new(PoolInner::new(clock)),
         }
+    }
+
+    /// Returns every buffer whose epoch has completed to its free list.
+    ///
+    /// Call from a command buffer completion handler, once per command buffer.
+    pub fn drain_completed(&self) {
+        self.inner.drain_completed();
     }
 
     /// Takes a reusable buffer of at least `size` bytes, if one is free.
@@ -341,7 +514,18 @@ impl BufferPool {
     /// This is the sweep, and it is now a **rare trim under memory pressure**
     /// rather than a step on the allocation path. It cannot race a live buffer:
     /// the free list holds only buffers whose last handle has already dropped.
+    ///
+    /// **Pending buffers are deliberately left alone.** They have been released
+    /// by the CPU but the GPU may still be reading or writing them, so freeing
+    /// one here would be the same use-after-free the deferral exists to
+    /// prevent -- with destruction in place of aliasing. Anything genuinely
+    /// finished has already been drained into a free list and is taken by the
+    /// loop below; the rest is reclaimed by a later trim.
     pub fn trim(&self) -> Vec<Buffer> {
+        // Sweep in anything the GPU has since finished, so a trim after a
+        // synchronize reclaims what that synchronize made safe.
+        self.inner.drain_completed();
+
         let mut freed = Vec::new();
         if let Ok(mut state) = self.inner.state.lock() {
             for (_, mut bucket) in std::mem::take(&mut state.free) {
@@ -389,6 +573,8 @@ impl BufferPool {
             free_buffers,
             free_bytes,
             free_buckets: state.free.len(),
+            pending_buffers: state.pending.len(),
+            pending_bytes: state.pending.iter().map(|p| p.buffer.length()).sum(),
         }
     }
 }
@@ -404,15 +590,22 @@ pub struct PoolOccupancySnapshot {
     /// By construction there are no others: a bucket is removed when it
     /// empties. This is the number that grew without bound before.
     pub free_buckets: usize,
+    /// Released by the CPU, still waiting on the GPU. Not yet reusable.
+    ///
+    /// This is the memory cost of deciding reuse on the GPU clock: a buffer
+    /// counted here would have been immediately reusable under the old
+    /// predicate, and immediately *corruptible* with it.
+    pub pending_buffers: usize,
+    pub pending_bytes: usize,
 }
 
 impl PoolOccupancySnapshot {
     pub fn total_buffers(&self) -> usize {
-        self.live_buffers + self.free_buffers
+        self.live_buffers + self.free_buffers + self.pending_buffers
     }
 
     pub fn total_bytes(&self) -> usize {
-        self.live_bytes + self.free_bytes
+        self.live_bytes + self.free_bytes + self.pending_bytes
     }
 }
 
@@ -425,6 +618,22 @@ mod tests {
         Device::system_default().expect("no Metal device")
     }
 
+    /// A pool plus the clock driving it, so a test can say when the GPU
+    /// finishes rather than depending on a real command queue.
+    fn pool_with_clock() -> (BufferPool, Arc<GpuClock>) {
+        let clock = Arc::new(GpuClock::new());
+        (BufferPool::with_clock(Arc::clone(&clock)), clock)
+    }
+
+    /// Stands in for `Commands`: closes the open epoch, reports it finished,
+    /// and sweeps -- what a command buffer commit and its completion handler do
+    /// between them.
+    fn gpu_completes(pool: &BufferPool, clock: &GpuClock) {
+        let epoch = clock.commit_epoch();
+        clock.mark_completed(epoch);
+        pool.drain_completed();
+    }
+
     /// Allocates through the pool the way `MetalDevice` does: try to reuse,
     /// otherwise create and adopt.
     fn alloc(pool: &BufferPool, dev: &Device, size: usize) -> Arc<PooledBuffer> {
@@ -435,6 +644,13 @@ mod tests {
             .new_buffer(size, crate::RESOURCE_OPTIONS)
             .expect("buffer allocation");
         pool.adopt(raw, size)
+    }
+
+    /// Drops `b` and lets the GPU finish, so it is available for reuse. The
+    /// two-step is the point of this change: a drop alone no longer suffices.
+    fn release_and_complete(pool: &BufferPool, clock: &GpuClock, b: Arc<PooledBuffer>) {
+        drop(b);
+        gpu_completes(pool, clock);
     }
 
     #[test]
@@ -456,13 +672,13 @@ mod tests {
         assert_eq!(occ.total_buffers(), 0);
     }
 
-    /// The property the whole change rests on: releasing is an *event*, not a
-    /// state to be discovered later. Nothing is swept, polled or asked; the
-    /// buffer is in the free list the moment the handle dies.
+    /// Releasing is still an *event* -- nothing is swept, polled or asked -- but
+    /// the event now says "the CPU is done", which is not the same as "reusable".
+    /// The buffer is parked, and it is the GPU finishing that frees it.
     #[test]
-    fn drop_returns_the_buffer_immediately() {
+    fn drop_parks_the_buffer_until_the_gpu_is_done() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
         let b = alloc(&pool, &dev, 1024);
         assert_eq!(pool.occupancy().free_buffers, 0, "live buffer is not free");
@@ -471,8 +687,80 @@ mod tests {
         drop(b);
 
         assert_eq!(pool.counters().releases, 1, "Drop did not push");
-        assert_eq!(pool.occupancy().free_buffers, 1);
+        assert_eq!(pool.counters().deferred, 1, "release was not deferred");
+        assert_eq!(
+            pool.occupancy().free_buffers,
+            0,
+            "buffer offered for reuse while the GPU may still be using it"
+        );
+        assert_eq!(pool.occupancy().pending_buffers, 1);
         assert_eq!(pool.occupancy().live_buffers, 0);
+
+        gpu_completes(&pool, &clock);
+
+        assert_eq!(
+            pool.occupancy().free_buffers,
+            1,
+            "GPU completion did not free it"
+        );
+        assert_eq!(pool.occupancy().pending_buffers, 0);
+        assert_eq!(pool.counters().drained, 1);
+    }
+
+    /// The bug, stated as a test. A dropped buffer whose GPU work is still
+    /// outstanding must not be handed to a second caller -- that is the aliasing
+    /// that corrupted grouped convolutions (issue #19).
+    #[test]
+    fn in_flight_buffer_is_not_handed_out_again() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        let first = alloc(&pool, &dev, 4096);
+        // The CPU is done with it; the GPU, which has not advanced, is not.
+        drop(first);
+
+        assert!(
+            pool.acquire(4096).is_none(),
+            "handed back a buffer with GPU work outstanding -- this is issue #19"
+        );
+
+        gpu_completes(&pool, &clock);
+        assert!(
+            pool.acquire(4096).is_some(),
+            "buffer stayed unavailable after its work completed"
+        );
+    }
+
+    /// Every release is deferred, including one made while the GPU is idle.
+    ///
+    /// This looks like a missed optimization and is not one. A release is
+    /// stamped with the epoch that is still *open*, and an open epoch cannot
+    /// have completed, so a "hand it straight back" branch would be
+    /// unreachable. Pinned as a test because the branch is the obvious thing to
+    /// add back, and adding it would either do nothing or -- if the condition
+    /// were loosened until it did something -- reintroduce the bug.
+    #[test]
+    fn release_is_deferred_even_when_the_gpu_is_idle() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        // Everything submitted so far is finished.
+        let epoch = clock.commit_epoch();
+        clock.mark_completed(epoch);
+        assert!(clock.is_complete(epoch));
+
+        let b = alloc(&pool, &dev, 1024);
+        drop(b);
+
+        assert_eq!(pool.counters().deferred, 1);
+        assert_eq!(
+            pool.occupancy().free_buffers,
+            0,
+            "released against an epoch that is still open"
+        );
+
+        gpu_completes(&pool, &clock);
+        assert_eq!(pool.occupancy().free_buffers, 1);
     }
 
     /// A released buffer is handed straight back rather than reallocated, and
@@ -480,7 +768,7 @@ mod tests {
     #[test]
     fn released_buffer_is_reused() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
         // Identity of the underlying Metal object, not of the wrapper: the
         // handle is necessarily a different allocation each time, and what
@@ -492,12 +780,42 @@ mod tests {
 
         let first = alloc(&pool, &dev, 2048);
         let addr = metal_id(&first);
-        drop(first);
+        release_and_complete(&pool, &clock, first);
 
         let second = alloc(&pool, &dev, 2048);
         assert_eq!(metal_id(&second), addr, "did not reuse the released buffer");
         assert_eq!(pool.counters().allocations, 1, "allocated a second time");
         assert_eq!(pool.counters().hits, 1);
+    }
+
+    /// Epochs retire in order, so a buffer parked in an earlier epoch is freed
+    /// by a later completion. The drain walks a prefix and stops; it must not
+    /// leave an early buffer behind because a later one is still outstanding.
+    #[test]
+    fn earlier_epochs_are_freed_by_later_completions() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        // Parked in epoch 0.
+        drop(alloc(&pool, &dev, 1024));
+        let e0 = clock.commit_epoch();
+
+        // Parked in epoch 1.
+        drop(alloc(&pool, &dev, 2048));
+        let e1 = clock.commit_epoch();
+
+        assert_eq!(pool.occupancy().pending_buffers, 2);
+
+        // Epoch 0 finishes: only the first buffer is safe.
+        clock.mark_completed(e0);
+        pool.drain_completed();
+        assert_eq!(pool.occupancy().free_buffers, 1);
+        assert_eq!(pool.occupancy().pending_buffers, 1);
+
+        clock.mark_completed(e1);
+        pool.drain_completed();
+        assert_eq!(pool.occupancy().free_buffers, 2);
+        assert_eq!(pool.occupancy().pending_buffers, 0);
     }
 
     /// Reuse must not require the caller to say anything. A buffer moved into
@@ -507,7 +825,7 @@ mod tests {
     #[test]
     fn reclamation_needs_no_caller_cooperation() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
         struct Holder {
             _buffer: Arc<PooledBuffer>,
@@ -530,6 +848,10 @@ mod tests {
             1,
             "last reference did not return it"
         );
+
+        // Still nothing the caller has to do: the GPU finishing is what makes
+        // it reusable, and that is the device's business, not the caller's.
+        gpu_completes(&pool, &clock);
         assert_eq!(pool.occupancy().free_buffers, 1);
     }
 
@@ -539,9 +861,9 @@ mod tests {
     #[test]
     fn larger_buffer_satisfies_smaller_request() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
-        drop(alloc(&pool, &dev, 4096));
+        release_and_complete(&pool, &clock, alloc(&pool, &dev, 4096));
         let got = pool.acquire(1024).expect("larger buffer should satisfy");
         assert_eq!(got.size(), 4096);
         assert_eq!(pool.counters().allocations, 1);
@@ -556,13 +878,14 @@ mod tests {
     #[test]
     fn smallest_sufficient_buffer_wins() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
         let held: Vec<_> = [8192, 2048, 4096]
             .into_iter()
             .map(|s| alloc(&pool, &dev, s))
             .collect();
         drop(held);
+        gpu_completes(&pool, &clock);
         assert_eq!(pool.occupancy().free_buckets, 3);
 
         let got = pool.acquire(1024).expect("something should satisfy");
@@ -575,11 +898,12 @@ mod tests {
     #[test]
     fn exact_match_costs_one_probe() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
         for size in [512, 1024, 2048, 4096, 8192] {
             drop(alloc(&pool, &dev, size));
         }
+        gpu_completes(&pool, &clock);
         pool.reset_counters();
 
         let got = pool.acquire(2048).expect("exact match exists");
@@ -599,13 +923,13 @@ mod tests {
     #[test]
     fn emptied_buckets_do_not_accumulate() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
         // Distinct sizes, as a growing KV cache produces.
         for i in 0..64 {
             let size = 1024 + i * 128;
             let b = alloc(&pool, &dev, size);
-            drop(b);
+            release_and_complete(&pool, &clock, b);
             // Take it straight back out, emptying the bucket again.
             let b = pool.acquire(size).expect("just released");
             std::mem::forget(b);
@@ -624,13 +948,14 @@ mod tests {
     #[test]
     fn lookup_cost_is_bounded_regardless_of_pool_size() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
         let mut held = Vec::new();
         for i in 0..256 {
             held.push(alloc(&pool, &dev, 1024 + i * 128));
         }
         drop(held);
+        gpu_completes(&pool, &clock);
         assert_eq!(pool.occupancy().free_buckets, 256);
 
         pool.reset_counters();
@@ -652,10 +977,10 @@ mod tests {
     #[test]
     fn trim_frees_only_what_is_free() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, clock) = pool_with_clock();
 
         let live = alloc(&pool, &dev, 1024);
-        drop(alloc(&pool, &dev, 2048));
+        release_and_complete(&pool, &clock, alloc(&pool, &dev, 2048));
         assert_eq!(pool.occupancy().free_buffers, 1);
 
         let freed = pool.trim();
@@ -664,8 +989,32 @@ mod tests {
         assert_eq!(pool.occupancy().live_buffers, 1);
 
         // The live one still returns itself afterwards.
-        drop(live);
+        release_and_complete(&pool, &clock, live);
         assert_eq!(pool.occupancy().free_buffers, 1);
+    }
+
+    /// Trim must not destroy a buffer the GPU may still be reading. Freeing one
+    /// here would be the same defect the deferral exists to prevent, with
+    /// use-after-free in place of aliasing.
+    #[test]
+    fn trim_leaves_buffers_the_gpu_may_still_be_using() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        drop(alloc(&pool, &dev, 2048));
+        assert_eq!(pool.occupancy().pending_buffers, 1);
+
+        let freed = pool.trim();
+        assert!(
+            freed.is_empty(),
+            "trim destroyed a buffer with GPU work outstanding"
+        );
+        assert_eq!(pool.occupancy().pending_buffers, 1);
+
+        // Once the work completes, a trim reclaims it as normal.
+        let epoch = clock.commit_epoch();
+        clock.mark_completed(epoch);
+        assert_eq!(pool.trim().len(), 1);
     }
 
     /// An unpooled handle frees its buffer outright. `new_private_buffer`
@@ -691,11 +1040,45 @@ mod tests {
     #[test]
     fn buffer_outliving_its_pool_drops_cleanly() {
         let dev = device();
-        let pool = BufferPool::new();
+        let (pool, _clock) = pool_with_clock();
         let b = alloc(&pool, &dev, 1024);
 
         drop(pool);
         // Must not panic, and must not try to push into a dead pool.
         drop(b);
+    }
+
+    /// Zero must mean "nothing has completed", not "epoch 0 has". They are
+    /// different states, and conflating them would free every buffer parked in
+    /// the first epoch before the GPU had run anything at all -- the exact bug
+    /// this change exists to fix, reintroduced by an off-by-one.
+    #[test]
+    fn a_fresh_clock_has_completed_nothing() {
+        let clock = GpuClock::new();
+        assert_eq!(clock.current_epoch(), 0);
+        assert_eq!(clock.completed_count(), 0);
+        assert!(
+            !clock.is_complete(0),
+            "epoch 0 reported finished before anything ran"
+        );
+
+        clock.mark_completed(0);
+        assert!(clock.is_complete(0));
+    }
+
+    /// Completion notifications for different command buffers may arrive on
+    /// different threads, so the clock must not go backwards when an older one
+    /// is delivered late.
+    #[test]
+    fn completion_never_goes_backwards() {
+        let clock = GpuClock::new();
+        clock.mark_completed(5);
+        clock.mark_completed(2);
+        assert_eq!(
+            clock.completed_count(),
+            6,
+            "a late report moved the clock back"
+        );
+        assert!(clock.is_complete(5));
     }
 }

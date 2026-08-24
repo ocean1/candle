@@ -185,7 +185,21 @@ impl MetalDevice {
         // already returned themselves to their pool, so there is nothing to
         // discover -- and destroying them, which is what the sweep did, only
         // forced the next allocation to re-create them.
+        //
+        // Still a drain, though, and it is not a scan: everything is complete
+        // now by definition, so this hands back whatever was waiting on the GPU
+        // without depending on a completion handler having been delivered yet.
+        // Metal dispatches those asynchronously, so a caller that synchronizes
+        // and immediately allocates would otherwise miss buffers that are
+        // provably free.
+        self.drain_completed_buffers();
         Ok(())
+    }
+
+    /// Returns buffers whose GPU work has finished to their free lists.
+    fn drain_completed_buffers(&self) {
+        self.buffers.drain_completed();
+        self.private_buffers.drain_completed();
     }
 
     /// Commit and wait on the buffer holding the caller's work; safe for concurrent CPU readbacks.
@@ -193,6 +207,7 @@ impl MetalDevice {
         self.commands
             .flush_and_wait_current()
             .map_err(MetalError::from)?;
+        self.drain_completed_buffers();
         Ok(())
     }
 

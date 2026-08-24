@@ -2108,12 +2108,28 @@ impl BackendDevice for MetalDevice {
         residency_set.insert(&seed_buf);
         let seed = Arc::new(Mutex::new(seed_buf));
         let commands = Commands::new(command_queue, &residency_set).map_err(MetalError::from)?;
+
+        // Both pools decide reuse against the GPU's progress through the command
+        // queue, not against CPU refcounts. `Commands` owns that clock and is
+        // the only thing that advances it.
+        let buffers = BufferPool::with_clock(commands.clock());
+        let private_buffers = BufferPool::with_clock(commands.clock());
+        {
+            // Subscribed here, before any work is encoded, so no command buffer
+            // completes without a subscriber to hear it.
+            let (shared, private) = (buffers.clone(), private_buffers.clone());
+            commands.on_command_buffer_complete(move || {
+                shared.drain_completed();
+                private.drain_completed();
+            });
+        }
+
         Ok(Self {
             id: DeviceId::new(),
             device,
             commands: Arc::new(commands),
-            buffers: BufferPool::new(),
-            private_buffers: BufferPool::new(),
+            buffers,
+            private_buffers,
             kernels,
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),

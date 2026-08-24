@@ -1,6 +1,6 @@
 use crate::metal::{
     BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
-    Fence, PrevCeOutputs, ResidencySet,
+    Fence, GpuClock, PrevCeOutputs, ResidencySet,
 };
 use crate::MetalKernelError;
 use block2::RcBlock;
@@ -16,6 +16,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
 const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
+
+/// Callbacks run after each command buffer completes. See
+/// [`Commands::on_command_buffer_complete`].
+type CompletionSubscribers = Arc<Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>>;
 
 fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, MetalKernelError> {
     command_queue.commandBuffer().map(CommandBuffer::new).ok_or(
@@ -132,6 +136,18 @@ pub struct Commands {
     /// encoder creation proportional to the number of distinct fences instead,
     /// which is typically small.
     live_fences: Arc<Mutex<Vec<LiveFence>>>,
+    /// How far the GPU has got through the command buffers submitted here.
+    ///
+    /// Shared with the buffer pools, which use it to decide when a released
+    /// buffer is safe to hand out again. This is the only place it advances.
+    clock: Arc<GpuClock>,
+    /// Run after each command buffer completes, once per command buffer.
+    ///
+    /// The buffer pools subscribe here to sweep in what that command buffer was
+    /// holding up. Kept as a callback rather than a direct reference to the
+    /// pools so that `Commands` does not need to know they exist -- it owns the
+    /// clock, not the things that read it.
+    on_complete: CompletionSubscribers,
 }
 
 /// A fence still referenced by `prev_ce_outputs`, with its buffer count.
@@ -172,7 +188,26 @@ impl Commands {
             device,
             prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
             live_fences: Arc::new(Mutex::new(Vec::new())),
+            clock: Arc::new(GpuClock::new()),
+            on_complete: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// The clock the buffer pools decide reuse against.
+    pub fn clock(&self) -> Arc<GpuClock> {
+        Arc::clone(&self.clock)
+    }
+
+    /// Registers `f` to run after every command buffer completes.
+    ///
+    /// Must be called during device setup, before any work is encoded:
+    /// subscribers added later would miss the command buffers already in
+    /// flight, and a buffer parked against one of those epochs would never be
+    /// swept in.
+    pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        if let Ok(mut subs) = self.on_complete.lock() {
+            subs.push(Arc::new(f));
+        }
     }
 
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
@@ -315,11 +350,42 @@ impl Commands {
             self.end_encoding(enc);
         }
 
+        // Close the epoch this command buffer holds and arrange for the pools to
+        // hear when it finishes. Every closed epoch must be reported exactly
+        // once, or a buffer parked against it waits forever -- so the handler is
+        // attached on the same branch that commits, and an already-committed
+        // buffer (which Metal will not accept a handler for) has its epoch
+        // retired here instead.
+        //
+        // Both happen under the state lock, so no release can observe the new
+        // epoch before the old one is accounted for.
+        let epoch = self.clock.commit_epoch();
         match state.current.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
+                let clock = Arc::clone(&self.clock);
+                let subs: Vec<_> = self
+                    .on_complete
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                state.current.on_completion(move || {
+                    // Order matters: the clock must show the epoch finished
+                    // before subscribers look, or they find nothing drainable
+                    // and the buffers wait for an unrelated later completion.
+                    clock.mark_completed(epoch);
+                    for f in &subs {
+                        f();
+                    }
+                });
                 state.current.commit();
             }
-            _ => {}
+            // Already committed or finished, so no handler can be attached. It
+            // has been waited on or will be by `flush_and_wait`; retiring the
+            // epoch now keeps the clock from stalling on an epoch that will
+            // never be reported.
+            _ => {
+                self.clock.mark_completed(epoch);
+            }
         }
         let new_cb = create_command_buffer(&self.command_queue)?;
         let old_cb = std::mem::replace(&mut state.current, new_cb);
