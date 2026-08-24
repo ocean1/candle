@@ -20,6 +20,12 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 mod device;
 pub use device::{DeviceId, MetalDevice};
 
+/// Per-dispatch recording of the Metal command stream.
+///
+/// Re-exported so a measurement harness can drive it without taking a direct
+/// dependency on `candle-metal-kernels`. Inert unless `CANDLE_METAL_TRACE=1`.
+pub use candle_metal_kernels::metal::trace;
+
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {
         buffer,

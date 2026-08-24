@@ -13,6 +13,7 @@ pub mod fence;
 mod icb_tests;
 pub mod library;
 pub mod residency_set;
+pub mod trace;
 
 pub use buffer::*;
 pub use buffer_pool::*;

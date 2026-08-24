@@ -117,12 +117,13 @@ impl Device {
     pub fn new_compute_pipeline_state_with_function(
         &self,
         function: &Function,
+        name: &str,
     ) -> Result<ComputePipeline, MetalKernelError> {
         let raw = self
             .as_ref()
             .newComputePipelineStateWithFunction_error(function.as_ref())
             .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
-        Ok(ComputePipeline::new(raw))
+        Ok(ComputePipeline::new(raw, name))
     }
 
     pub fn new_command_queue(&self) -> Result<CommandQueue, MetalKernelError> {
