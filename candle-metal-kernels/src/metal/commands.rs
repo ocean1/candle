@@ -261,6 +261,7 @@ impl Commands {
                 &self.prev_ce_outputs,
                 &self.executor(),
             );
+            crate::metal::profile::record_encoder();
             state_guard.current_encoder = Some(enc);
         }
 
@@ -408,6 +409,10 @@ impl Commands {
                         f();
                     }
                 });
+                // Registered before commit: GPUStartTime/GPUEndTime only become
+                // valid once the buffer completes, so a completion handler is
+                // the only place they can be read.
+                state.current.record_gpu_time_on_completion();
                 state.current.commit();
             }
             // Already committed or finished, so no handler can be attached. It
@@ -429,6 +434,9 @@ impl Commands {
     fn ensure_completed(cb: &CommandBuffer) -> Result<(), MetalKernelError> {
         match cb.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
+                // This path commits a buffer that `commit_swap_locked` never saw,
+                // so it needs its own registration or its GPU time goes unrecorded.
+                cb.record_gpu_time_on_completion();
                 cb.commit();
                 cb.wait_until_completed();
             }
