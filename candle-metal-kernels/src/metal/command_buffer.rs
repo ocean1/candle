@@ -127,6 +127,31 @@ impl CommandBuffer {
         // alive until Metal releases it. The block captures only owned state.
         unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
     }
+
+    /// Register a completion handler that records this buffer's GPU execution
+    /// interval, when profiling is enabled.
+    ///
+    /// Must be called before `commit`: Metal rejects handlers added to a buffer
+    /// that has already been committed. `GPUStartTime`/`GPUEndTime` are only
+    /// meaningful once the buffer has completed, which is what makes a handler
+    /// the only place to read them.
+    pub fn record_gpu_time_on_completion(&self) {
+        use block2::RcBlock;
+        use std::ptr::NonNull;
+
+        if !crate::metal::profile::enabled() {
+            return;
+        }
+        let block = RcBlock::new(|cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            // SAFETY: Metal hands the completed command buffer to its own
+            // completion handler, so the pointer is valid and non-null for the
+            // duration of the call. Only the two timing properties are read,
+            // and both are plain scalars valid in the completed state.
+            let cb = unsafe { cb.as_ref() };
+            crate::metal::profile::record_command_buffer(cb.GPUStartTime(), cb.GPUEndTime());
+        });
+        unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
+    }
 }
 
 impl AsRef<ProtocolObject<dyn MTLCommandBuffer>> for CommandBuffer {
