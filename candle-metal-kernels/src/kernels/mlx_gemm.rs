@@ -1,3 +1,4 @@
+use crate::kernels::params::{begin_packed_params, finish_packed_params, GemvParams, ParamStyle};
 use crate::metal::{Buffer, ComputeCommandEncoder, Device, MetalDeviceType};
 use crate::utils::{EncoderProvider, Input};
 use crate::{
@@ -5,6 +6,12 @@ use crate::{
     Source, Value,
 };
 use objc2_metal::MTLSize;
+
+/// Trailing alignment of the packed block, so its length matches the `sizeof`
+/// the kernel sees. Taken from the Rust mirror rather than written as a
+/// literal, and `gemv_params_layout_matches_metal` is what proves that mirror
+/// agrees with `gemv.metal`.
+const GEMV_PARAMS_ALIGN: usize = core::mem::align_of::<GemvParams>();
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum GemmDType {
@@ -272,6 +279,45 @@ pub fn call_mlx_gemv(
     rhs_buffer: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    call_mlx_gemv_with(
+        device,
+        ep,
+        kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        lhs_offset,
+        lhs_buffer,
+        rhs_stride,
+        rhs_offset,
+        rhs_buffer,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_mlx_gemv`], choosing how the scalars are bound.
+///
+/// The classical entry point above delegates here with [`ParamStyle::Split`],
+/// so there is one body rather than two and the styles cannot drift in what
+/// they bind — which is the property that makes the bit-identical test
+/// meaningful. Same shape as `call_reduce_contiguous_with` (issue #38).
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_gemv_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
     debug_assert!(m == 1 || n == 1, "call_mlx_gemv requires M=1 or N=1");
 
     assert!(rhs_stride.len() >= 2);
@@ -394,8 +440,16 @@ pub fn call_mlx_gemv(
     };
     let kernel_prefix = if transpose_mat { "gemv_t" } else { "gemv" };
     let name = format!(
-        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0",
-        kernel_prefix, dtype_str, bm, bn, sm, sn, tm, tn
+        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}",
+        kernel_prefix,
+        dtype_str,
+        bm,
+        bn,
+        sm,
+        sn,
+        tm,
+        tn,
+        style.name_suffix()
     );
 
     let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
@@ -408,6 +462,13 @@ pub fn call_mlx_gemv(
     let mat_batch_strides = [mat_batch_stride];
     let bias_batch_strides = [0i64];
 
+    // The packed block is built by letting this *same* `set_params!` run and
+    // diverting each scalar as it passes (`EncoderParam::set_param`), so the two
+    // styles cannot disagree about which values are bound or in what order:
+    // only one argument list exists. A hand-written packing struct beside this
+    // call would be two declarations of one thing, which is the hand-sync
+    // `DESIGN.md` §8.1b exists to remove.
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -428,6 +489,9 @@ pub fn call_mlx_gemv(
             1i32 // bias_stride
         )
     );
+    // Held until after the dispatch is encoded: the params block and any array
+    // promoted out of `setBytes` must outlive it.
+    let _staged = finish_packed_params(device, encoder, style, GEMV_PARAMS_ALIGN)?;
 
     let n_out_per_tgp = if transpose_mat {
         bn * sn * tn
