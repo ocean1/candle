@@ -9,6 +9,26 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
+/// Serializes these tests against each other.
+///
+/// `Device::new_metal(0)` hands back one process-wide device, so every test
+/// here drives the *same* pool. Run concurrently they take each other's
+/// buffers and reset each other's counters, and the failure looks like a pool
+/// bug rather than a harness one -- "allocated 6 buffers over 384 lookups" when
+/// another test had just emptied the free list. Cargo's default is one thread
+/// per core, so this is not a hypothetical.
+///
+/// A lock rather than `--test-threads=1`, because the requirement then travels
+/// with the tests instead of living in whatever command someone happens to run.
+static POOL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking test leaves this poisoned; the pool state it was observing is
+    // no longer trustworthy anyway, and taking the guard regardless means one
+    // failure reports one failure rather than cascading into the rest.
+    POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn metal_device() -> Option<Device> {
     Device::new_metal(0).ok()
 }
@@ -22,6 +42,7 @@ fn metal_device() -> Option<Device> {
 /// `in_flight_buffer_is_not_handed_out_again` cover the second half.
 #[test]
 fn dropping_a_tensor_returns_its_buffer() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
@@ -63,6 +84,7 @@ fn dropping_a_tensor_returns_its_buffer() -> Result<()> {
 /// 2000 iterations the allocation count freezes and the footprint is flat.
 #[test]
 fn repeated_identical_work_stops_allocating() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
@@ -107,6 +129,7 @@ fn repeated_identical_work_stops_allocating() -> Result<()> {
 /// from the free-list scan and must not be reintroduced in the footprint.
 #[test]
 fn pool_footprint_converges_and_stays_flat() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
@@ -151,6 +174,7 @@ fn pool_footprint_converges_and_stays_flat() -> Result<()> {
 /// The cost was O(work done), not O(live buffers), and it never converged.
 #[test]
 fn free_list_does_not_accumulate_empty_buckets() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
@@ -182,6 +206,7 @@ fn free_list_does_not_accumulate_empty_buckets() -> Result<()> {
 /// `DESIGN.md` §15.2 #10 require of anything on the per-token path.
 #[test]
 fn lookup_cost_does_not_grow_with_pool_size() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
@@ -224,6 +249,7 @@ fn lookup_cost_does_not_grow_with_pool_size() -> Result<()> {
 /// retained (issue #8's 7731 -> 5509 MB depends on it).
 #[test]
 fn uploaded_buffers_are_not_retained_for_reuse() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
@@ -255,6 +281,7 @@ fn uploaded_buffers_are_not_retained_for_reuse() -> Result<()> {
 /// manual `free()` API.
 #[test]
 fn reclamation_requires_nothing_of_the_caller() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
@@ -294,9 +321,62 @@ fn reclamation_requires_nothing_of_the_caller() -> Result<()> {
     Ok(())
 }
 
+/// A workload whose buffers grow every step must not grow the pool without
+/// bound. This is LFM2 decode's shape: the KV cache is one token longer each
+/// step, so every allocation asks for a size never asked for before, and the
+/// size just freed is never wanted again.
+///
+/// It is the case deferring release to GPU completion broke. Under CPU-drop
+/// release each buffer was reused inside the operation that freed it; deferred,
+/// it is stranded. Measured on LFM2 before the free-list bound: 11.6 stranded
+/// buffers per token, 5231 MB -> 13629 MB at 400 tokens, still climbing.
+#[test]
+fn growing_allocations_do_not_grow_the_pool_without_bound() -> Result<()> {
+    let _guard = lock();
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+
+    let footprint = |m: &candle_core::MetalDevice| {
+        let (s, p) = m.pool_occupancy();
+        s.total_bytes() + p.total_bytes()
+    };
+
+    // Ever-larger tensors, as a growing KV cache produces.
+    for n in 1..300usize {
+        let t = Tensor::zeros((n, 512), DType::F32, &device)?;
+        let _ = (&t + 1.0)?;
+    }
+    let at_300 = footprint(metal);
+
+    for n in 300..600usize {
+        let t = Tensor::zeros((n, 512), DType::F32, &device)?;
+        let _ = (&t + 1.0)?;
+    }
+    let at_600 = footprint(metal);
+
+    // Each of the two pools caps its free list at 256 MB, and both are counted
+    // here, so the ceiling this can reach is 512 MB plus whatever is in flight.
+    // What the assertion is really about is that the ceiling exists: without it
+    // the second half adds a second half's worth of stranded buffers and the
+    // total keeps climbing with the loop bound, unbounded.
+    let ceiling = 2 * 256 * 1024 * 1024 + 64 * 1024 * 1024;
+    assert!(
+        at_600 <= ceiling,
+        "pool reached {at_600} bytes ({at_300} at the halfway point), past the \
+         {ceiling} byte ceiling the two capped free lists allow; the free list \
+         is not bounded"
+    );
+    Ok(())
+}
+
 /// `trim` hands memory back without disturbing live tensors.
 #[test]
 fn trim_frees_the_free_list_and_spares_live_tensors() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
@@ -335,6 +415,7 @@ fn trim_frees_the_free_list_and_spares_live_tensors() -> Result<()> {
 /// an aliased one.
 #[test]
 fn trim_does_not_free_buffers_still_in_flight() -> Result<()> {
+    let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
     };
