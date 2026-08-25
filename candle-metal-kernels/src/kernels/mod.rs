@@ -40,9 +40,10 @@ pub use params::{
     AffineParams, AffineStridedParams, BinaryParams, BinaryStridedParams, CastParams,
     CastStridedParams, Col2im1dParams, Conv1dDepthwiseKParams, Conv1dDepthwiseParams,
     ConvTranspose1dParams, ConvTranspose2dParams, Copy2dParams, GemvParams, Im2col1dParams,
-    Im2colParams, NormParams, ParamStyle, Pool2dParams, ReduceParams, RopeIParams, RopeParams,
-    RopeThdParams, ScaleParams, ScaleStridedParams, SoftmaxParams, UnaryParams, UnaryStridedParams,
-    UpsampleBilinear2dParams, UpsampleNearest2dParams,
+    Im2colParams, LayoutDescriptor, LayoutFamily, NormParams, ParamStyle, Pool2dParams,
+    ReduceParams, RopeIParams, RopeParams, RopeThdParams, ScaleParams, ScaleStridedParams,
+    SoftmaxParams, UnaryParams, UnaryStridedParams, UpsampleBilinear2dParams,
+    UpsampleNearest2dParams,
 };
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,

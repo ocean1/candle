@@ -39,6 +39,14 @@
 //! `size_t` in MSL is 8 bytes, which is why the RoPE structs use `u64` and are
 //! 8-aligned where the reduction structs are 4-aligned. Narrowing them to `u32`
 //! would have been a numeric change smuggled in beside a binding change.
+//!
+//! # How a family registers its check
+//!
+//! [`LayoutFamily`] at the foot of this file. A family is a variant, and
+//! [`LayoutFamily::descriptor`] matches exhaustively, so **a family that does
+//! not register does not compile** (issue #58). Before that the registration was
+//! a call site in `tests.rs`, and a family omitted there was simply never
+//! checked — indistinguishable from one that passed.
 
 use crate::metal::{Buffer, ComputeCommandEncoder, Device};
 use crate::{MetalKernelError, RESOURCE_OPTIONS};
@@ -298,25 +306,14 @@ pub struct Conv1dDepthwiseKParams {
 /// The kernel in `conv.metal` that reports the device-side layout.
 pub const CONV_LAYOUT_KERNEL: &str = "conv_params_layout";
 
-/// How many `u32` slots [`CONV_LAYOUT_KERNEL`] writes.
-pub const CONV_LAYOUT_SLOTS: usize = 65;
-
 /// What each slot of [`CONV_LAYOUT_KERNEL`]'s output means, and what Rust
 /// computes for it.
 ///
-/// Same shape as [`expected_layout`], and deliberately a separate function
-/// rather than an extension of it: `conv.metal` and `reduce.metal` are compiled
-/// as separate libraries, so their layout kernels are separate dispatches and
-/// each family's slots have to be addressed against its own.
-///
-/// **Note for whoever lands after #40.** That change adds `UNARY_LAYOUT_SLOTS`,
-/// `BINARY_LAYOUT_SLOTS`, `CAST_LAYOUT_SLOTS` and `AFFINE_LAYOUT_SLOTS` in the
-/// same flat shape, and this is a fifth. The repetition is real and a composable
-/// per-family descriptor would be better; it is left flat here so that this
-/// change and #40 conflict textually rather than semantically, and so that
-/// restructuring is one deliberate change rather than a side effect of whichever
-/// family landed last.
-pub fn expected_conv_layout() -> [(&'static str, u32); CONV_LAYOUT_SLOTS] {
+/// Same shape as [`expected_reduce_layout`], and deliberately a separate
+/// function rather than an extension of it: `conv.metal` and `reduce.metal` are
+/// compiled as separate libraries, so their layout kernels are separate
+/// dispatches and each family's slots have to be addressed against its own.
+pub fn expected_conv_layout() -> Vec<(&'static str, u32)> {
     use core::mem::{align_of, offset_of, size_of};
 
     debug_assert_eq!(align_of::<Im2colParams>(), 8);
@@ -330,7 +327,7 @@ pub fn expected_conv_layout() -> [(&'static str, u32); CONV_LAYOUT_SLOTS] {
     debug_assert_eq!(align_of::<Conv1dDepthwiseParams>(), 8);
     debug_assert_eq!(align_of::<Conv1dDepthwiseKParams>(), 8);
 
-    [
+    vec![
         ("sizeof(Im2colParams)", size_of::<Im2colParams>() as u32),
         (
             "Im2colParams.dst_numel",
@@ -562,37 +559,31 @@ pub fn expected_conv_layout() -> [(&'static str, u32); CONV_LAYOUT_SLOTS] {
 }
 
 /// The kernel in `reduce.metal` that reports the device-side layout.
-pub const LAYOUT_KERNEL: &str = "reduce_params_layout";
-
-/// How many `u32` slots [`LAYOUT_KERNEL`] writes.
-pub const LAYOUT_SLOTS: usize = 26;
+pub const REDUCE_LAYOUT_KERNEL: &str = "reduce_params_layout";
 
 /// The kernel in `gemv.metal` that reports the device-side layout.
 ///
-/// A second kernel rather than more slots on [`LAYOUT_KERNEL`]: the layout
-/// check has to load from the library that actually defines the struct, and
-/// `gemv.metal` and `reduce.metal` are separate `Source`s compiled
+/// A second kernel rather than more slots on [`REDUCE_LAYOUT_KERNEL`]: the
+/// layout check has to load from the library that actually defines the struct,
+/// and `gemv.metal` and `reduce.metal` are separate `Source`s compiled
 /// independently (`kernel.rs:109`). Keeping them separate is also what lets the
 /// families compose rather than share one fixed slot count.
 pub const GEMV_LAYOUT_KERNEL: &str = "gemv_params_layout";
 
-/// How many `u32` slots [`GEMV_LAYOUT_KERNEL`] writes.
-pub const GEMV_LAYOUT_SLOTS: usize = 8;
-
 /// What each slot of [`GEMV_LAYOUT_KERNEL`] means, and what Rust computes for
 /// it.
 ///
-/// As [`expected_layout`], for `gemv.metal`. Written as data rather than as a
-/// sequence of assertions so a mismatch reports *which* field disagrees — the
-/// whole point being that one wrong offset is otherwise invisible: the kernel
-/// reads a well-formed number from the wrong place and computes a plausible
-/// wrong answer (`DESIGN.md` §3.5, §15.1).
-pub fn gemv_expected_layout() -> [(&'static str, u32); GEMV_LAYOUT_SLOTS] {
+/// As [`expected_reduce_layout`], for `gemv.metal`. Written as data rather than
+/// as a sequence of assertions so a mismatch reports *which* field disagrees —
+/// the whole point being that one wrong offset is otherwise invisible: the
+/// kernel reads a well-formed number from the wrong place and computes a
+/// plausible wrong answer (`DESIGN.md` §3.5, §15.1).
+pub fn expected_gemv_layout() -> Vec<(&'static str, u32)> {
     use core::mem::{align_of, offset_of, size_of};
 
     debug_assert_eq!(align_of::<GemvParams>(), 4);
 
-    [
+    vec![
         ("sizeof(GemvParams)", size_of::<GemvParams>() as u32),
         (
             "GemvParams.in_vec_size",
@@ -619,15 +610,15 @@ pub fn gemv_expected_layout() -> [(&'static str, u32); GEMV_LAYOUT_SLOTS] {
     ]
 }
 
-/// What each slot of [`LAYOUT_KERNEL`]'s output means, and what Rust computes
-/// for it.
+/// What each slot of [`REDUCE_LAYOUT_KERNEL`]'s output means, and what Rust
+/// computes for it.
 ///
 /// The ordering is declared here and in the kernel, and
 /// `reduce_params_layout_matches_metal` is what fails if they drift. Written as
 /// data rather than as a sequence of assertions so a mismatch reports *which*
 /// field disagrees rather than just that something did — the whole point being
 /// that a single wrong offset is otherwise invisible.
-pub fn expected_layout() -> [(&'static str, u32); LAYOUT_SLOTS] {
+pub fn expected_reduce_layout() -> Vec<(&'static str, u32)> {
     use core::mem::{align_of, offset_of, size_of};
 
     // Alignment is not shipped per slot -- it is `static_assert`ed on the Metal
@@ -641,7 +632,7 @@ pub fn expected_layout() -> [(&'static str, u32); LAYOUT_SLOTS] {
     debug_assert_eq!(align_of::<RopeParams>(), 8);
     debug_assert_eq!(align_of::<RopeThdParams>(), 8);
 
-    [
+    vec![
         ("sizeof(ReduceParams)", size_of::<ReduceParams>() as u32),
         (
             "ReduceParams.src_numel",
@@ -843,33 +834,25 @@ pub struct ScaleStridedParams {
 
 /// The kernel in `unary.metal` that reports the device-side layout.
 pub const UNARY_LAYOUT_KERNEL: &str = "unary_params_layout";
-/// How many `u32` slots [`UNARY_LAYOUT_KERNEL`] writes.
-pub const UNARY_LAYOUT_SLOTS: usize = 10;
 
 /// The kernel in `binary.metal` that reports the device-side layout.
 pub const BINARY_LAYOUT_KERNEL: &str = "binary_params_layout";
-/// How many `u32` slots [`BINARY_LAYOUT_KERNEL`] writes.
-pub const BINARY_LAYOUT_SLOTS: usize = 5;
 
 /// The kernel in `cast.metal` that reports the device-side layout.
 pub const CAST_LAYOUT_KERNEL: &str = "cast_params_layout";
-/// How many `u32` slots [`CAST_LAYOUT_KERNEL`] writes.
-pub const CAST_LAYOUT_SLOTS: usize = 5;
 
 /// The kernel in `affine.metal` that reports the device-side layout.
 pub const AFFINE_LAYOUT_KERNEL: &str = "affine_params_layout";
-/// How many `u32` slots [`AFFINE_LAYOUT_KERNEL`] writes.
-pub const AFFINE_LAYOUT_SLOTS: usize = 16;
 
 /// What each slot of [`UNARY_LAYOUT_KERNEL`]'s output means.
-pub fn expected_unary_layout() -> [(&'static str, u32); UNARY_LAYOUT_SLOTS] {
+pub fn expected_unary_layout() -> Vec<(&'static str, u32)> {
     use core::mem::{align_of, offset_of, size_of};
 
     debug_assert_eq!(align_of::<UnaryParams>(), 8);
     debug_assert_eq!(align_of::<UnaryStridedParams>(), 8);
     debug_assert_eq!(align_of::<Copy2dParams>(), 8);
 
-    [
+    vec![
         ("sizeof(UnaryParams)", size_of::<UnaryParams>() as u32),
         ("UnaryParams.dim", offset_of!(UnaryParams, dim) as u32),
         (
@@ -893,13 +876,13 @@ pub fn expected_unary_layout() -> [(&'static str, u32); UNARY_LAYOUT_SLOTS] {
 }
 
 /// What each slot of [`BINARY_LAYOUT_KERNEL`]'s output means.
-pub fn expected_binary_layout() -> [(&'static str, u32); BINARY_LAYOUT_SLOTS] {
+pub fn expected_binary_layout() -> Vec<(&'static str, u32)> {
     use core::mem::{align_of, offset_of, size_of};
 
     debug_assert_eq!(align_of::<BinaryParams>(), 8);
     debug_assert_eq!(align_of::<BinaryStridedParams>(), 8);
 
-    [
+    vec![
         ("sizeof(BinaryParams)", size_of::<BinaryParams>() as u32),
         ("BinaryParams.dim", offset_of!(BinaryParams, dim) as u32),
         (
@@ -918,13 +901,13 @@ pub fn expected_binary_layout() -> [(&'static str, u32); BINARY_LAYOUT_SLOTS] {
 }
 
 /// What each slot of [`CAST_LAYOUT_KERNEL`]'s output means.
-pub fn expected_cast_layout() -> [(&'static str, u32); CAST_LAYOUT_SLOTS] {
+pub fn expected_cast_layout() -> Vec<(&'static str, u32)> {
     use core::mem::{align_of, offset_of, size_of};
 
     debug_assert_eq!(align_of::<CastParams>(), 8);
     debug_assert_eq!(align_of::<CastStridedParams>(), 8);
 
-    [
+    vec![
         ("sizeof(CastParams)", size_of::<CastParams>() as u32),
         ("CastParams.dim", offset_of!(CastParams, dim) as u32),
         (
@@ -948,7 +931,7 @@ pub fn expected_cast_layout() -> [(&'static str, u32); CAST_LAYOUT_SLOTS] {
 /// the argument for shipping them across the boundary rather than asserting
 /// them on each side: `sizeof(AffineParams)` is 16 where its fields sum to 12,
 /// and `sizeof(ScaleStridedParams)` is 24 where they sum to 20.
-pub fn expected_affine_layout() -> [(&'static str, u32); AFFINE_LAYOUT_SLOTS] {
+pub fn expected_affine_layout() -> Vec<(&'static str, u32)> {
     use core::mem::{align_of, offset_of, size_of};
 
     debug_assert_eq!(align_of::<AffineParams>(), 8);
@@ -956,7 +939,7 @@ pub fn expected_affine_layout() -> [(&'static str, u32); AFFINE_LAYOUT_SLOTS] {
     debug_assert_eq!(align_of::<ScaleParams>(), 8);
     debug_assert_eq!(align_of::<ScaleStridedParams>(), 8);
 
-    [
+    vec![
         ("sizeof(AffineParams)", size_of::<AffineParams>() as u32),
         ("AffineParams.dim", offset_of!(AffineParams, dim) as u32),
         ("AffineParams.mul", offset_of!(AffineParams, mul) as u32),
@@ -1172,4 +1155,180 @@ pub const PACKED_SUFFIX: &str = "_packed";
 /// the need for.
 pub fn packed_name(classical: &str) -> String {
     format!("{classical}{PACKED_SUFFIX}")
+}
+
+// ---------------------------------------------------------------------------
+// The layout registry (issue #58).
+//
+// Every family above carries a packed-parameter struct, a `<family>_params_layout`
+// kernel that reports the device's view of it, and an `expected_*_layout()`
+// giving Rust's. What was missing is anything that makes *checking* them
+// mandatory: before this, each family added a const, a function, and a call site
+// in `tests.rs`, and the call site is the one that fails silently. A family left
+// out of it is not checked, and an unchecked family is indistinguishable from a
+// passing one.
+//
+// # Why an enum and not a slice
+//
+// A `&[(name, fn)]` slice removes the hand-maintained *call-site list*, which is
+// what the issue asks for literally. It does not remove the failure mode: a new
+// family can still be omitted from the slice, and the omission is still silent.
+// That relocates the defect rather than closing it.
+//
+// `LayoutFamily` closes it because the `match` in [`LayoutFamily::descriptor`]
+// is exhaustive. Adding a variant without an arm is `error[E0004]: non-exhaustive
+// patterns`, so a family that fails to register **cannot compile**, which is the
+// acceptance criterion stated as a property of the language rather than of
+// anyone's diligence. [`LayoutFamily::ALL`] is then the derived list the checker
+// iterates, and `layout_registry_covers_every_family` asserts it names every
+// variant — the one thing the compiler cannot check, since a missing entry in
+// `ALL` is a short array and not a type error.
+//
+// # Why the slot counts are gone
+//
+// `LAYOUT_SLOTS`, `CONV_LAYOUT_SLOTS` and the four elementwise ones were each a
+// hand-maintained integer that had to agree with the length of an array declared
+// six lines below it. The descriptor takes the length from the array instead, so
+// the count cannot drift from the thing it counts. The device side still gets
+// checked against it: the buffer is sized from `expected.len()` and the kernel
+// writes exactly that many slots.
+// ---------------------------------------------------------------------------
+
+/// A kernel family that carries packed parameters, and therefore owes a layout
+/// check.
+///
+/// Registration is by *existence of a variant*: [`LayoutFamily::descriptor`]
+/// matches exhaustively, so a new family that does not describe itself is a
+/// compile error rather than a silently unchecked family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LayoutFamily {
+    /// `reduce.metal` — issue #38. Reductions, softmax, the two norms, RoPE.
+    Reduce,
+    /// `unary.metal` — issue #40. Includes `copy2d`, the largest single kernel
+    /// in the decode trace (`DESIGN.md` §11.2).
+    Unary,
+    /// `binary.metal` — issue #40.
+    Binary,
+    /// `cast.metal` — issue #40.
+    Cast,
+    /// `affine.metal` — issue #40. The first structs that pad.
+    Affine,
+    /// `gemv.metal` — issue #41. 183 dispatches per decode token.
+    Gemv,
+    /// `conv.metal` — issue #42. The mixed-width structs.
+    Conv,
+}
+
+/// Everything the layout check needs to know about one family.
+///
+/// `expected` is a `Vec` rather than a fixed-size array because the families
+/// have different slot counts (5 to 65) and a trait object over arrays of
+/// differing length is not expressible. The cost is one allocation per test
+/// dispatch, which is a test-only path and not on the per-token path §15.2 #10
+/// governs.
+pub struct LayoutDescriptor {
+    /// The family, for error messages.
+    pub family: LayoutFamily,
+    /// Which `.metal` library defines the structs. Each is compiled separately,
+    /// so a layout kernel can only see its own file's structs.
+    pub source: crate::Source,
+    /// The `[[host_name]]` of the kernel that reports the device-side layout.
+    pub kernel: &'static str,
+    /// What Rust computes for each slot the kernel writes, in order.
+    pub expected: Vec<(&'static str, u32)>,
+}
+
+impl LayoutDescriptor {
+    /// How many `u32` slots this family's layout kernel writes.
+    ///
+    /// Derived from `expected` rather than declared beside it, so the count and
+    /// the thing it counts cannot drift apart.
+    pub fn slots(&self) -> usize {
+        self.expected.len()
+    }
+}
+
+impl LayoutFamily {
+    /// Every family. The checker iterates this; `layout_registry_covers_every
+    /// _family` asserts it is complete.
+    ///
+    /// Complete coverage of *this* array is the only part the compiler cannot
+    /// enforce, which is why it has its own test. The `descriptor` match below
+    /// is what the compiler does enforce, and it is the stronger half: a family
+    /// can be missing from `ALL` and still be a well-formed program, but it
+    /// cannot be missing from `descriptor` at all.
+    pub const ALL: &'static [LayoutFamily] = &[
+        LayoutFamily::Reduce,
+        LayoutFamily::Unary,
+        LayoutFamily::Binary,
+        LayoutFamily::Cast,
+        LayoutFamily::Affine,
+        LayoutFamily::Gemv,
+        LayoutFamily::Conv,
+    ];
+
+    /// The name of the `.metal` file this family lives in, for error messages.
+    pub fn metal_file(self) -> &'static str {
+        match self {
+            LayoutFamily::Reduce => "reduce.metal",
+            LayoutFamily::Unary => "unary.metal",
+            LayoutFamily::Binary => "binary.metal",
+            LayoutFamily::Cast => "cast.metal",
+            LayoutFamily::Affine => "affine.metal",
+            LayoutFamily::Gemv => "gemv.metal",
+            LayoutFamily::Conv => "conv.metal",
+        }
+    }
+
+    /// This family's layout kernel, source, and expected slots.
+    ///
+    /// **This match is the registration mechanism.** It is exhaustive, so a new
+    /// `LayoutFamily` variant without an arm here does not compile — which is
+    /// what makes "a family that fails to register is a compile error" true by
+    /// construction rather than by convention.
+    pub fn descriptor(self) -> LayoutDescriptor {
+        let (source, kernel, expected) = match self {
+            LayoutFamily::Reduce => (
+                crate::Source::Reduce,
+                REDUCE_LAYOUT_KERNEL,
+                expected_reduce_layout(),
+            ),
+            LayoutFamily::Unary => (
+                crate::Source::Unary,
+                UNARY_LAYOUT_KERNEL,
+                expected_unary_layout(),
+            ),
+            LayoutFamily::Binary => (
+                crate::Source::Binary,
+                BINARY_LAYOUT_KERNEL,
+                expected_binary_layout(),
+            ),
+            LayoutFamily::Cast => (
+                crate::Source::Cast,
+                CAST_LAYOUT_KERNEL,
+                expected_cast_layout(),
+            ),
+            LayoutFamily::Affine => (
+                crate::Source::Affine,
+                AFFINE_LAYOUT_KERNEL,
+                expected_affine_layout(),
+            ),
+            LayoutFamily::Gemv => (
+                crate::Source::Gemv,
+                GEMV_LAYOUT_KERNEL,
+                expected_gemv_layout(),
+            ),
+            LayoutFamily::Conv => (
+                crate::Source::Conv,
+                CONV_LAYOUT_KERNEL,
+                expected_conv_layout(),
+            ),
+        };
+        LayoutDescriptor {
+            family: self,
+            source,
+            kernel,
+            expected,
+        }
+    }
 }

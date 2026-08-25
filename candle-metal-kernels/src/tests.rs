@@ -2749,161 +2749,11 @@ fn reduce_undeclared_dtype_has_no_name() {
 //  * the two forms compute **bit-identical** output — which is what proves the
 //    body really is shared rather than merely similar
 
-/// The device's own view of every packed struct's layout, against Rust's.
-///
-/// Dispatches `reduce_params_layout`, which writes `sizeof` and each field's
-/// `offsetof` *as the compiled kernel sees them*. Comparing those against
-/// `size_of`/`offset_of!` on the `#[repr(C)]` mirrors checks the two sides
-/// against each other, where a `static_assert` on either side alone would only
-/// prove that side is self-consistent.
-///
-/// This is the check that catches the hazards #38 names — a vector type
-/// over-aligning, a `bool` sized differently — for any struct added later.
-#[test]
-fn reduce_params_layout_matches_metal() {
-    use crate::kernels::params::{expected_layout, LAYOUT_KERNEL, LAYOUT_SLOTS};
-
-    let device = device();
-    let kernels = Kernels::new();
-    let commands = commands(&device);
-    let encoder = commands.command_encoder().unwrap();
-
-    let out = device
-        .new_buffer(LAYOUT_SLOTS * core::mem::size_of::<u32>(), RESOURCE_OPTIONS)
-        .unwrap();
-
-    let pipeline = kernels
-        .load_pipeline(&device, Source::Reduce, LAYOUT_KERNEL)
-        .unwrap();
-    let enc: &ComputeCommandEncoder = encoder.as_ref();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_output_buffer(0, Some(&out), 0);
-    enc.dispatch_thread_groups(
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-    );
-    drop(encoder);
-    commands.wait_until_completed().unwrap();
-
-    let device_side: Vec<u32> = read_to_vec(&out, LAYOUT_SLOTS);
-    let mut disagreements = Vec::new();
-    for (slot, (what, rust)) in expected_layout().into_iter().enumerate() {
-        if device_side[slot] != rust {
-            disagreements.push(format!(
-                "  {what}: metal {} vs rust {rust}",
-                device_side[slot]
-            ));
-        }
-    }
-    assert!(
-        disagreements.is_empty(),
-        "packed parameter layout differs between reduce.metal and params.rs.\n\
-         A field at the wrong offset is silent corruption, not a crash:\n{}",
-        disagreements.join("\n")
-    );
-}
-
-/// The layout check must be able to fail.
-///
-/// `DESIGN.md` §15.1 #1 and `CONTRIBUTING.md` §3.1 #2: a test that cannot fail
-/// is not a test, and this one guards a defect that is otherwise invisible.
-///
-/// The mutation is applied to a **copy of `reduce.metal`** compiled at runtime,
-/// so the real source is untouched. It **swaps `ReduceParams.src_numel` and
-/// `ReduceParams.num_dims`** -- two adjacent fields of the same type. That case
-/// is chosen deliberately over inserting or removing a field, because it is the
-/// one nothing else catches:
-///
-/// * `sizeof` is unchanged, so the `static_assert` in `reduce.metal` still
-///   passes;
-/// * both fields are `uint`, so the brace initializer still type-checks --
-///   inserting a field of a different type is rejected by C++11 narrowing
-///   before it ever reaches a GPU, which is a real layer of defence but not
-///   this one;
-/// * the kernel runs and produces plausible numbers from the wrong values.
-///
-/// It is the same shape as the defect `DESIGN.md` §8.1c warns about for
-/// `im2col`'s eight consecutive `constant size_t` parameters: reordering two
-/// same-typed arguments is silent.
-#[test]
-fn reduce_params_layout_check_detects_a_moved_field() {
-    use crate::kernels::params::{expected_layout, LAYOUT_KERNEL, LAYOUT_SLOTS};
-
-    let original = "struct ReduceParams {\n    uint src_numel;\n    uint num_dims;\n    uint el_per_block;\n};";
-    let swapped = "struct ReduceParams {\n    uint num_dims;\n    uint src_numel;\n    uint el_per_block;\n};";
-    assert!(
-        crate::source::REDUCE.contains(original),
-        "the struct this test mutates has been reworded; update the mutation"
-    );
-    let mutant = crate::source::REDUCE.replace(original, swapped);
-
-    let device = device();
-    let library = device.new_library_with_source(&mutant, None).unwrap();
-    let function = library.get_function(LAYOUT_KERNEL, None).unwrap();
-    let pipeline = device
-        .new_compute_pipeline_state_with_function(&function)
-        .unwrap();
-
-    let commands = commands(&device);
-    let encoder = commands.command_encoder().unwrap();
-    let out = device
-        .new_buffer(LAYOUT_SLOTS * core::mem::size_of::<u32>(), RESOURCE_OPTIONS)
-        .unwrap();
-    let enc: &ComputeCommandEncoder = encoder.as_ref();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_output_buffer(0, Some(&out), 0);
-    enc.dispatch_thread_groups(
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-    );
-    drop(encoder);
-    commands.wait_until_completed().unwrap();
-
-    let device_side: Vec<u32> = read_to_vec(&out, LAYOUT_SLOTS);
-    let disagreements: Vec<String> = expected_layout()
-        .into_iter()
-        .enumerate()
-        .filter(|(slot, (_, rust))| device_side[*slot] != *rust)
-        .map(|(slot, (what, rust))| format!("{what}: metal {} vs rust {rust}", device_side[slot]))
-        .collect();
-
-    // Both swapped fields must be reported, and the struct's size must not be
-    // -- which is exactly why `sizeof` alone is not a sufficient check.
-    assert!(
-        disagreements
-            .iter()
-            .any(|d| d.starts_with("ReduceParams.src_numel")),
-        "swapping src_numel must be reported; got {disagreements:?}"
-    );
-    assert!(
-        disagreements
-            .iter()
-            .any(|d| d.starts_with("ReduceParams.num_dims")),
-        "swapping num_dims must be reported; got {disagreements:?}"
-    );
-    assert!(
-        !disagreements
-            .iter()
-            .any(|d| d.starts_with("sizeof(ReduceParams)")),
-        "the swap must not change sizeof, or it is not the silent case; got {disagreements:?}"
-    );
-}
+// The layout checks themselves are registry-driven and live at the foot of this
+// file (`every_family_params_layout_matches_metal`, issue #58). They were seven
+// near-identical per-family test bodies until then, and the seventh call site
+// was the thing that could be forgotten: a family absent from it was never
+// checked, which looks exactly like a family that passes.
 
 /// Every classical name has a `_packed` counterpart in the compiled library.
 ///
@@ -3526,69 +3376,6 @@ fn gemv_packed_names_resolve() {
     );
 }
 
-/// `GemvParams`'s layout agrees between `gemv.metal` and `params.rs`.
-///
-/// A `static_assert` on either side proves only that side is self-consistent;
-/// this ships the *compiled kernel's own* `sizeof` and field offsets across the
-/// boundary and compares them against Rust's `size_of`/`offset_of!`. A field at
-/// the wrong offset does not crash -- the kernel reads a well-formed number
-/// from the wrong place and computes a plausible wrong answer (`DESIGN.md`
-/// §3.5, §15.1).
-#[test]
-fn gemv_params_layout_matches_metal() {
-    use crate::kernels::params::{gemv_expected_layout, GEMV_LAYOUT_KERNEL, GEMV_LAYOUT_SLOTS};
-
-    let device = device();
-    let kernels = Kernels::new();
-    let commands = commands(&device);
-    let encoder = commands.command_encoder().unwrap();
-
-    let out = device
-        .new_buffer(
-            GEMV_LAYOUT_SLOTS * core::mem::size_of::<u32>(),
-            RESOURCE_OPTIONS,
-        )
-        .unwrap();
-
-    let pipeline = kernels
-        .load_pipeline(&device, Source::Gemv, GEMV_LAYOUT_KERNEL)
-        .unwrap();
-    let enc: &ComputeCommandEncoder = encoder.as_ref();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_output_buffer(0, Some(&out), 0);
-    enc.dispatch_thread_groups(
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-    );
-    drop(encoder);
-    commands.wait_until_completed().unwrap();
-
-    let device_side: Vec<u32> = read_to_vec(&out, GEMV_LAYOUT_SLOTS);
-    let mut disagreements = Vec::new();
-    for (slot, (what, rust)) in gemv_expected_layout().into_iter().enumerate() {
-        if device_side[slot] != rust {
-            disagreements.push(format!(
-                "  {what}: metal {} vs rust {rust}",
-                device_side[slot]
-            ));
-        }
-    }
-    assert!(
-        disagreements.is_empty(),
-        "packed parameter layout differs between gemv.metal and params.rs.\n\
-         A field at the wrong offset is silent corruption, not a crash:\n{}",
-        disagreements.join("\n")
-    );
-}
-
 fn layout_pipeline(source: Source, name: &'static str) -> ComputePipeline {
     let device = device();
     let kernels = Kernels::new();
@@ -3617,59 +3404,6 @@ fn mutated_layout_pipeline(
     device
         .new_compute_pipeline_state_with_function(&function)
         .unwrap()
-}
-
-#[test]
-fn unary_params_layout_matches_metal() {
-    let d = layout_disagreements(
-        &layout_pipeline(Source::Unary, crate::kernels::params::UNARY_LAYOUT_KERNEL),
-        &crate::kernels::params::expected_unary_layout(),
-    );
-    assert!(
-        d.is_empty(),
-        "packed parameter layout differs between unary.metal and params.rs.\n\
-         A field at the wrong offset is silent corruption, not a crash:\n  {}",
-        d.join("\n  ")
-    );
-}
-
-#[test]
-fn binary_params_layout_matches_metal() {
-    let d = layout_disagreements(
-        &layout_pipeline(Source::Binary, crate::kernels::params::BINARY_LAYOUT_KERNEL),
-        &crate::kernels::params::expected_binary_layout(),
-    );
-    assert!(
-        d.is_empty(),
-        "binary.metal vs params.rs:\n  {}",
-        d.join("\n  ")
-    );
-}
-
-#[test]
-fn cast_params_layout_matches_metal() {
-    let d = layout_disagreements(
-        &layout_pipeline(Source::Cast, crate::kernels::params::CAST_LAYOUT_KERNEL),
-        &crate::kernels::params::expected_cast_layout(),
-    );
-    assert!(
-        d.is_empty(),
-        "cast.metal vs params.rs:\n  {}",
-        d.join("\n  ")
-    );
-}
-
-#[test]
-fn affine_params_layout_matches_metal() {
-    let d = layout_disagreements(
-        &layout_pipeline(Source::Affine, crate::kernels::params::AFFINE_LAYOUT_KERNEL),
-        &crate::kernels::params::expected_affine_layout(),
-    );
-    assert!(
-        d.is_empty(),
-        "affine.metal vs params.rs:\n  {}",
-        d.join("\n  ")
-    );
 }
 
 /// The layout check must be able to fail, and must fail on *the silent case*.
@@ -4264,56 +3998,15 @@ fn packed_matches_split_for_affine_f32_strided() {
 /// than crash it.
 #[test]
 fn gemv_params_layout_check_detects_a_moved_field() {
-    use crate::kernels::params::{gemv_expected_layout, GEMV_LAYOUT_KERNEL, GEMV_LAYOUT_SLOTS};
+    use crate::kernels::params::{expected_gemv_layout, GEMV_LAYOUT_KERNEL};
 
-    let original = "struct GemvParams {\n  int in_vec_size;\n  int out_vec_size;";
-    let swapped = "struct GemvParams {\n  int out_vec_size;\n  int in_vec_size;";
-    assert!(
-        crate::source::GEMV.contains(original),
-        "the struct this test mutates has been reworded; update the mutation"
+    let pipeline = mutated_layout_pipeline(
+        crate::source::GEMV,
+        "struct GemvParams {\n  int in_vec_size;\n  int out_vec_size;",
+        "struct GemvParams {\n  int out_vec_size;\n  int in_vec_size;",
+        GEMV_LAYOUT_KERNEL,
     );
-    let mutant = crate::source::GEMV.replace(original, swapped);
-
-    let device = device();
-    let library = device.new_library_with_source(&mutant, None).unwrap();
-    let function = library.get_function(GEMV_LAYOUT_KERNEL, None).unwrap();
-    let pipeline = device
-        .new_compute_pipeline_state_with_function(&function)
-        .unwrap();
-
-    let commands = commands(&device);
-    let encoder = commands.command_encoder().unwrap();
-    let out = device
-        .new_buffer(
-            GEMV_LAYOUT_SLOTS * core::mem::size_of::<u32>(),
-            RESOURCE_OPTIONS,
-        )
-        .unwrap();
-    let enc: &ComputeCommandEncoder = encoder.as_ref();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_output_buffer(0, Some(&out), 0);
-    enc.dispatch_thread_groups(
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-    );
-    drop(encoder);
-    commands.wait_until_completed().unwrap();
-
-    let device_side: Vec<u32> = read_to_vec(&out, GEMV_LAYOUT_SLOTS);
-    let disagreements: Vec<String> = gemv_expected_layout()
-        .into_iter()
-        .enumerate()
-        .filter(|(slot, (_, rust))| device_side[*slot] != *rust)
-        .map(|(slot, (what, rust))| format!("{what}: metal {} vs rust {rust}", device_side[slot]))
-        .collect();
+    let disagreements = layout_disagreements(&pipeline, &expected_gemv_layout());
 
     assert!(
         disagreements
@@ -4421,66 +4114,6 @@ fn gemv_packed_does_not_change_occupancy() {
 //    swaps two of exactly those.
 // ---------------------------------------------------------------------------
 
-/// The device's own view of every conv packed struct's layout, against Rust's.
-///
-/// Separate from `reduce_params_layout_matches_metal` because `conv.metal` and
-/// `reduce.metal` are compiled as separate libraries, so each has its own
-/// layout kernel and its own slot numbering.
-#[test]
-fn conv_params_layout_matches_metal() {
-    use crate::kernels::params::{expected_conv_layout, CONV_LAYOUT_KERNEL, CONV_LAYOUT_SLOTS};
-
-    let device = device();
-    let kernels = Kernels::new();
-    let commands = commands(&device);
-    let encoder = commands.command_encoder().unwrap();
-
-    let out = device
-        .new_buffer(
-            CONV_LAYOUT_SLOTS * core::mem::size_of::<u32>(),
-            RESOURCE_OPTIONS,
-        )
-        .unwrap();
-
-    let pipeline = kernels
-        .load_pipeline(&device, Source::Conv, CONV_LAYOUT_KERNEL)
-        .unwrap();
-    let enc: &ComputeCommandEncoder = encoder.as_ref();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_output_buffer(0, Some(&out), 0);
-    enc.dispatch_thread_groups(
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-    );
-    drop(encoder);
-    commands.wait_until_completed().unwrap();
-
-    let device_side: Vec<u32> = read_to_vec(&out, CONV_LAYOUT_SLOTS);
-    let mut disagreements = Vec::new();
-    for (slot, (what, rust)) in expected_conv_layout().into_iter().enumerate() {
-        if device_side[slot] != rust {
-            disagreements.push(format!(
-                "  {what}: metal {} vs rust {rust}",
-                device_side[slot]
-            ));
-        }
-    }
-    assert!(
-        disagreements.is_empty(),
-        "packed parameter layout differs between conv.metal and params.rs.\n\
-         A field at the wrong offset is silent corruption, not a crash:\n{}",
-        disagreements.join("\n")
-    );
-}
-
 /// The conv layout check must be able to fail.
 ///
 /// `CONTRIBUTING.md` §3.1 #2. The mutation swaps **`Im2colParams.h_k` and
@@ -4498,56 +4131,15 @@ fn conv_params_layout_matches_metal() {
 /// untouched.
 #[test]
 fn conv_params_layout_check_detects_a_moved_field() {
-    use crate::kernels::params::{expected_conv_layout, CONV_LAYOUT_KERNEL, CONV_LAYOUT_SLOTS};
+    use crate::kernels::params::{expected_conv_layout, CONV_LAYOUT_KERNEL};
 
-    let original = "    size_t h_k;\n    size_t w_k;\n    size_t stride;\n    size_t padding;\n    size_t dilation;\n};";
-    let swapped = "    size_t w_k;\n    size_t h_k;\n    size_t stride;\n    size_t padding;\n    size_t dilation;\n};";
-    assert!(
-        crate::source::CONV.contains(original),
-        "the struct this test mutates has been reworded; update the mutation"
+    let pipeline = mutated_layout_pipeline(
+        crate::source::CONV,
+        "    size_t h_k;\n    size_t w_k;\n    size_t stride;\n    size_t padding;\n    size_t dilation;\n};",
+        "    size_t w_k;\n    size_t h_k;\n    size_t stride;\n    size_t padding;\n    size_t dilation;\n};",
+        CONV_LAYOUT_KERNEL,
     );
-    let mutant = crate::source::CONV.replace(original, swapped);
-
-    let device = device();
-    let library = device.new_library_with_source(&mutant, None).unwrap();
-    let function = library.get_function(CONV_LAYOUT_KERNEL, None).unwrap();
-    let pipeline = device
-        .new_compute_pipeline_state_with_function(&function)
-        .unwrap();
-
-    let commands = commands(&device);
-    let encoder = commands.command_encoder().unwrap();
-    let out = device
-        .new_buffer(
-            CONV_LAYOUT_SLOTS * core::mem::size_of::<u32>(),
-            RESOURCE_OPTIONS,
-        )
-        .unwrap();
-    let enc: &ComputeCommandEncoder = encoder.as_ref();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_output_buffer(0, Some(&out), 0);
-    enc.dispatch_thread_groups(
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-    );
-    drop(encoder);
-    commands.wait_until_completed().unwrap();
-
-    let device_side: Vec<u32> = read_to_vec(&out, CONV_LAYOUT_SLOTS);
-    let disagreements: Vec<String> = expected_conv_layout()
-        .into_iter()
-        .enumerate()
-        .filter(|(slot, (_, rust))| device_side[*slot] != *rust)
-        .map(|(slot, (what, rust))| format!("{what}: metal {} vs rust {rust}", device_side[slot]))
-        .collect();
+    let disagreements = layout_disagreements(&pipeline, &expected_conv_layout());
 
     assert!(
         disagreements
@@ -5253,5 +4845,222 @@ fn conv_packed_matches_split_for_conv_transpose2d() {
         outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
         outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
         "conv_transpose2d_f32 and its packed form disagree"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The layout registry (issue #58).
+//
+// Seven families each carried a `<family>_params_layout_matches_metal` test that
+// differed from the others only in which `Source`, which kernel name and which
+// `expected_*_layout()` it named. Adding a family meant a const, a function, and
+// a call site here -- and the call site is the one that fails silently: a family
+// absent from it is never checked, which is indistinguishable from one that
+// passes.
+//
+// The two tests below replace all seven. `LayoutFamily::descriptor`'s match is
+// exhaustive, so a family that fails to register is a **compile error**; these
+// close the one gap the compiler cannot see, which is a variant missing from
+// `LayoutFamily::ALL`.
+//
+// Note what is *not* here any more: nothing in this file names a family. A new
+// family adds a variant and an arm in `params.rs` and is checked by these tests
+// without touching `tests.rs` at all -- which preserves the append-only property
+// that let four conversions merge as a union (#62), because the per-family
+// parity arms below are still pure EOF appends and there is no longer a shared
+// list for two of them to edit.
+// ---------------------------------------------------------------------------
+
+/// Every registered family's packed structs agree with the device's view.
+///
+/// One dispatch per family, driven by `LayoutFamily::ALL`. A `static_assert` on
+/// either side proves only that side is self-consistent; this ships the
+/// *compiled kernel's own* `sizeof` and field offsets across the boundary and
+/// compares them against Rust's `size_of`/`offset_of!`. A field at the wrong
+/// offset does not crash — the kernel reads a well-formed number from the wrong
+/// place and computes a plausible wrong answer (`DESIGN.md` §3.5, §15.1).
+///
+/// This is also the check that catches the hazards #38 names — a vector type
+/// over-aligning, a `bool` sized differently — for any struct added later, and
+/// it now catches them for *every* family by construction rather than for those
+/// somebody remembered to add.
+///
+/// The slot count is asserted rather than assumed: the buffer is sized from
+/// `descriptor.slots()`, so a kernel writing more slots than Rust describes
+/// would write past it. That is why `slots()` is derived from the `expected`
+/// array's length rather than declared beside it.
+#[test]
+fn every_family_params_layout_matches_metal() {
+    use crate::kernels::params::LayoutFamily;
+
+    // Per-family, not just a total: a total alone cannot say *which* family
+    // stopped being checked, and two families moving in opposite directions
+    // would cancel.
+    const EXPECTED_SLOTS: &[(&str, usize)] = &[
+        ("reduce.metal", 26),
+        ("unary.metal", 10),
+        ("binary.metal", 5),
+        ("cast.metal", 5),
+        ("affine.metal", 16),
+        ("gemv.metal", 8),
+        ("conv.metal", 65),
+    ];
+
+    let mut failures = Vec::new();
+    let mut observed = Vec::new();
+
+    for &family in LayoutFamily::ALL {
+        let descriptor = family.descriptor();
+        assert!(
+            descriptor.slots() > 0,
+            "{family:?} registered no layout slots, so its check would pass vacuously"
+        );
+
+        let pipeline = layout_pipeline(descriptor.source, descriptor.kernel);
+        let disagreements = layout_disagreements(&pipeline, &descriptor.expected);
+
+        if !disagreements.is_empty() {
+            failures.push(format!(
+                "{} ({:?}):\n  {}",
+                family.metal_file(),
+                family,
+                disagreements.join("\n  ")
+            ));
+        }
+        observed.push((family.metal_file(), descriptor.slots()));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "packed parameter layout differs between .metal and params.rs.\n\
+         A field at the wrong offset is silent corruption, not a crash:\n{}",
+        failures.join("\n")
+    );
+
+    // Checked by count, not by inspection: if a family stops being checked the
+    // number moves, and the assertion names it rather than the suite quietly
+    // covering less than it did.
+    assert_eq!(
+        observed.len(),
+        LayoutFamily::ALL.len(),
+        "every registered family must be checked"
+    );
+    assert_eq!(
+        observed,
+        EXPECTED_SLOTS.to_vec(),
+        "family or slot count changed. Seven families and their slot counts were \
+         the state at issue #58; update this only alongside a deliberate addition."
+    );
+}
+
+/// `LayoutFamily::ALL` names every variant.
+///
+/// The `match` in `LayoutFamily::descriptor` is exhaustive, so a family that
+/// fails to describe itself does not compile — that is the acceptance criterion
+/// and the compiler enforces it. What the compiler cannot see is a variant
+/// missing from `ALL`, since a short array is a well-formed program. This is the
+/// one part of the registration that needs a test rather than a type.
+///
+/// It works by matching each known variant off an exhaustive `match` too, so
+/// adding a variant fails *here* at compile time as well and cannot be answered
+/// by editing only this test's expected count.
+#[test]
+fn layout_registry_covers_every_family() {
+    use crate::kernels::params::LayoutFamily;
+
+    // Exhaustive by construction: adding a variant without extending this match
+    // is `error[E0004]`, so the list below cannot silently fall behind the enum.
+    fn seen(family: LayoutFamily) -> &'static str {
+        match family {
+            LayoutFamily::Reduce => "reduce",
+            LayoutFamily::Unary => "unary",
+            LayoutFamily::Binary => "binary",
+            LayoutFamily::Cast => "cast",
+            LayoutFamily::Affine => "affine",
+            LayoutFamily::Gemv => "gemv",
+            LayoutFamily::Conv => "conv",
+        }
+    }
+
+    let expected = [
+        LayoutFamily::Reduce,
+        LayoutFamily::Unary,
+        LayoutFamily::Binary,
+        LayoutFamily::Cast,
+        LayoutFamily::Affine,
+        LayoutFamily::Gemv,
+        LayoutFamily::Conv,
+    ];
+
+    for family in expected {
+        assert!(
+            LayoutFamily::ALL.contains(&family),
+            "{} ({:?}) is a LayoutFamily variant but is missing from \
+             LayoutFamily::ALL, so it would never be checked",
+            seen(family),
+            family
+        );
+    }
+    assert_eq!(
+        LayoutFamily::ALL.len(),
+        expected.len(),
+        "LayoutFamily::ALL has an entry that is not in this test's list, or a \
+         duplicate"
+    );
+}
+
+/// The registry-driven layout check must be able to fail.
+///
+/// `DESIGN.md` §15.1 #1 and `CONTRIBUTING.md` §3.1 #2: a test that cannot fail
+/// is not a test, and this one guards a defect that is otherwise invisible.
+///
+/// The mutation is applied to a **copy of `reduce.metal`** compiled at runtime,
+/// so the real source is untouched. It **swaps `ReduceParams.src_numel` and
+/// `ReduceParams.num_dims`** — two adjacent fields of the same type. That case
+/// is chosen deliberately over inserting or removing a field, because it is the
+/// one nothing else catches:
+///
+/// * `sizeof` is unchanged, so the `static_assert` in `reduce.metal` still
+///   passes;
+/// * both fields are `uint`, so the brace initializer still type-checks —
+///   inserting a field of a different type is rejected by C++11 narrowing
+///   before it ever reaches a GPU, which is a real layer of defence but not
+///   this one;
+/// * the kernel runs and produces plausible numbers from the wrong values.
+///
+/// It is the same shape as the defect `DESIGN.md` §8.1c warns about for
+/// `im2col`'s eight consecutive `constant size_t` parameters: reordering two
+/// same-typed arguments is silent.
+///
+/// It goes through `LayoutFamily::Reduce.descriptor()` rather than naming the
+/// kernel and the expected array directly, so the mutation exercises the same
+/// comparison the registry-driven check runs rather than a re-implementation of
+/// it.
+#[test]
+fn reduce_params_layout_check_detects_a_moved_field() {
+    use crate::kernels::params::LayoutFamily;
+
+    let descriptor = LayoutFamily::Reduce.descriptor();
+    let pipeline = mutated_layout_pipeline(
+        crate::source::REDUCE,
+        "struct ReduceParams {\n    uint src_numel;\n    uint num_dims;\n    uint el_per_block;\n};",
+        "struct ReduceParams {\n    uint num_dims;\n    uint src_numel;\n    uint el_per_block;\n};",
+        descriptor.kernel,
+    );
+    let d = layout_disagreements(&pipeline, &descriptor.expected);
+
+    // Both swapped fields must be reported, and the struct's size must not be
+    // -- which is exactly why `sizeof` alone is not a sufficient check.
+    assert!(
+        d.iter().any(|x| x.starts_with("ReduceParams.src_numel")),
+        "swapping src_numel must be reported; got {d:?}"
+    );
+    assert!(
+        d.iter().any(|x| x.starts_with("ReduceParams.num_dims")),
+        "swapping num_dims must be reported; got {d:?}"
+    );
+    assert!(
+        !d.iter().any(|x| x.starts_with("sizeof(ReduceParams)")),
+        "the swap must not change sizeof, or it is not the silent case; got {d:?}"
     );
 }
