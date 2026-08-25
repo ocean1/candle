@@ -6,6 +6,7 @@ pub mod convolution;
 pub mod elementwise_names;
 pub mod fill;
 pub mod indexing;
+pub mod indexing_names;
 mod macros;
 pub mod mlx_gemm;
 pub mod params;
@@ -30,6 +31,7 @@ pub use conv_names::ConvKernel;
 pub use convolution::*;
 pub use fill::*;
 pub use indexing::*;
+pub use indexing_names::IndexingKernel;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_with, GemmDType};
 // `ParamStyle` is re-exported here rather than from `reduce`, where it was
 // declared when `reduce.metal` was the only family carrying both binding

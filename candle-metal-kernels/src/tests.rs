@@ -5064,3 +5064,147 @@ fn reduce_params_layout_check_detects_a_moved_field() {
         "the swap must not change sizeof, or it is not the silent case; got {d:?}"
     );
 }
+
+/// Every name [`IndexingKernel`] declares must exist in the compiled
+/// `indexing.metal` library.
+///
+/// The `conv_names_resolve` / `reduce_names_resolve` counterpart for the last
+/// decode-path family to get a registry, and it is the one that had already
+/// failed: `candle-core` named `is_i64_u8` and `is_i64_u32` and
+/// `indexing.metal` declared neither, so `index_select` on a `U8` or `U32`
+/// tensor with `I64` indices was a runtime `LoadFunctionError`. After #26's 48
+/// absent reduce variants and `conv`'s, that is the fourth firing of the class
+/// (`DESIGN.md` §8.1b) — and the first that needed a check spanning two crates
+/// to see, which is why three previous registry passes did not find it.
+#[test]
+fn indexing_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let mut checked = 0usize;
+    for family in IndexingKernel::ALL {
+        for ((ids, values), name) in family.variants() {
+            kernels
+                .load_pipeline(&device, Source::Indexing, name)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "indexing.metal has no kernel named {name:?} \
+                         (declared by IndexingKernel::{} for ids={ids:?} values={values:?}): {e:?}",
+                        family.stem(),
+                    )
+                });
+            checked += 1;
+        }
+    }
+
+    // Guards against the table being emptied or a family silently dropping all
+    // its variants -- an all-green run over zero names would otherwise pass.
+    // 18 each for index_select and index_add (3 index types x 6 value types),
+    // 16 for gather, and 10 each for scatter and scatter_add.
+    assert_eq!(
+        checked, 72,
+        "expected 72 declared indexing variants, found {checked}"
+    );
+}
+
+/// Each declared name must be its family's stem, then the index dtype, then the
+/// value dtype, and each `(index, value)` pair must appear once per family.
+///
+/// The names are stored verbatim so they can be grepped against
+/// `indexing.metal`, which means a row could pair one key with another family's
+/// valid name and still resolve — `indexing_names_resolve` would pass while
+/// [`IndexingKernel::name`] handed callers the wrong kernel. That is not
+/// hypothetical here: `s_u32_f32` and `sa_u32_f32` differ by one character and
+/// by whether the destination is assigned or accumulated into, so a copy-paste
+/// between the two families produces a name that loads and computes the wrong
+/// thing.
+///
+/// The ordering matters too. The `[[host_name]]` reads
+/// `<stem>_<index>_<value>` while the Metal template takes `<value, index>`, so
+/// a row that swapped the two suffixes would still resolve — against a kernel
+/// with the dtypes transposed.
+#[test]
+fn indexing_names_match_their_stem_and_dtypes() {
+    for family in IndexingKernel::ALL {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for ((ids, values), name) in family.variants() {
+            assert_eq!(
+                name,
+                format!("{}_{ids}_{values}", family.stem()),
+                "IndexingKernel::{} declares {name:?} for ids={ids:?} values={values:?}",
+                family.stem(),
+            );
+            assert!(
+                !seen.contains(&(ids, values)),
+                "IndexingKernel::{} declares ({ids:?}, {values:?}) twice",
+                family.stem(),
+            );
+            seen.push((ids, values));
+        }
+        assert!(
+            !seen.is_empty(),
+            "IndexingKernel::{} declares no variants",
+            family.stem(),
+        );
+    }
+}
+
+/// A `(index dtype, value dtype)` pair a family does not declare must not
+/// produce a name.
+///
+/// Returning `None` is what keeps an unsupported pair from reaching
+/// `load_pipeline` as a string that will fail to resolve — the caller reports it
+/// against its own dtype enum instead. This is the property whose absence *was*
+/// the `is_i64_u8` bug: the old `match` returned a name for it unconditionally,
+/// and nothing checked that the name existed.
+#[test]
+fn indexing_undeclared_pair_has_no_name() {
+    for family in IndexingKernel::ALL {
+        // f64 and i32 are instantiated nowhere in indexing.metal, in either
+        // position.
+        for bad in ["f64", "i32", "not_a_dtype"] {
+            assert_eq!(
+                family.name(bad, "f32"),
+                None,
+                "IndexingKernel::{} named an {bad:?} index type",
+                family.stem(),
+            );
+            assert_eq!(
+                family.name("u32", bad),
+                None,
+                "IndexingKernel::{} named a {bad:?} value type",
+                family.stem(),
+            );
+        }
+    }
+
+    // The scatter families are the asymmetric ones: `sa_u32_u32` exists and
+    // `sa_u8_u32` does not, which is indexing.metal's asymmetry rather than a
+    // simplification in the registry.
+    assert_eq!(
+        IndexingKernel::SCATTER_ADD.name("u32", "u32"),
+        Some("sa_u32_u32")
+    );
+    assert_eq!(IndexingKernel::SCATTER_ADD.name("u8", "u32"), None);
+    assert_eq!(IndexingKernel::SCATTER.name("u8", "u32"), None);
+
+    // gather declares no u8-valued variants for u32 or i64 indices.
+    assert_eq!(IndexingKernel::GATHER.name("u32", "u8"), None);
+    assert_eq!(IndexingKernel::GATHER.name("i64", "u8"), None);
+
+    // And the positive cases, so the assertions above are not vacuous. The
+    // first is the LFM2 embedding lookup; the second and third are the two
+    // that did not exist before this change.
+    assert_eq!(
+        IndexingKernel::INDEX_SELECT.name("u32", "f16"),
+        Some("is_u32_f16")
+    );
+    assert_eq!(
+        IndexingKernel::INDEX_SELECT.name("i64", "u8"),
+        Some("is_i64_u8")
+    );
+    assert_eq!(
+        IndexingKernel::INDEX_SELECT.name("i64", "u32"),
+        Some("is_i64_u32")
+    );
+}

@@ -7,7 +7,7 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 use candle_metal_kernels::kernels::binary::contiguous;
 use candle_metal_kernels::{
     metal::{Buffer, BufferPool, Commands, Device, PooledBuffer, ResidencySet},
-    BufferOffset, CallConvTranspose2dCfg, ConvKernel, Kernels, RESOURCE_OPTIONS,
+    BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
 };
 use objc2_foundation::NSRange;
 #[cfg(feature = "metal-debug-labels")]
@@ -45,6 +45,35 @@ fn conv_kernel_name(kernel: ConvKernel, dtype: DType, op: &'static str) -> Resul
     match kernel.name(dtype.as_str()) {
         Some(name) => Ok(name),
         None => crate::bail!("Metal {op} {dtype:?} not implemented"),
+    }
+}
+
+/// Resolve an `indexing.metal` kernel name for an `(ids dtype, value dtype)`
+/// pair, or report the op as unimplemented for it.
+///
+/// The `conv_kernel_name` above, for the family whose names were chosen *here*
+/// rather than in `candle-metal-kernels`. Each of these five call sites carried
+/// its own `match (ids.dtype, self.dtype)` table of string literals — 72 arms
+/// between them — and nothing compared those spellings with the
+/// `[[host_name]]`s `indexing.metal` declares.
+///
+/// **That had already gone wrong**: `is_i64_u8` and `is_i64_u32` were named here
+/// and declared nowhere, so `index_select` on a `U8` or `U32` tensor with `I64`
+/// indices failed at runtime. [`IndexingKernel`] is now the single Rust-side
+/// declaration and `indexing_names_resolve` checks every name in it against the
+/// compiled library.
+///
+/// Two dtypes rather than one, because an indexing kernel's name carries both —
+/// `is_u32_f16` is `index` over an f16 tensor with u32 indices.
+fn indexing_kernel_name(
+    kernel: IndexingKernel,
+    ids_dtype: DType,
+    value_dtype: DType,
+    op: &'static str,
+) -> Result<&'static str> {
+    match kernel.name(ids_dtype.as_str(), value_dtype.as_str()) {
+        Some(name) => Ok(name),
+        None => crate::bail!("Metal {op} {ids_dtype:?} {value_dtype:?} not implemented"),
     }
 }
 /// Simple way to catch lock error without
@@ -1533,25 +1562,7 @@ impl BackendStorage for MetalStorage {
             .with_size_for(dst_el, dtype)
             .with_label("gather")
             .build()?;
-        let name = match (ids.dtype, self.dtype) {
-            (DType::U8, DType::U8) => "gather_u8_u8",
-            (DType::U8, DType::F32) => "gather_u8_f32",
-            (DType::U8, DType::F16) => "gather_u8_f16",
-            (DType::U8, DType::BF16) => "gather_u8_bf16",
-            (DType::U8, DType::U32) => "gather_u8_u32",
-            (DType::U8, DType::I64) => "gather_u8_i64",
-            (DType::U32, DType::F32) => "gather_u32_f32",
-            (DType::U32, DType::F16) => "gather_u32_f16",
-            (DType::U32, DType::BF16) => "gather_u32_bf16",
-            (DType::U32, DType::U32) => "gather_u32_u32",
-            (DType::U32, DType::I64) => "gather_u32_i64",
-            (DType::I64, DType::F32) => "gather_i64_f32",
-            (DType::I64, DType::F16) => "gather_i64_f16",
-            (DType::I64, DType::BF16) => "gather_i64_bf16",
-            (DType::I64, DType::U32) => "gather_i64_u32",
-            (DType::I64, DType::I64) => "gather_i64_i64",
-            (left, right) => crate::bail!("Metal gather {left:?} {right:?} not implemented"),
-        };
+        let name = indexing_kernel_name(IndexingKernel::GATHER, ids.dtype, self.dtype, "gather")?;
         let encoder = self.device.command_encoder()?;
         let src = buffer_o(&self.buffer, src_l, dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
@@ -1583,22 +1594,17 @@ impl BackendStorage for MetalStorage {
         if !l.is_contiguous() || !ids_l.is_contiguous() || !src_l.is_contiguous() {
             return Err(crate::Error::RequiresContiguous { op: "scatter" }.bt());
         };
-        let name = match (ids.dtype, self.dtype) {
-            (DType::U8, DType::F32) => "s_u8_f32",
-            (DType::U8, DType::F16) => "s_u8_f16",
-            (DType::U8, DType::BF16) => "s_u8_bf16",
-            (DType::U32, DType::U32) => "s_u32_u32",
-            (DType::U32, DType::F32) => "s_u32_f32",
-            (DType::U32, DType::F16) => "s_u32_f16",
-            (DType::U32, DType::BF16) => "s_u32_bf16",
-            (DType::I64, DType::F32) => "s_i64_f32",
-            (DType::I64, DType::F16) => "s_i64_f16",
-            (DType::I64, DType::BF16) => "s_i64_bf16",
-            _ => Err(MetalError::UnexpectedDType {
+        // `UnexpectedDType` rather than `indexing_kernel_name`'s `bail!`: this
+        // site reports against the *ids* dtype specifically, which is a better
+        // message than a generic pair, and changing it would be a behaviour
+        // change beside a name-table change.
+        let Some(name) = IndexingKernel::SCATTER.name(ids.dtype.as_str(), self.dtype.as_str())
+        else {
+            Err(MetalError::UnexpectedDType {
                 msg: "scatter ids should be u8/u32/i64",
                 expected: DType::U32,
                 got: ids.dtype(),
-            })?,
+            })?
         };
         let encoder = self.device.command_encoder()?;
         let dst = buffer_o(&self.buffer, l, self.dtype);
@@ -1632,22 +1638,13 @@ impl BackendStorage for MetalStorage {
         if !l.is_contiguous() || !ids_l.is_contiguous() || !src_l.is_contiguous() {
             return Err(crate::Error::RequiresContiguous { op: "scatter-add" }.bt());
         };
-        let name = match (ids.dtype, self.dtype) {
-            (DType::U8, DType::F32) => "sa_u8_f32",
-            (DType::U8, DType::F16) => "sa_u8_f16",
-            (DType::U8, DType::BF16) => "sa_u8_bf16",
-            (DType::U32, DType::U32) => "sa_u32_u32",
-            (DType::U32, DType::F32) => "sa_u32_f32",
-            (DType::U32, DType::F16) => "sa_u32_f16",
-            (DType::U32, DType::BF16) => "sa_u32_bf16",
-            (DType::I64, DType::F32) => "sa_i64_f32",
-            (DType::I64, DType::F16) => "sa_i64_f16",
-            (DType::I64, DType::BF16) => "sa_i64_bf16",
-            _ => Err(MetalError::UnexpectedDType {
+        let Some(name) = IndexingKernel::SCATTER_ADD.name(ids.dtype.as_str(), self.dtype.as_str())
+        else {
+            Err(MetalError::UnexpectedDType {
                 msg: "scatter-add ids should be u8/u32/i64",
                 expected: DType::U32,
                 got: ids.dtype(),
-            })?,
+            })?
         };
         let encoder = self.device.command_encoder()?;
         let dst = buffer_o(&self.buffer, l, self.dtype);
@@ -1684,32 +1681,17 @@ impl BackendStorage for MetalStorage {
             .with_size_for(dst_el, dtype)
             .with_label("index_select")
             .build()?;
-        let name = match (ids.dtype, self.dtype) {
-            (DType::U8, DType::U8) => "is_u8_u8",
-            (DType::U8, DType::U32) => "is_u8_u32",
-            (DType::U8, DType::I64) => "is_u8_i64",
-            (DType::U8, DType::BF16) => "is_u8_bf16",
-            (DType::U8, DType::F32) => "is_u8_f32",
-            (DType::U8, DType::F16) => "is_u8_f16",
-
-            (DType::U32, DType::U8) => "is_u32_u8",
-            (DType::U32, DType::U32) => "is_u32_u32",
-            (DType::U32, DType::I64) => "is_u32_i64",
-            (DType::U32, DType::F32) => "is_u32_f32",
-            (DType::U32, DType::F16) => "is_u32_f16",
-            (DType::U32, DType::BF16) => "is_u32_bf16",
-
-            (DType::I64, DType::U8) => "is_i64_u8",
-            (DType::I64, DType::U32) => "is_i64_u32",
-            (DType::I64, DType::I64) => "is_i64_i64",
-            (DType::I64, DType::F32) => "is_i64_f32",
-            (DType::I64, DType::F16) => "is_i64_f16",
-            (DType::I64, DType::BF16) => "is_i64_bf16",
-
-            (left, right) => {
-                crate::bail!("Metal contiguous index_select {left:?} {right:?} not implemented")
-            }
-        };
+        // The site that had the defect: `is_i64_u8` and `is_i64_u32` were named
+        // in the table this replaces and declared nowhere in `indexing.metal`,
+        // so these two pairs reached `load_pipeline` as names that could not
+        // resolve. Both are declared now, and `indexing_names_resolve` is what
+        // keeps them so.
+        let name = indexing_kernel_name(
+            IndexingKernel::INDEX_SELECT,
+            ids.dtype,
+            self.dtype,
+            "contiguous index_select",
+        )?;
         let encoder = self.device.command_encoder()?;
         let src = buffer_o(&self.buffer, src_l, dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
@@ -1746,33 +1728,13 @@ impl BackendStorage for MetalStorage {
         if !ids_l.is_contiguous() || !src_l.is_contiguous() {
             return Err(crate::Error::RequiresContiguous { op: "index-add" }.bt());
         };
-        let name = match (ids.dtype, self.dtype) {
-            (DType::I64, DType::BF16) => "ia_i64_bf16",
-            (DType::I64, DType::F16) => "ia_i64_f16",
-            (DType::I64, DType::F32) => "ia_i64_f32",
-            (DType::I64, DType::I64) => "ia_i64_i64",
-            (DType::I64, DType::U32) => "ia_i64_u32",
-            (DType::I64, DType::U8) => "ia_i64_u8",
-
-            (DType::U32, DType::BF16) => "ia_u32_bf16",
-            (DType::U32, DType::F16) => "ia_u32_f16",
-            (DType::U32, DType::F32) => "ia_u32_f32",
-            (DType::U32, DType::I64) => "ia_u32_i64",
-            (DType::U32, DType::U32) => "ia_u32_u32",
-            (DType::U32, DType::U8) => "ia_u32_u8",
-
-            (DType::U8, DType::BF16) => "ia_u8_bf16",
-            (DType::U8, DType::F16) => "ia_u8_f16",
-            (DType::U8, DType::F32) => "ia_u8_f32",
-            (DType::U8, DType::I64) => "ia_u8_i64",
-            (DType::U8, DType::U32) => "ia_u8_u32",
-            (DType::U8, DType::U8) => "ia_u8_u8",
-
-            _ => Err(MetalError::UnexpectedDType {
+        let Some(name) = IndexingKernel::INDEX_ADD.name(ids.dtype.as_str(), self.dtype.as_str())
+        else {
+            Err(MetalError::UnexpectedDType {
                 msg: "index-add ids should be u8/u32/i64",
                 expected: DType::U32,
                 got: ids.dtype(),
-            })?,
+            })?
         };
         let encoder = self.device.command_encoder()?;
         let src = buffer_o(&src.buffer, src_l, src.dtype);
