@@ -12,7 +12,10 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 /// Shared cross-encoder output map: maps buffer pointer -> fence of the last encoder that wrote it.
@@ -79,6 +82,43 @@ pub struct ComputeCommandEncoder {
     /// exactly as before this field existed, so the default path is unchanged
     /// rather than merely equivalent.
     pub(crate) executor: Arc<ExecutorSlot>,
+    /// Open packed-params block, when a caller is capturing scalars instead of
+    /// binding them inline (`DESIGN.md` §11.3b, issue #38).
+    ///
+    /// `AtomicBool` beside the buffer, rather than testing an `Option` under
+    /// the lock, so the classical path pays a relaxed load and nothing else.
+    /// Following #35's shape deliberately: that change kept "the classical path
+    /// must not regress" *structural* by branching before doing any work, and a
+    /// mutex per scalar bind would have given that up -- `DESIGN.md` §6.4a
+    /// measured per-bind bookkeeping at 29.1 ns and the whole fence probe at
+    /// 5.1 % of non-GPU time, so per-bind additions are exactly the shape worth
+    /// not paying by default.
+    pub(crate) capturing: Arc<AtomicBool>,
+    pub(crate) param_capture: Arc<Mutex<ParamCapture>>,
+}
+
+/// Scalars accumulated for a packed params block, and the buffer renumbering
+/// that has to accompany them.
+///
+/// Diverting a scalar out of the argument list leaves a hole in the buffer
+/// indices: `call_rms_norm` binds `(length, elements_to_sum, src, dst, alpha,
+/// eps)` at 0..5, and the packed kernel takes `(params, src, dst, alpha)` at
+/// 0..3. So capture cannot only collect bytes -- it must also renumber the
+/// bindings that remain, or every buffer lands one or two slots too high and
+/// the kernel reads whatever was left at that index. Under
+/// `HazardTrackingModeUntracked` that is a silent wrong answer (`DESIGN.md`
+/// §3.5), which is the same class of failure as a bad struct offset and is
+/// caught by the same bit-identical test.
+///
+/// `next_buffer` starts at 1 because slot 0 is the params buffer itself.
+#[derive(Default)]
+pub struct ParamCapture {
+    bytes: Vec<u8>,
+    next_buffer: usize,
+    /// Buffers allocated to hold arrays that the classical path binds with
+    /// `setBytes`. Handed to the caller at capture close, so their lifetime is
+    /// the dispatch's rather than the capture's.
+    staged: Vec<Buffer>,
 }
 
 impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
@@ -118,6 +158,8 @@ impl ComputeCommandEncoder {
             state: Arc::new(Mutex::new(EncoderState::new())),
             prev_ce_outputs,
             executor,
+            capturing: Arc::new(AtomicBool::new(false)),
+            param_capture: Arc::new(Mutex::new(ParamCapture::default())),
         }
     }
 
@@ -209,6 +251,7 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        let index = self.capture_buffer_index(index);
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
             // Read-after-write against an earlier encoder: order against that
@@ -232,6 +275,7 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        let index = self.capture_buffer_index(index);
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
             // Write-after-write or write-after-read against an earlier encoder.
@@ -262,6 +306,136 @@ impl ComputeCommandEncoder {
         let size = core::mem::size_of::<T>();
         let ptr = ptr::NonNull::new(data as *const T as *mut c_void).unwrap();
         unsafe { self.raw.setBytes_length_atIndex(ptr, size, index) }
+    }
+
+    /// Capture this scalar into the packed-params staging area instead of
+    /// binding it inline, when a capture is open.
+    ///
+    /// Returns `false` when none is, which is the classical path and the
+    /// default: the caller then does exactly what it did before. The relaxed
+    /// load is the whole of the cost in that case -- no lock is taken.
+    ///
+    /// This is `DESIGN.md` §11.3b's "one function, not 51 call sites".
+    /// `EncoderParam::set_param` is the only place a primitive reaches
+    /// `setBytes`, so diverting it here leaves every `set_params!` site and
+    /// every `call_*` entry point untouched: the caller still passes a `u32`,
+    /// and where it lands becomes the encoder's business.
+    #[inline(always)]
+    pub(crate) fn capture_scalar(&self, bytes: &[u8], align: usize) -> bool {
+        if !self.capturing.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut cap = self.param_capture.lock().unwrap();
+        // Match the layout the kernel will read: pad to the field's own
+        // alignment before appending. `DESIGN.md` §15.1 -- a field at the wrong
+        // offset is silent corruption, so the padding rule has to be the one
+        // MSL actually applies, and `reduce_params_layout_matches_metal` is
+        // what proves it is.
+        while !cap.bytes.len().is_multiple_of(align) {
+            cap.bytes.push(0);
+        }
+        cap.bytes.extend_from_slice(bytes);
+        true
+    }
+
+    /// Promote a `setBytes` array to a device buffer, when capturing.
+    ///
+    /// `dims` and `strides` cannot join the packed struct -- their length comes
+    /// from the tensor's layout -- but they do not need to: an ICB command can
+    /// bind a buffer of any length, it just has no `setBytes` at all. So under
+    /// capture they become a real buffer and keep their own argument slot.
+    ///
+    /// Allocating per call is deliberate for this change and is not what a
+    /// decode path would do; see `with_packed_params` in `kernels/reduce.rs`
+    /// for why that is acceptable here and what a plan-owned buffer would look
+    /// like instead.
+    #[inline]
+    pub(crate) fn capture_array(&self, len_bytes: usize, bytes: *const c_void) -> bool {
+        if !self.capturing.load(Ordering::Relaxed) {
+            return false;
+        }
+        let index = self.capture_buffer_index(usize::MAX);
+        let device = crate::metal::Device::new(self.command_buffer.device());
+        let Ok(buffer) = device.new_buffer_with_data(bytes, len_bytes, crate::RESOURCE_OPTIONS)
+        else {
+            // Allocation failure here would otherwise bind nothing and let the
+            // kernel read a stale slot. Reporting it is not possible through
+            // `EncoderParam`, which returns unit, so fail loudly rather than
+            // silently: this path is behind an opt-in style and is not reached
+            // by any classical dispatch.
+            panic!("packed-params staging allocation failed for {len_bytes} bytes");
+        };
+        // Bound directly rather than through `set_input_buffer`, which would
+        // renumber a second time.
+        let ptr = buffer.raw_ptr() as usize;
+        self.wait_for_buffer(ptr);
+        {
+            let mut s = self.state.lock().unwrap();
+            s.next_inputs.insert(ptr);
+            s.all_inputs.insert(ptr);
+        }
+        unsafe {
+            self.raw
+                .setBuffer_offset_atIndex(Some(buffer.as_ref()), 0, index)
+        }
+        // The staging buffer must stay alive until the dispatch it feeds has
+        // completed, not merely until it is encoded. It is parked here and
+        // handed to the caller by `end_param_capture`, which holds it across
+        // the dispatch -- releasing it at capture-close would drop it while the
+        // GPU may still be reading, which is the in-flight-reuse failure
+        // `DESIGN.md` §2.3.8b describes and no fence can see.
+        self.param_capture.lock().unwrap().staged.push(buffer);
+        true
+    }
+
+    /// The index a buffer should actually bind at, given any scalars already
+    /// diverted out of the argument list ahead of it.
+    ///
+    /// Returns the caller's own index unless a capture is open.
+    #[inline(always)]
+    fn capture_buffer_index(&self, index: usize) -> usize {
+        if !self.capturing.load(Ordering::Relaxed) {
+            return index;
+        }
+        let mut cap = self.param_capture.lock().unwrap();
+        let slot = cap.next_buffer;
+        cap.next_buffer += 1;
+        slot
+    }
+
+    /// Begin capturing scalars into a packed-params block.
+    ///
+    /// Scoped rather than persistent: [`Self::end_param_capture`] returns the
+    /// bytes and closes it, so a capture cannot leak into the next dispatch.
+    pub fn begin_param_capture(&self) {
+        let mut cap = self.param_capture.lock().unwrap();
+        cap.bytes.clear();
+        cap.staged.clear();
+        // Slot 0 is the params buffer, bound by the caller after the capture
+        // closes, so the first real buffer goes to 1.
+        cap.next_buffer = 1;
+        drop(cap);
+        self.capturing.store(true, Ordering::Relaxed);
+    }
+
+    /// Close a capture opened by [`Self::begin_param_capture`], returning the
+    /// packed bytes and any buffers staged for arrays.
+    ///
+    /// The caller must hold the returned buffers until the dispatch is
+    /// complete; see [`Self::capture_array`].
+    ///
+    /// The trailing pad matters: C++ pads a struct up to its own alignment, so
+    /// `sizeof` is always a multiple of `alignof`. Without it a `{u64,u32}`
+    /// would ship 12 bytes where the kernel reads 16.
+    pub fn end_param_capture(&self, align: usize) -> (Vec<u8>, Vec<Buffer>) {
+        self.capturing.store(false, Ordering::Relaxed);
+        let mut cap = self.param_capture.lock().unwrap();
+        let mut bytes = std::mem::take(&mut cap.bytes);
+        let staged = std::mem::take(&mut cap.staged);
+        while align != 0 && !bytes.len().is_multiple_of(align) {
+            bytes.push(0);
+        }
+        (bytes, staged)
     }
 
     pub fn set_compute_pipeline_state(&self, pipeline: &ComputePipeline) {

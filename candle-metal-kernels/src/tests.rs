@@ -2730,3 +2730,475 @@ fn reduce_undeclared_dtype_has_no_name() {
         Some("fast_sum_f16_strided")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Packed parameters (issue #38)
+//
+// `reduce.metal` carries every kernel twice: the classical form binding each
+// scalar with `setBytes`, and a `_packed` form taking one `device const
+// Params*`. Only the second is expressible in an ICB command, which has no
+// `setBytes` in any form (`DESIGN.md` §3.7b).
+//
+// Three things have to hold, and they fail in different ways:
+//
+//  * the two sides agree on **layout** — a field at the wrong offset is a
+//    plausible wrong answer, not a crash (`DESIGN.md` §3.5, §15.1)
+//  * every `_packed` name **resolves** — a missing instantiation compiles and
+//    links, and #26 shipped exactly that defect for 48 variants
+//  * the two forms compute **bit-identical** output — which is what proves the
+//    body really is shared rather than merely similar
+
+/// The device's own view of every packed struct's layout, against Rust's.
+///
+/// Dispatches `reduce_params_layout`, which writes `sizeof` and each field's
+/// `offsetof` *as the compiled kernel sees them*. Comparing those against
+/// `size_of`/`offset_of!` on the `#[repr(C)]` mirrors checks the two sides
+/// against each other, where a `static_assert` on either side alone would only
+/// prove that side is self-consistent.
+///
+/// This is the check that catches the hazards #38 names — a vector type
+/// over-aligning, a `bool` sized differently — for any struct added later.
+#[test]
+fn reduce_params_layout_matches_metal() {
+    use crate::kernels::params::{expected_layout, LAYOUT_KERNEL, LAYOUT_SLOTS};
+
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let out = device
+        .new_buffer(LAYOUT_SLOTS * core::mem::size_of::<u32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    let pipeline = kernels
+        .load_pipeline(&device, Source::Reduce, LAYOUT_KERNEL)
+        .unwrap();
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_output_buffer(0, Some(&out), 0);
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let device_side: Vec<u32> = read_to_vec(&out, LAYOUT_SLOTS);
+    let mut disagreements = Vec::new();
+    for (slot, (what, rust)) in expected_layout().into_iter().enumerate() {
+        if device_side[slot] != rust {
+            disagreements.push(format!(
+                "  {what}: metal {} vs rust {rust}",
+                device_side[slot]
+            ));
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "packed parameter layout differs between reduce.metal and params.rs.\n\
+         A field at the wrong offset is silent corruption, not a crash:\n{}",
+        disagreements.join("\n")
+    );
+}
+
+/// The layout check must be able to fail.
+///
+/// `DESIGN.md` §15.1 #1 and `CONTRIBUTING.md` §3.1 #2: a test that cannot fail
+/// is not a test, and this one guards a defect that is otherwise invisible.
+///
+/// The mutation is applied to a **copy of `reduce.metal`** compiled at runtime,
+/// so the real source is untouched. It **swaps `ReduceParams.src_numel` and
+/// `ReduceParams.num_dims`** -- two adjacent fields of the same type. That case
+/// is chosen deliberately over inserting or removing a field, because it is the
+/// one nothing else catches:
+///
+/// * `sizeof` is unchanged, so the `static_assert` in `reduce.metal` still
+///   passes;
+/// * both fields are `uint`, so the brace initializer still type-checks --
+///   inserting a field of a different type is rejected by C++11 narrowing
+///   before it ever reaches a GPU, which is a real layer of defence but not
+///   this one;
+/// * the kernel runs and produces plausible numbers from the wrong values.
+///
+/// It is the same shape as the defect `DESIGN.md` §8.1c warns about for
+/// `im2col`'s eight consecutive `constant size_t` parameters: reordering two
+/// same-typed arguments is silent.
+#[test]
+fn reduce_params_layout_check_detects_a_moved_field() {
+    use crate::kernels::params::{expected_layout, LAYOUT_KERNEL, LAYOUT_SLOTS};
+
+    let original = "struct ReduceParams {\n    uint src_numel;\n    uint num_dims;\n    uint el_per_block;\n};";
+    let swapped = "struct ReduceParams {\n    uint num_dims;\n    uint src_numel;\n    uint el_per_block;\n};";
+    assert!(
+        crate::source::REDUCE.contains(original),
+        "the struct this test mutates has been reworded; update the mutation"
+    );
+    let mutant = crate::source::REDUCE.replace(original, swapped);
+
+    let device = device();
+    let library = device.new_library_with_source(&mutant, None).unwrap();
+    let function = library.get_function(LAYOUT_KERNEL, None).unwrap();
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .unwrap();
+
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let out = device
+        .new_buffer(LAYOUT_SLOTS * core::mem::size_of::<u32>(), RESOURCE_OPTIONS)
+        .unwrap();
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_output_buffer(0, Some(&out), 0);
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let device_side: Vec<u32> = read_to_vec(&out, LAYOUT_SLOTS);
+    let disagreements: Vec<String> = expected_layout()
+        .into_iter()
+        .enumerate()
+        .filter(|(slot, (_, rust))| device_side[*slot] != *rust)
+        .map(|(slot, (what, rust))| format!("{what}: metal {} vs rust {rust}", device_side[slot]))
+        .collect();
+
+    // Both swapped fields must be reported, and the struct's size must not be
+    // -- which is exactly why `sizeof` alone is not a sufficient check.
+    assert!(
+        disagreements
+            .iter()
+            .any(|d| d.starts_with("ReduceParams.src_numel")),
+        "swapping src_numel must be reported; got {disagreements:?}"
+    );
+    assert!(
+        disagreements
+            .iter()
+            .any(|d| d.starts_with("ReduceParams.num_dims")),
+        "swapping num_dims must be reported; got {disagreements:?}"
+    );
+    assert!(
+        !disagreements
+            .iter()
+            .any(|d| d.starts_with("sizeof(ReduceParams)")),
+        "the swap must not change sizeof, or it is not the silent case; got {disagreements:?}"
+    );
+}
+
+/// Every classical name has a `_packed` counterpart in the compiled library.
+///
+/// The same argument as `reduce_names_resolve`, applied to the new axis: an
+/// absent instantiation is not a compile error on either side, and the first
+/// symptom would be a `LoadFunctionError` inside a forward pass. #26 shipped
+/// precisely that for 48 variants, caught only by loading against the library.
+#[test]
+fn packed_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let mut checked = 0usize;
+    for family in ReduceKernel::ALL {
+        for (suffix, name) in family.variants() {
+            let packed = crate::kernels::params::packed_name(name);
+            kernels
+                .load_pipeline(&device, Source::Reduce, packed.clone())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "reduce.metal has no kernel named {packed:?} \
+                         (the packed form of {name:?}, ReduceKernel::{}{} for {suffix:?}): {e:?}",
+                        family.stem(),
+                        family.tail(),
+                    )
+                });
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked, 90,
+        "expected a packed counterpart for all 90 declared variants, found {checked}"
+    );
+}
+
+/// Run a reduction both ways and return `(split, packed)`.
+fn reduce_both_ways<T, U: Clone>(
+    v: &[T],
+    in_length: usize,
+    out_length: usize,
+    name: &'static str,
+) -> (Vec<U>, Vec<U>) {
+    let device = device();
+    let kernels = Kernels::new();
+    let shape = vec![in_length];
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, v);
+        let output = device
+            .new_buffer(out_length * core::mem::size_of::<U>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_reduce_contiguous_with(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            &shape,
+            out_length,
+            BufferOffset::zero_offset(&input),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<U>(&output, out_length));
+    }
+    let packed = outs.pop().unwrap();
+    let split = outs.pop().unwrap();
+    (split, packed)
+}
+
+/// `fast_sum_f16` — 22 of the 674 dispatches in a decode token — must give the
+/// same bits either way.
+///
+/// Bit-identical rather than approximately equal, deliberately. The two
+/// variants are instantiated from one body, so anything but an exact match
+/// means the binding style changed what the kernel computed, which is the whole
+/// question this issue asks. `DESIGN.md` §2.3 makes the same argument for the
+/// engine as a whole.
+#[test]
+fn packed_matches_split_for_sum_f16() {
+    let v: Vec<f16> = (0..1024)
+        .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 25.0))
+        .collect();
+    let (split, packed) = reduce_both_ways::<f16, f16>(&v, 1024, 8, "fast_sum_f16");
+    assert_eq!(
+        split.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        packed.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "fast_sum_f16 and fast_sum_f16_packed disagree"
+    );
+}
+
+#[test]
+fn packed_matches_split_for_sum_f32() {
+    let v: Vec<f32> = (0..2048)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+        .collect();
+    let (split, packed) = reduce_both_ways::<f32, f32>(&v, 2048, 16, "fast_sum_f32");
+    assert_eq!(
+        split.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        packed.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "fast_sum_f32 and fast_sum_f32_packed disagree"
+    );
+}
+
+/// `argmax` exercises the `indexed<T>` accumulator and the arg-reduce entry
+/// points, which are a separate pair of wrappers from the plain reductions.
+#[test]
+fn packed_matches_split_for_argmax_f32() {
+    let v: Vec<f32> = (0..512)
+        .map(|i| ((i * 61 % 97) as f32 - 48.0) / 7.0)
+        .collect();
+    let (split, packed) = reduce_both_ways::<f32, u32>(&v, 512, 4, "fast_argmax_f32");
+    assert_eq!(
+        split, packed,
+        "fast_argmax_f32 and its packed form disagree"
+    );
+}
+
+/// `softmax_f32` — 8 dispatches per decode token, one per attention layer.
+#[test]
+fn packed_matches_split_for_softmax_f32() {
+    let device = device();
+    let kernels = Kernels::new();
+    let v: Vec<f32> = (0..1024)
+        .map(|i| ((i * 29 % 83) as f32 - 41.0) / 13.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &v);
+        call_last_softmax_with(
+            &device,
+            &encoder,
+            &kernels,
+            "softmax_f32",
+            v.len(),
+            128,
+            &input,
+            0,
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, v.len()));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "softmax_f32 and softmax_f32_packed disagree"
+    );
+}
+
+/// `rmsnorm_f16` — 77 of the 674 dispatches in a decode token, the single
+/// largest contributor from this file, and the kernel `DESIGN.md` §3.7b names
+/// as the clearest case of a dispatch an ICB cannot express today.
+#[test]
+fn packed_matches_split_for_rmsnorm_f16() {
+    let device = device();
+    let kernels = Kernels::new();
+    let v: Vec<f16> = (0..2048)
+        .map(|i| f16::from_f32(((i * 53 % 89) as f32 - 44.0) / 17.0))
+        .collect();
+    let alpha: Vec<f16> = (0..256)
+        .map(|i| f16::from_f32(1.0 + (i % 7) as f32 / 32.0))
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let alpha_buf = new_buffer(&device, &alpha);
+        let output = new_buffer(&device, &v);
+        call_rms_norm_with(
+            &device,
+            &encoder,
+            &kernels,
+            "rmsnorm_f16",
+            v.len(),
+            256,
+            1e-5,
+            &input,
+            0,
+            &alpha_buf,
+            0,
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, v.len()));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "rmsnorm_f16 and rmsnorm_f16_packed disagree"
+    );
+}
+
+/// `rope_f16` — 16 dispatches per decode token, and the only family here whose
+/// scalars are `size_t`. That makes it the one that would break first if the
+/// Rust mirror had been narrowed to `u32`, so it is worth its own arm rather
+/// than being taken as covered by the `uint` families.
+#[test]
+fn packed_matches_split_for_rope_f16() {
+    let device = device();
+    let kernels = Kernels::new();
+    let (bh, td, d) = (8usize, 64usize, 64usize);
+    let n = bh * td;
+    let v: Vec<f16> = (0..n)
+        .map(|i| f16::from_f32(((i * 41 % 79) as f32 - 39.0) / 11.0))
+        .collect();
+    let cs: Vec<f16> = (0..(td * d / 2))
+        .map(|i| f16::from_f32((i % 13) as f32 / 13.0))
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let cos = new_buffer(&device, &cs);
+        let sin = new_buffer(&device, &cs);
+        let output = new_buffer(&device, &v);
+        call_rope_with(
+            &device, &encoder, &kernels, "rope_f16", bh, td, d, 0, &input, 0, &cos, 0, &sin, 0,
+            &output, style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, n));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "rope_f16 and rope_f16_packed disagree"
+    );
+}
+
+/// A strided reduction, so the `dims` *and* `strides` arrays both take the
+/// promoted-to-a-buffer path rather than `setBytes`.
+///
+/// This is the case the packed form does not fully absorb: an array's length
+/// comes from the tensor's layout, so it cannot be a struct field. It stays a
+/// separate binding, which an ICB can express — the constraint is `setBytes`,
+/// not buffer count.
+#[test]
+fn packed_matches_split_for_sum_f32_strided() {
+    let device = device();
+    let kernels = Kernels::new();
+    let v: Vec<f32> = (0..1024)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+        .collect();
+    let shape = vec![4usize, 8, 32];
+    let strides = vec![256usize, 32, 1];
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let output = device
+            .new_buffer(32 * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_reduce_strided_with(
+            &device,
+            &encoder,
+            &kernels,
+            "fast_sum_f32_strided",
+            &shape,
+            &strides,
+            32,
+            BufferOffset::zero_offset(&input),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, 32));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "fast_sum_f32_strided and its packed form disagree"
+    );
+}

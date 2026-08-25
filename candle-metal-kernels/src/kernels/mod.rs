@@ -7,6 +7,7 @@ pub mod fill;
 pub mod indexing;
 mod macros;
 pub mod mlx_gemm;
+pub mod params;
 pub mod quantized;
 pub mod random;
 pub mod reduce;
@@ -24,6 +25,7 @@ pub use convolution::*;
 pub use fill::*;
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
+pub use params::{NormParams, ReduceParams, RopeIParams, RopeParams, RopeThdParams, SoftmaxParams};
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,
 };

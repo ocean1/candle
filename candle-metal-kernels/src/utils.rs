@@ -100,16 +100,56 @@ pub fn set_param<P: EncoderParam>(encoder: &ComputeCommandEncoder, position: usi
 pub trait EncoderParam {
     fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self);
 }
+/// Lowers a primitive to the encoder, as either an inline constant or a field
+/// of a packed params block.
+///
+/// This one function is the entire Rust half of issue #38. An ICB command has
+/// no `setBytes` in any form (`DESIGN.md` §3.7b), so a kernel whose scalars
+/// arrive that way cannot be encoded into one; routing them into a buffer is
+/// the prerequisite. Because every inline constant in the crate already funnels
+/// through here -- 56 `set_params!` sites across 51 kernel entry points -- the
+/// diversion is invisible to all of them.
+///
+/// `capture_scalar` returns `false` unless a caller has opened a capture, so
+/// the classical path is the same `set_bytes` call it always was, reached after
+/// one relaxed atomic load.
+///
+/// The `to_ne_bytes`-shaped lowering is deliberate: the packed block has to
+/// match the C++ struct the kernel reads, so each field is appended at its own
+/// alignment. `usize` is 8 bytes here and maps to MSL's `size_t`, which is
+/// also 8 -- see `kernels/params.rs` for why the RoPE mirrors are `u64` rather
+/// than narrowed to `u32`.
 macro_rules! primitive {
     ($type:ty) => {
         impl EncoderParam for $type {
             fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+                let bytes = data.to_ne_bytes();
+                if encoder.capture_scalar(&bytes, core::mem::align_of::<Self>()) {
+                    return;
+                }
                 encoder.set_bytes(position, &data);
             }
         }
     };
 }
-primitive!(bool);
+/// `bool` has no `to_ne_bytes`, and it is also the one primitive whose packed
+/// width is worth stating out loud: **MSL's `bool` is 1 byte**, matching Rust's,
+/// so a `bool` field packs as a single byte and pads to whatever follows it.
+/// That is the second of the two hazards issue #38 names, and it is handled
+/// here rather than being left for a future family to trip over.
+///
+/// No kernel in `reduce.metal` binds a `bool`; this exists so the trait stays
+/// total, and so the width is recorded at the point that decides it.
+impl EncoderParam for bool {
+    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        let bytes = [data as u8];
+        if encoder.capture_scalar(&bytes, core::mem::align_of::<Self>()) {
+            return;
+        }
+        encoder.set_bytes(position, &data);
+    }
+}
+
 primitive!(usize);
 primitive!(i32);
 primitive!(i64);
@@ -135,8 +175,20 @@ impl<'a> BufferOffset<'a> {
     }
 }
 
+/// Arrays -- `dims` and `strides` -- are the one thing that does *not* fold
+/// into a packed params struct, and the reason is structural rather than
+/// incidental: their length is a property of the tensor's layout, so a
+/// fixed-layout struct cannot hold them. They stay a separate binding.
+///
+/// That is not a gap in the ICB story. `setKernelBuffer` binds a buffer of any
+/// length; what an ICB command cannot do is `setBytes` (`DESIGN.md` §3.7b). So
+/// under capture these are promoted to a device buffer -- which an ICB *can*
+/// express -- rather than being packed or left inline.
 impl<T> EncoderParam for &[T] {
     fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        if encoder.capture_array(core::mem::size_of_val(data), data.as_ptr().cast()) {
+            return;
+        }
         encoder.set_bytes_directly(position, core::mem::size_of_val(data), data.as_ptr().cast());
     }
 }

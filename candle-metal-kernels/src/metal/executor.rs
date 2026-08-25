@@ -226,10 +226,22 @@ impl std::fmt::Debug for ExecutorSlot {
 /// per dispatch, which is the only reason to want them.
 ///
 /// So an ICB path requires promoting every inline constant into a device
-/// buffer -- changing every kernel signature and every `.metal` source that
-/// reads one. That is the invasive, cross-cutting refactor `DESIGN.md` §8.1b
-/// records upstream declining, and it is a prerequisite for the ICB path
-/// rather than part of it. It is recorded here, and in `DESIGN.md` §11.3a, as
-/// the next thing that must land before this enum grows an `Icb` variant.
+/// buffer. That is a prerequisite for the ICB path rather than part of it, and
+/// it is recorded here and in `DESIGN.md` §11.3a as the next thing that must
+/// land before this enum grows an `Icb` variant.
+///
+/// **Two corrections to that framing, from doing it for one file** (issue #38,
+/// `DESIGN.md` §11.3c):
+///
+/// It is not "changing every kernel signature". Nothing is changed: a `_packed`
+/// entry point is *added* beside each existing one, generated from the same
+/// body, so the binding style is a compile-tier variant axis in §7.1's sense --
+/// the same kind of thing as dtype -- and the classical path is never in
+/// question. `reduce.metal`'s 90 variants became 180 that way.
+///
+/// And "the invasive refactor upstream would decline" was speculation that had
+/// been repeated as fact. It originates in §8.1b, about a *build script*
+/// emitting generated `.metal` into `OUT_DIR` -- a different change, with a
+/// different cost. **No candle maintainer has been asked about this one.**
 #[derive(Debug)]
 pub struct IcbFeasibility;

@@ -47,11 +47,21 @@ METAL_FUNC uint max_shared_mem(uint n) {
 }
 
 
-template<ushort D, typename IndexT>
+// The dims/strides pointers are templated on the *pointer type* rather than
+// written with a fixed address-space qualifier, so one body serves both binding
+// styles (#38). The classical wrappers instantiate these with
+// `constant const IndexT *` — what `setBytes` produces — and the packed wrappers
+// with `device const IndexT *`, which is all `setKernelBuffer` can bind.
+//
+// MSL has no `addrspace` template parameter, but a pointer type *is* a type, so
+// deducing it is enough and the arithmetic below is written once. Verified
+// against the runtime compiler before this file was touched: both
+// instantiations compile into one library.
+template<ushort D, typename IndexT, typename PtrT>
 struct strided_indexer {
-    constant const IndexT *dims;
-    constant const IndexT *strides;
-    strided_indexer<D - 1, IndexT> next {dims, strides};
+    PtrT dims;
+    PtrT strides;
+    strided_indexer<D - 1, IndexT, PtrT> next {dims, strides};
 
     METAL_FUNC IndexT operator()(IndexT idx) const {
         IndexT dim = dims[D - 1];
@@ -61,24 +71,27 @@ struct strided_indexer {
     }
 };
 
-template<typename IndexT>
-struct strided_indexer<1, IndexT> {
-    constant const IndexT *dims;
-    constant const IndexT *strides;
+template<typename IndexT, typename PtrT>
+struct strided_indexer<1, IndexT, PtrT> {
+    PtrT dims;
+    PtrT strides;
 
     METAL_FUNC IndexT operator()(IndexT idx) const {
         return idx * strides[0];
     }
 };
 
-template<ushort D, typename IndexT>
+// `num_dims` is taken by value rather than as a `constant &`. It is read as a
+// loop bound, never through its address, so the reference bought nothing and
+// keeping it would have pinned this helper to one address space.
+template<ushort D, typename IndexT, typename PtrT>
 METAL_FUNC IndexT get_strided_idx_fallback(
     IndexT idx,
-    constant const IndexT &num_dims,
-    constant const IndexT *dims,
-    constant const IndexT *strides
+    const IndexT num_dims,
+    PtrT dims,
+    PtrT strides
 ) {
-    strided_indexer<D, IndexT> next {dims, strides};
+    strided_indexer<D, IndexT, PtrT> next {dims, strides};
 
     IndexT strided_i = 0;
     for (IndexT d = D; d < num_dims; d++) {
@@ -90,31 +103,31 @@ METAL_FUNC IndexT get_strided_idx_fallback(
     return strided_i + next(idx);
 }
 
-template<typename IndexT>
+template<typename IndexT, typename PtrT>
 METAL_FUNC IndexT get_strided_index_t(
     IndexT idx,
-    constant const IndexT &num_dims,
-    constant const IndexT *dims,
-    constant const IndexT *strides
+    const IndexT num_dims,
+    PtrT dims,
+    PtrT strides
 ) {
     switch (num_dims) {
-        case 1: return strided_indexer<1, IndexT>{dims, strides}(idx);
-        case 2: return strided_indexer<2, IndexT>{dims, strides}(idx);
-        case 3: return strided_indexer<3, IndexT>{dims, strides}(idx);
-        case 4: return strided_indexer<4, IndexT>{dims, strides}(idx);
-        //case 5: return strided_indexer<5, IndexT>{dims, strides}(idx);
-        //case 6: return strided_indexer<6, IndexT>{dims, strides}(idx);
-        default: return get_strided_idx_fallback<4, IndexT>(idx, num_dims, dims, strides);
+        case 1: return strided_indexer<1, IndexT, PtrT>{dims, strides}(idx);
+        case 2: return strided_indexer<2, IndexT, PtrT>{dims, strides}(idx);
+        case 3: return strided_indexer<3, IndexT, PtrT>{dims, strides}(idx);
+        case 4: return strided_indexer<4, IndexT, PtrT>{dims, strides}(idx);
+        //case 5: return strided_indexer<5, IndexT, PtrT>{dims, strides}(idx);
+        //case 6: return strided_indexer<6, IndexT, PtrT>{dims, strides}(idx);
+        default: return get_strided_idx_fallback<4, IndexT, PtrT>(idx, num_dims, dims, strides);
     }
 }
 
-template<typename IndexT, bool STRIDED>
+template<typename IndexT, bool STRIDED, typename PtrT = constant const IndexT *>
 struct indexer_t {
     typedef IndexT I;
 };
 
-template<typename IndexT>
-struct indexer_t<IndexT, false> {
+template<typename IndexT, typename PtrT>
+struct indexer_t<IndexT, false, PtrT> {
     typedef IndexT I;
 
     const IndexT last_dim = 0;
@@ -124,17 +137,17 @@ struct indexer_t<IndexT, false> {
     }
 };
 
-template<typename IndexT>
-struct indexer_t<IndexT, true> {
+template<typename IndexT, typename PtrT>
+struct indexer_t<IndexT, true, PtrT> {
     typedef IndexT I;
 
-    constant const IndexT &num_dims;
-    constant const IndexT *dims;
-    constant const IndexT *strides;
+    const IndexT num_dims;
+    PtrT dims;
+    PtrT strides;
     const IndexT last_dim;
 
     METAL_FUNC IndexT operator()(IndexT i) const {
-        return get_strided_index_t(i, num_dims, dims, strides);
+        return get_strided_index_t<IndexT, PtrT>(i, num_dims, dims, strides);
     }
 };
 
@@ -421,8 +434,8 @@ struct loader<T, R, OP, BLOCKSIZE, Indexer, IndexT, typename metal::enable_if_t<
     METAL_FUNC R operator()(
         R value,
         Indexer indexer,
-        constant IndexT &src_numel,
-        constant IndexT &el_per_block,
+        const IndexT src_numel,
+        const IndexT el_per_block,
         device const T *src,
         const IndexT offset,
         const uint tid
@@ -453,8 +466,8 @@ struct loader<T, R, OP, BLOCKSIZE, Indexer, IndexT, typename metal::enable_if_t<
     METAL_FUNC R operator()(
         R value,
         Indexer indexer,
-        constant IndexT &src_numel,
-        constant IndexT &el_per_block,
+        const IndexT src_numel,
+        const IndexT el_per_block,
         device const T *src,
         const IndexT offset,
         const uint tid
@@ -577,8 +590,8 @@ template<
 >
 METAL_FUNC void reduce(
     Indexer indexer,
-    constant IndexT &src_numel,
-    constant IndexT &el_per_block,
+    const IndexT src_numel,
+    const IndexT el_per_block,
     device const T *src,
     device R *dst,
     threadgroup R shared[BLOCKSIZE],
@@ -651,51 +664,129 @@ case N: {                                                               \
     break;                                                              \
 }
 
+// The scalars each reduce entry point binds, as one standard-layout struct
+// (#38). Mirrored by `ReduceParams` in `kernels/params.rs`; the pair is checked
+// by `reduce_params_layout_matches_metal`, because a field at the wrong offset
+// is silent corruption rather than a crash (`DESIGN.md` §15.1).
+//
+// `dims` and `strides` are deliberately *not* fields: they are a tensor's
+// layout, so their length is a property of the call, not of the struct. They
+// stay separate bindings — which an ICB can express, since `setKernelBuffer`
+// binds a buffer of any length.
+struct ReduceParams {
+    uint src_numel;
+    uint num_dims;
+    uint el_per_block;
+};
+
 // `OP` is the reduction operator already applied to the accumulator type
 // (`Sum<float>`), not a template-template parameter as the macro form took it.
 // The macro spelled `OP<R>` at each use site; naming the applied type once in
 // the instantiation keeps the accumulator visible in exactly one place per
 // variant, which is what `avg_pool2d`'s per-dtype accumulators needed in #9.
+//
+// Where the shared part stops, and why it stops there.
+//
+// The obvious factoring — one `METAL_FUNC` body holding the whole kernel, two
+// wrappers calling it — does not compile: `reduce_switch` declares
+// `threadgroup R shared[N]`, and MSL permits a threadgroup-address-space
+// variable only inside a `[[kernel]]`-qualified function. (Caught by the
+// runtime compiler, which is the oracle §8.1b argues for.)
+//
+// So the seam sits one level lower, where this file already put it: `reduce()`
+// takes its shared memory as a *parameter*. The switch and its threadgroup
+// allocation stay in the kernel, and everything below the switch — the loader,
+// the block reduce, the store, all the arithmetic — is the same code for both
+// binding styles, reached through the same `reduce_case`. What the two wrappers
+// differ in is the two lines that unpack the parameters, which is the
+// irreducible core of the difference.
+//
+// `reduce_entry` is what makes that duplication one macro rather than four
+// hand-written switch statements: it takes the already-unpacked scalars, so the
+// wrapper above it is three lines regardless of where they came from.
+#define reduce_entry(PTR)                                               \
+    const uint src_numel = p.src_numel;                                 \
+    const uint el_per_block = p.el_per_block;                           \
+    indexer_t<uint, false, PTR> indexer;                                \
+    reduce_switch(reduce_case)
+
+#define reduce_strided_entry(PTR)                                       \
+    const uint src_numel = p.src_numel;                                 \
+    const uint el_per_block = p.el_per_block;                           \
+    indexer_t<uint, true, PTR> indexer {                                \
+        p.num_dims, dims, strides, dims[p.num_dims - 1]                 \
+    };                                                                  \
+    reduce_switch(reduce_case)
+
 template<typename T, typename R, typename OP>
 [[kernel]] void reduce_kernel(
-    constant uint &src_numel,
-    constant uint &num_dims,
+    constant uint &in_src_numel,
+    constant uint &in_num_dims,
     constant uint *dims,
-    constant uint &el_per_block,
+    constant uint &in_el_per_block,
     device const T *src,
     device R *dst,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
-    indexer_t<uint, false> indexer;
-    reduce_switch(reduce_case)
+    ReduceParams p { in_src_numel, in_num_dims, in_el_per_block };
+    reduce_entry(constant const uint *)
+}
+
+template<typename T, typename R, typename OP>
+[[kernel]] void reduce_kernel_packed(
+    device const ReduceParams *pp,
+    device const uint *dims,
+    device const T *src,
+    device R *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    ReduceParams p = *pp;
+    reduce_entry(device const uint *)
 }
 
 template<typename T, typename R, typename OP>
 [[kernel]] void reduce_kernel_strided(
-    constant uint &src_numel,
-    constant uint &num_dims,
+    constant uint &in_src_numel,
+    constant uint &in_num_dims,
     constant uint *dims,
     constant uint *strides,
-    constant uint &el_per_block,
+    constant uint &in_el_per_block,
     device const T *src,
     device R *dst,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
-    indexer_t<uint, true> indexer {
-        num_dims, dims, strides, dims[num_dims - 1]
-    };
-    reduce_switch(reduce_case)
+    ReduceParams p { in_src_numel, in_num_dims, in_el_per_block };
+    reduce_strided_entry(constant const uint *)
+}
+
+template<typename T, typename R, typename OP>
+[[kernel]] void reduce_kernel_strided_packed(
+    device const ReduceParams *pp,
+    device const uint *dims,
+    device const uint *strides,
+    device const T *src,
+    device R *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    ReduceParams p = *pp;
+    reduce_strided_entry(device const uint *)
 }
 
 #define init_kernel(name, func, ...) \
   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
 
 // Both the contiguous and strided entry points for one (op, dtype), matching
-// the pair `impl_reduce` used to generate.
+// the pair `impl_reduce` used to generate — and now each in both binding
+// styles, which is the whole of #38's mechanism: `_packed` is a name segment,
+// exactly as the dtype is, and the body behind it is the same code.
 //
 // `opname` is spelled separately from the operator type rather than stringized
 // from it: the type is `Sum` while the kernel is `fast_sum_*`, so `#op` would
@@ -704,8 +795,12 @@ template<typename T, typename R, typename OP>
 // what catches that; it caught exactly this while this file was being written.
 #define init_reduce(op, opname, tname, t)                               \
     init_kernel("fast_" #opname "_" #tname, reduce_kernel, t, t, op<t>) \
+    init_kernel("fast_" #opname "_" #tname "_packed",                   \
+                reduce_kernel_packed, t, t, op<t>)                      \
     init_kernel("fast_" #opname "_" #tname "_strided",                  \
-                reduce_kernel_strided, t, t, op<t>)
+                reduce_kernel_strided, t, t, op<t>)                     \
+    init_kernel("fast_" #opname "_" #tname "_strided_packed",           \
+                reduce_kernel_strided_packed, t, t, op<t>)
 
 template<
     typename T,
@@ -716,8 +811,8 @@ template<
 >
 METAL_FUNC void reduce(
     Indexer indexer,
-    constant IndexT &src_numel,
-    constant IndexT &el_per_block,
+    const IndexT src_numel,
+    const IndexT el_per_block,
     device const T *src,
     device uint *dst,
     threadgroup indexed<T> shared[BLOCKSIZE],
@@ -768,50 +863,97 @@ case N: {                                               \
 // `OP` is again the applied operator, here over the `indexed<T>` accumulator
 // (`Min<indexed<float>>`), which is what carries the tie-breaking index
 // alongside the value.
+// As above: the switch stays in the kernel because of the threadgroup array,
+// and the macro keeps the four wrappers from restating it.
+#define arg_reduce_entry(PTR)                                           \
+    using I = indexed<T>;                                               \
+    const uint src_numel = p.src_numel;                                 \
+    const uint el_per_block = p.el_per_block;                           \
+    indexer_t<uint, false, PTR> indexer {                               \
+        dims[p.num_dims - 1]                                            \
+    };                                                                  \
+    reduce_switch(arg_reduce_case)
+
+#define arg_reduce_strided_entry(PTR)                                   \
+    using I = indexed<T>;                                               \
+    const uint src_numel = p.src_numel;                                 \
+    const uint el_per_block = p.el_per_block;                           \
+    indexer_t<uint, true, PTR> indexer {                                \
+        p.num_dims, dims, strides, dims[p.num_dims - 1]                 \
+    };                                                                  \
+    reduce_switch(arg_reduce_case)
+
 template<typename T, typename OP>
 [[kernel]] void arg_reduce_kernel(
-    constant uint &src_numel,
-    constant uint &num_dims,
+    constant uint &in_src_numel,
+    constant uint &in_num_dims,
     constant uint *dims,
-    constant uint &el_per_block,
+    constant uint &in_el_per_block,
     device const T *src,
     device uint *dst,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
-    using I = indexed<T>;
-    indexer_t<uint, false> indexer {
-        dims[num_dims - 1]
-    };
-    reduce_switch(arg_reduce_case)
+    ReduceParams p { in_src_numel, in_num_dims, in_el_per_block };
+    arg_reduce_entry(constant const uint *)
+}
+
+template<typename T, typename OP>
+[[kernel]] void arg_reduce_kernel_packed(
+    device const ReduceParams *pp,
+    device const uint *dims,
+    device const T *src,
+    device uint *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    ReduceParams p = *pp;
+    arg_reduce_entry(device const uint *)
 }
 
 template<typename T, typename OP>
 [[kernel]] void arg_reduce_kernel_strided(
-    constant uint &src_numel,
-    constant uint &num_dims,
+    constant uint &in_src_numel,
+    constant uint &in_num_dims,
     constant uint *dims,
     constant uint *strides,
-    constant uint &el_per_block,
+    constant uint &in_el_per_block,
     device const T *src,
     device uint *dst,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
-    using I = indexed<T>;
-    indexer_t<uint, true> indexer {
-        num_dims, dims, strides, dims[num_dims - 1]
-    };
-    reduce_switch(arg_reduce_case)
+    ReduceParams p { in_src_numel, in_num_dims, in_el_per_block };
+    arg_reduce_strided_entry(constant const uint *)
+}
+
+template<typename T, typename OP>
+[[kernel]] void arg_reduce_kernel_strided_packed(
+    device const ReduceParams *pp,
+    device const uint *dims,
+    device const uint *strides,
+    device const T *src,
+    device uint *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    ReduceParams p = *pp;
+    arg_reduce_strided_entry(device const uint *)
 }
 
 #define init_arg_reduce(op, opname, tname, t)                                 \
     init_kernel("fast_" #opname "_" #tname,                                   \
                 arg_reduce_kernel, t, op<indexed<t>>)                         \
+    init_kernel("fast_" #opname "_" #tname "_packed",                         \
+                arg_reduce_kernel_packed, t, op<indexed<t>>)                  \
     init_kernel("fast_" #opname "_" #tname "_strided",                        \
-                arg_reduce_kernel_strided, t, op<indexed<t>>)
+                arg_reduce_kernel_strided, t, op<indexed<t>>)                 \
+    init_kernel("fast_" #opname "_" #tname "_strided_packed",                 \
+                arg_reduce_kernel_strided_packed, t, op<indexed<t>>)
 
 // Contains the intermediate results for the online softmax calculation.
 // m: max
@@ -896,8 +1038,8 @@ struct finalize_softmax {
 // Same as the Online normalizer calculation for softmax: https://arxiv.org/pdf/1805.02867.pdf
 template<typename T, ushort BLOCKSIZE>
 METAL_FUNC void softmax(
-    constant uint &src_numel,
-    constant uint &el_per_block,
+    const uint src_numel,
+    const uint el_per_block,
     device const T *src,
     device T *dst,
     threadgroup MD<T> shared[BLOCKSIZE],
@@ -956,21 +1098,49 @@ case N: {                                               \
     break;                                              \
 }
 
+// Softmax and the norms below bind only scalars, so their packed form is one
+// buffer and no separate array binding — the shape `measurements/probes/issue-38`
+// demonstrated. Layout is mirrored in `kernels/params.rs` and asserted.
+struct SoftmaxParams {
+    uint src_numel;
+    uint el_per_block;
+};
+
+#define softmax_entry()                                                 \
+    const uint src_numel = p.src_numel;                                 \
+    const uint el_per_block = p.el_per_block;                           \
+    reduce_switch(softmax_case)
+
 template<typename T>
 [[kernel]] void softmax_kernel(
-    constant uint &src_numel,
-    constant uint &el_per_block,
+    constant uint &in_src_numel,
+    constant uint &in_el_per_block,
     device const T *src,
     device T *dst,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
-    reduce_switch(softmax_case)
+    SoftmaxParams p { in_src_numel, in_el_per_block };
+    softmax_entry()
 }
 
-#define init_softmax(tname, t) \
-    init_kernel("softmax_" #tname, softmax_kernel, t)
+template<typename T>
+[[kernel]] void softmax_kernel_packed(
+    device const SoftmaxParams *pp,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    SoftmaxParams p = *pp;
+    softmax_entry()
+}
+
+#define init_softmax(tname, t)                          \
+    init_kernel("softmax_" #tname, softmax_kernel, t)   \
+    init_kernel("softmax_" #tname "_packed", softmax_kernel_packed, t)
 
 
 template<typename T>
@@ -1091,12 +1261,12 @@ template<
     ushort BLOCKSIZE
 >
 METAL_FUNC void rms_norm(
-    constant uint &src_numel,
-    constant uint &el_per_block,
+    const uint src_numel,
+    const uint el_per_block,
     device const T *src,
     device T *dst,
     device const T *alpha,
-    constant float &eps,
+    const float eps,
     threadgroup RMS<float> shared[BLOCKSIZE],
     threadgroup float &total,
 
@@ -1167,23 +1337,57 @@ case N: {                                               \
     break;                                              \
 }
 
+// `{uint, uint, float}` — the struct the probe in `measurements/probes/issue-38`
+// used, and the one `call_rms_norm`'s 77 dispatches per decode token bind.
+struct NormParams {
+    uint src_numel;
+    uint el_per_block;
+    float eps;
+};
+
+// `reduce_switch_on(float, ...)` rather than `reduce_switch`: the norms
+// accumulate in `float` and clamp the block size on that, not on `T`. Preserved
+// from #26, where collapsing the two spellings would have changed which block
+// size a half-precision norm selects.
+#define norm_entry(CASE_MACRO)                                          \
+    const uint src_numel = p.src_numel;                                 \
+    const uint el_per_block = p.el_per_block;                           \
+    const float eps = p.eps;                                            \
+    reduce_switch_on(float, CASE_MACRO)
+
 template<typename T>
 [[kernel]] void rms_norm_kernel(
-    constant uint &src_numel,
-    constant uint &el_per_block,
+    constant uint &in_src_numel,
+    constant uint &in_el_per_block,
     device const T *src,
     device T *dst,
     device const T *alpha,
-    constant float &eps,
+    constant float &in_eps,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
-    reduce_switch_on(float, rms_norm_case)
+    NormParams p { in_src_numel, in_el_per_block, in_eps };
+    norm_entry(rms_norm_case)
 }
 
-#define init_rms_norm(tname, t) \
-    init_kernel("rmsnorm_" #tname, rms_norm_kernel, t)
+template<typename T>
+[[kernel]] void rms_norm_kernel_packed(
+    device const NormParams *pp,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormParams p = *pp;
+    norm_entry(rms_norm_case)
+}
+
+#define init_rms_norm(tname, t)                             \
+    init_kernel("rmsnorm_" #tname, rms_norm_kernel, t)      \
+    init_kernel("rmsnorm_" #tname "_packed", rms_norm_kernel_packed, t)
 
 template<typename T>
 struct LayerNormValue {
@@ -1265,13 +1469,13 @@ template<
     ushort BLOCKSIZE
 >
 METAL_FUNC void layer_norm(
-    constant uint &src_numel,
-    constant uint &el_per_block,
+    const uint src_numel,
+    const uint el_per_block,
     device const T *src,
     device T *dst,
     device const T *alpha,
     device const T *beta,
-    constant float &eps,
+    const float eps,
     threadgroup LayerNormValue<float> shared[BLOCKSIZE],
     threadgroup float &mu,
     threadgroup float &sigma,
@@ -1359,31 +1563,53 @@ case N: {                                               \
     break;                                              \
 }
 
+// `lane_id` is threaded through unused, exactly as the macro form left it. It
+// is a kernel attribute rather than a bound parameter, so it is unaffected by
+// the binding style and is preserved rather than tidied (#26 kept it for the
+// same reason).
 template<typename T>
 [[kernel]] void layer_norm_kernel(
-    constant uint &src_numel,
-    constant uint &el_per_block,
+    constant uint &in_src_numel,
+    constant uint &in_el_per_block,
     device const T *src,
     device T *dst,
     device const T *alpha,
     device const T *beta,
-    constant float &eps,
+    constant float &in_eps,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
     uint lane_id [[thread_index_in_simdgroup]],
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
-    reduce_switch_on(float, layer_norm_case)
+    NormParams p { in_src_numel, in_el_per_block, in_eps };
+    norm_entry(layer_norm_case)
 }
 
-#define init_layer_norm(tname, t) \
-    init_kernel("layernorm_" #tname, layer_norm_kernel, t)
+template<typename T>
+[[kernel]] void layer_norm_kernel_packed(
+    device const NormParams *pp,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *beta,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormParams p = *pp;
+    norm_entry(layer_norm_case)
+}
+
+#define init_layer_norm(tname, t)                           \
+    init_kernel("layernorm_" #tname, layer_norm_kernel, t)  \
+    init_kernel("layernorm_" #tname "_packed", layer_norm_kernel_packed, t)
 
 template<typename T>
 METAL_FUNC void ropei(
-    constant size_t &bh,
-    constant size_t &td,
-    constant size_t &stride_b,
+    const size_t bh,
+    const size_t td,
+    const size_t stride_b,
     device const T *src,
     device const T *cos,
     device const T *sin,
@@ -1406,10 +1632,10 @@ METAL_FUNC void ropei(
 
 template<typename T>
 METAL_FUNC void rope(
-    constant size_t &bh,
-    constant size_t &td,
-    constant size_t &d,
-    constant size_t &stride_b,
+    const size_t bh,
+    const size_t td,
+    const size_t d,
+    const size_t stride_b,
     device const T *src,
     device const T *cos,
     device const T *sin,
@@ -1438,11 +1664,11 @@ METAL_FUNC void rope(
 
 template<typename T>
 METAL_FUNC void rope_thd(
-    constant size_t &b,
-    constant size_t &t,
-    constant size_t &h,
-    constant size_t &d,
-    constant size_t &stride_b,
+    const size_t b,
+    const size_t t,
+    const size_t h,
+    const size_t d,
+    const size_t stride_b,
     device const T *src,
     device const T *cos,
     device const T *sin,
@@ -1468,6 +1694,34 @@ METAL_FUNC void rope_thd(
     dst[i2] = src[i1] * s + src[i2] * c;
 }
 
+// RoPE binds `size_t`, which is **8 bytes** in MSL where the reductions' `uint`
+// is 4. The struct keeps `size_t` rather than narrowing to `uint`, so the
+// packed form binds exactly the values the classical form does and the
+// conversion stays a binding-style change with no numeric range change. The
+// Rust mirror is `u64` for the same reason, and the sizes are asserted against
+// each other — this is precisely the over-alignment class #38 warns about, and
+// silently narrowing here would be a wrong answer rather than a crash.
+struct RopeIParams {
+    size_t bh;
+    size_t td;
+    size_t stride_b;
+};
+
+struct RopeParams {
+    size_t bh;
+    size_t td;
+    size_t d;
+    size_t stride_b;
+};
+
+struct RopeThdParams {
+    size_t b;
+    size_t t;
+    size_t h;
+    size_t d;
+    size_t stride_b;
+};
+
 template<typename T>
 [[kernel]] void rope_i_kernel(
     constant size_t &bh,
@@ -1480,6 +1734,19 @@ template<typename T>
     uint tid [[ thread_position_in_grid ]]
 ) {
     ropei<T>(bh, td, stride_b, src, cos, sin, dst, tid);
+}
+
+template<typename T>
+[[kernel]] void rope_i_kernel_packed(
+    device const RopeIParams *pp,
+    device const T *src,
+    device const T *cos,
+    device const T *sin,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    RopeIParams p = *pp;
+    ropei<T>(p.bh, p.td, p.stride_b, src, cos, sin, dst, tid);
 }
 
 template<typename T>
@@ -1498,6 +1765,19 @@ template<typename T>
 }
 
 template<typename T>
+[[kernel]] void rope_kernel_packed(
+    device const RopeParams *pp,
+    device const T *src,
+    device const T *cos,
+    device const T *sin,
+    device T *dst,
+    uint idx [[ thread_position_in_grid ]]
+) {
+    RopeParams p = *pp;
+    rope<T>(p.bh, p.td, p.d, p.stride_b, src, cos, sin, dst, idx);
+}
+
+template<typename T>
 [[kernel]] void rope_thd_kernel(
     constant size_t &b,
     constant size_t &t,
@@ -1513,13 +1793,135 @@ template<typename T>
     rope_thd<T>(b, t, h, d, stride_b, src, cos, sin, dst, idx);
 }
 
+template<typename T>
+[[kernel]] void rope_thd_kernel_packed(
+    device const RopeThdParams *pp,
+    device const T *src,
+    device const T *cos,
+    device const T *sin,
+    device T *dst,
+    uint idx [[ thread_position_in_grid ]]
+) {
+    RopeThdParams p = *pp;
+    rope_thd<T>(p.b, p.t, p.h, p.d, p.stride_b, src, cos, sin, dst, idx);
+}
+
 // The three variants a single `ROPE(...)` used to generate. Note the name
 // shapes differ between them — `rope_f32`, `rope_i_f32`, `rope_thd_f32` — so
 // the dtype suffix is not a common tail and each is spelled out.
-#define init_rope(tname, t)                                     \
-    init_kernel("rope_" #tname, rope_kernel, t)                 \
-    init_kernel("rope_i_" #tname, rope_i_kernel, t)             \
-    init_kernel("rope_thd_" #tname, rope_thd_kernel, t)
+#define init_rope(tname, t)                                                 \
+    init_kernel("rope_" #tname, rope_kernel, t)                             \
+    init_kernel("rope_" #tname "_packed", rope_kernel_packed, t)            \
+    init_kernel("rope_i_" #tname, rope_i_kernel, t)                         \
+    init_kernel("rope_i_" #tname "_packed", rope_i_kernel_packed, t)        \
+    init_kernel("rope_thd_" #tname, rope_thd_kernel, t)                     \
+    init_kernel("rope_thd_" #tname "_packed", rope_thd_kernel_packed, t)
+
+// ---------------------------------------------------------------------------
+// Layout, asserted on the device side.
+//
+// A packed parameter at the wrong offset is silent corruption, not a crash
+// (`DESIGN.md` §3.5, §15.1) — the kernel reads a well-formed number from the
+// wrong place and produces a plausible wrong answer. So the layout is pinned
+// here in the language that decides it, and pinned again in `kernels/params.rs`
+// for the Rust `#[repr(C)]` mirrors; `reduce_params_layout_matches_metal`
+// dispatches a kernel that writes these very values into a buffer and compares
+// them against Rust's own `size_of`/`offset_of`, so the two sides are checked
+// against each other rather than each against its own expectation.
+//
+// MSL is C++14 with standard layout rules, so these hold for the same reasons
+// they would in host C++. The hazards #38 names are absent by construction and
+// are worth stating: no field here is a vector type (`float3` would occupy 16
+// bytes, not 12), and none is `bool` (1 byte in MSL). Every field is a scalar
+// whose size is fixed by the language.
+//
+// Only sizes and alignments are `static_assert`ed. Offsets are *not*: MSL has
+// no `<cstddef>`, and the null-pointer-member form of `offsetof` is not a
+// constant expression here (it performs a reinterpret_cast, which constant
+// evaluation rejects). They are reported by `reduce_params_layout` below
+// instead, which is the stronger check regardless — it compares the device's
+// own numbers against Rust's, where a `static_assert` would only prove the
+// device side agrees with itself.
+static_assert(sizeof(ReduceParams) == 12, "ReduceParams layout");
+static_assert(alignof(ReduceParams) == 4, "ReduceParams alignment");
+
+static_assert(sizeof(SoftmaxParams) == 8, "SoftmaxParams layout");
+static_assert(alignof(SoftmaxParams) == 4, "SoftmaxParams alignment");
+
+static_assert(sizeof(NormParams) == 12, "NormParams layout");
+static_assert(alignof(NormParams) == 4, "NormParams alignment");
+
+// `size_t` is 8 bytes here, so these are 8-aligned where the `uint` structs
+// above are 4-aligned. That difference is the reason the assertions are
+// per-struct rather than one blanket check.
+static_assert(sizeof(RopeIParams) == 24, "RopeIParams layout");
+static_assert(alignof(RopeIParams) == 8, "RopeIParams alignment");
+
+static_assert(sizeof(RopeParams) == 32, "RopeParams layout");
+static_assert(alignof(RopeParams) == 8, "RopeParams alignment");
+
+static_assert(sizeof(RopeThdParams) == 40, "RopeThdParams layout");
+static_assert(alignof(RopeThdParams) == 8, "RopeThdParams alignment");
+
+// Reports each struct's size and every field's offset *as the compiled kernel
+// sees them*, for the host-side layout test to compare against Rust's own
+// figures. A `static_assert` proves the device side is self-consistent; only
+// shipping the numbers across the boundary proves the two sides agree, which is
+// the failure this exists to catch.
+//
+// Writes 26 slots; see `LAYOUT_SLOTS` in `kernels/params.rs` for what each
+// index means. The two orderings are declared once each, and the test fails if
+// they disagree.
+//
+// The offset is taken from a real `thread` instance rather than the usual
+// null-pointer form, which MSL rejects in constant evaluation. Measuring it at
+// runtime is what this kernel is for.
+#define offsetof_rt(S, F) \
+    ((uint)((thread const char *)&(probe_##S.F) - (thread const char *)&probe_##S))
+
+[[kernel]] void reduce_params_layout(
+    device uint *out,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    if (tid != 0) { return; }
+    ReduceParams  probe_ReduceParams;
+    SoftmaxParams probe_SoftmaxParams;
+    NormParams    probe_NormParams;
+    RopeIParams   probe_RopeIParams;
+    RopeParams    probe_RopeParams;
+    RopeThdParams probe_RopeThdParams;
+    out[ 0] = sizeof(ReduceParams);
+    out[ 1] = offsetof_rt(ReduceParams, src_numel);
+    out[ 2] = offsetof_rt(ReduceParams, num_dims);
+    out[ 3] = offsetof_rt(ReduceParams, el_per_block);
+
+    out[ 4] = sizeof(SoftmaxParams);
+    out[ 5] = offsetof_rt(SoftmaxParams, src_numel);
+    out[ 6] = offsetof_rt(SoftmaxParams, el_per_block);
+
+    out[ 7] = sizeof(NormParams);
+    out[ 8] = offsetof_rt(NormParams, src_numel);
+    out[ 9] = offsetof_rt(NormParams, el_per_block);
+    out[10] = offsetof_rt(NormParams, eps);
+
+    out[11] = sizeof(RopeIParams);
+    out[12] = offsetof_rt(RopeIParams, bh);
+    out[13] = offsetof_rt(RopeIParams, td);
+    out[14] = offsetof_rt(RopeIParams, stride_b);
+
+    out[15] = sizeof(RopeParams);
+    out[16] = offsetof_rt(RopeParams, bh);
+    out[17] = offsetof_rt(RopeParams, td);
+    out[18] = offsetof_rt(RopeParams, d);
+    out[19] = offsetof_rt(RopeParams, stride_b);
+
+    out[20] = sizeof(RopeThdParams);
+    out[21] = offsetof_rt(RopeThdParams, b);
+    out[22] = offsetof_rt(RopeThdParams, t);
+    out[23] = offsetof_rt(RopeThdParams, h);
+    out[24] = offsetof_rt(RopeThdParams, d);
+    out[25] = offsetof_rt(RopeThdParams, stride_b);
+}
 
 init_rms_norm(f32, float)
 init_rms_norm(f16, half)
