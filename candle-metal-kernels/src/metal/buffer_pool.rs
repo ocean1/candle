@@ -254,6 +254,13 @@ pub struct PoolCounters {
     pub drained: u64,
     /// Buffers currently parked waiting for the GPU.
     pub pending: u64,
+    /// Free buffers destroyed to keep the free list inside its byte budget.
+    ///
+    /// Nonzero means the workload is freeing sizes it does not ask for again --
+    /// a growing KV cache does this every token. Zero means every freed buffer
+    /// found a later use, which is the steady state a fixed-shape workload
+    /// reaches.
+    pub evicted: u64,
 }
 
 struct PoolState {
@@ -286,6 +293,19 @@ struct PoolState {
     /// nothing has to sort it.
     pending: std::collections::VecDeque<PendingBuffer>,
 
+    /// Bytes currently sitting in `free`, maintained incrementally so the
+    /// budget check never has to walk the buckets.
+    free_bytes: usize,
+
+    /// Sizes in the order they entered `free`, so eviction can take the oldest
+    /// without sorting or scanning. An entry whose buffer has since been handed
+    /// out is stale and simply skipped; that is cheaper than removing it
+    /// eagerly, and it keeps `acquire` off this structure entirely.
+    free_order: std::collections::VecDeque<usize>,
+
+    /// Cap on `free_bytes`. See `evict_over_budget` for why there has to be one.
+    free_budget: usize,
+
     counters: PoolCounters,
 }
 
@@ -304,6 +324,20 @@ pub struct PoolInner {
     clock: Arc<GpuClock>,
 }
 
+/// Default cap on bytes held in a free list.
+///
+/// Sized from measurement rather than taste. Issue #21 recorded 43.6 MB of free
+/// buffers in LFM2 decode steady state under CPU-drop release; deferring to GPU
+/// completion holds roughly the in-flight window's worth on top of that. 256 MB
+/// leaves several times that headroom while capping the pathological case at a
+/// bounded overshoot instead of the 13.6 GB an unbounded free list reached at
+/// 400 decode tokens.
+///
+/// It is a ceiling, not a target. A workload that reuses what it frees never
+/// approaches it and never runs the eviction path at all; what it bounds is the
+/// case where freed sizes are never asked for again.
+const DEFAULT_FREE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
 impl PoolInner {
     fn new(clock: Arc<GpuClock>) -> Self {
         Self {
@@ -312,6 +346,9 @@ impl PoolInner {
                 live_buffers: 0,
                 live_bytes: 0,
                 pending: std::collections::VecDeque::new(),
+                free_bytes: 0,
+                free_order: std::collections::VecDeque::new(),
+                free_budget: DEFAULT_FREE_BUDGET_BYTES,
                 counters: PoolCounters::default(),
             }),
             clock,
@@ -380,12 +417,63 @@ impl PoolInner {
                 .pending
                 .pop_front()
                 .expect("front() just returned Some");
+            state.free_bytes += entry.size;
+            state.free_order.push_back(entry.size);
             state.free.entry(entry.size).or_default().push(entry.buffer);
             drained += 1;
         }
         if drained > 0 {
             state.counters.drained += drained;
             state.counters.pending = state.pending.len() as u64;
+            state.evict_over_budget();
+        }
+    }
+}
+
+impl PoolState {
+    /// Drops the oldest free buffers until the free list is back inside its
+    /// byte budget.
+    ///
+    /// **Why a bound is needed at all**, when the pool did not have one before:
+    /// under CPU-drop release a buffer re-entered the free list *within* the
+    /// operation that freed it, so a workload asking for a slightly larger
+    /// buffer each step -- a growing KV cache, which is exactly LFM2 decode --
+    /// reused each size before moving on to the next. Deferring the return to
+    /// GPU completion moves it past that point, so the size just freed is never
+    /// the size next requested and every one of those buffers is stranded.
+    /// Measured on LFM2 without this: 11.6 stranded buffers per token, taking
+    /// the pool from 5231 MB to 13629 MB at 400 tokens and still climbing.
+    ///
+    /// That is the same unbounded-growth shape issue #21 removed from the
+    /// bucket keys, so it must not be reintroduced in the buffers themselves.
+    ///
+    /// Note what this is *not*: it is not the old sweep. That existed to
+    /// **discover** which buffers were free, by testing `strong_count` on every
+    /// one of them, and bounded the pool only as a side effect. Discovery is an
+    /// event here. This only enforces the bound; it never searches for anything,
+    /// and it never touches a buffer that is live or still pending.
+    ///
+    /// Oldest-first, because a size that has not been asked for since it was
+    /// freed is the least likely to be asked for again -- in the growing case,
+    /// provably never.
+    fn evict_over_budget(&mut self) {
+        while self.free_bytes > self.free_budget {
+            let Some(size) = self.free_order.pop_front() else {
+                break;
+            };
+            let Some(bucket) = self.free.get_mut(&size) else {
+                continue;
+            };
+            // Stale entry: a lookup already took this buffer, so there is
+            // nothing here to evict and the queue entry is just noise.
+            if bucket.pop().is_none() {
+                continue;
+            }
+            if bucket.is_empty() {
+                self.free.remove(&size);
+            }
+            self.free_bytes = self.free_bytes.saturating_sub(size);
+            self.counters.evicted += 1;
         }
     }
 }
@@ -428,6 +516,15 @@ impl BufferPool {
         self.inner.drain_completed();
     }
 
+    /// Sets the cap on bytes retained in the free list, evicting immediately if
+    /// the new cap is already exceeded. See `DEFAULT_FREE_BUDGET_BYTES`.
+    pub fn set_free_budget(&self, bytes: usize) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.free_budget = bytes;
+            state.evict_over_budget();
+        }
+    }
+
     /// Takes a reusable buffer of at least `size` bytes, if one is free.
     ///
     /// Probes the exact-size bucket first, since an exact match cannot be
@@ -467,6 +564,11 @@ impl BufferPool {
         };
 
         let (buffer, bucket_size) = found?;
+
+        // The buffer has left the free list. Its `free_order` entry is left
+        // behind and skipped when eviction reaches it -- removing it here would
+        // mean a linear search, which is exactly what must not be on this path.
+        state.free_bytes = state.free_bytes.saturating_sub(bucket_size);
 
         // Drop the key when its bucket empties. This is what stops the map
         // from becoming a graveyard: the old pool's `retain` cleared a bucket's
@@ -531,6 +633,8 @@ impl BufferPool {
             for (_, mut bucket) in std::mem::take(&mut state.free) {
                 freed.append(&mut bucket);
             }
+            state.free_bytes = 0;
+            state.free_order.clear();
             state.counters.trims += 1;
             state.counters.trimmed += freed.len() as u64;
         }
@@ -559,19 +663,15 @@ impl BufferPool {
         let Ok(state) = self.inner.state.lock() else {
             return PoolOccupancySnapshot::default();
         };
-        let mut free_buffers = 0;
-        let mut free_bytes = 0;
-        for bucket in state.free.values() {
-            free_buffers += bucket.len();
-            for b in bucket {
-                free_bytes += b.length();
-            }
-        }
+        let free_buffers = state.free.values().map(|b| b.len()).sum();
         PoolOccupancySnapshot {
             live_buffers: state.live_buffers,
             live_bytes: state.live_bytes,
             free_buffers,
-            free_bytes,
+            // The maintained figure, not a re-walk of the buckets: it is what
+            // the budget is enforced against, so reporting anything else would
+            // let the two disagree silently.
+            free_bytes: state.free_bytes,
             free_buckets: state.free.len(),
             pending_buffers: state.pending.len(),
             pending_bytes: state.pending.iter().map(|p| p.buffer.length()).sum(),
@@ -1033,6 +1133,99 @@ mod tests {
 
         assert_eq!(pool.occupancy().free_buffers, 0);
         assert_eq!(pool.counters().releases, 0);
+    }
+
+    /// The regression that deferring release introduced, and the bound that
+    /// stops it.
+    ///
+    /// A workload asking for a slightly larger buffer each step never asks
+    /// again for the size it just freed. Under CPU-drop release that did not
+    /// matter, because the buffer was reused within the same operation that
+    /// freed it. Deferring to GPU completion moves the return past that point,
+    /// so every one of those buffers is stranded -- 11.6 per token on LFM2,
+    /// taking the pool to 13.6 GB at 400 tokens before this bound existed.
+    #[test]
+    fn a_workload_that_never_reuses_a_size_does_not_grow_the_pool() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        pool.set_free_budget(4 * 1024 * 1024);
+
+        // Ever-growing sizes, as a KV cache produces.
+        for i in 0..512usize {
+            let size = 64 * 1024 + i * 1024;
+            let b = alloc(&pool, &dev, size);
+            release_and_complete(&pool, &clock, b);
+        }
+
+        let occ = pool.occupancy();
+        assert!(
+            occ.free_bytes <= 4 * 1024 * 1024,
+            "free list grew to {} bytes, past its {} byte budget",
+            occ.free_bytes,
+            4 * 1024 * 1024
+        );
+        assert!(
+            pool.counters().evicted > 0,
+            "nothing was evicted, so the bound never engaged"
+        );
+    }
+
+    /// The bound must not cost anything when the workload does reuse what it
+    /// frees, which is the fixed-shape steady state. Nothing should be evicted,
+    /// and every allocation after the first should be a hit.
+    #[test]
+    fn a_reusing_workload_never_evicts() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        pool.set_free_budget(1024 * 1024);
+
+        for _ in 0..256 {
+            let b = alloc(&pool, &dev, 4096);
+            release_and_complete(&pool, &clock, b);
+        }
+
+        let c = pool.counters();
+        assert_eq!(
+            c.evicted, 0,
+            "evicted from a workload that reuses its sizes"
+        );
+        assert_eq!(c.allocations, 1, "allocated more than once for one size");
+        assert_eq!(c.hits, 255);
+    }
+
+    /// Eviction must take the oldest free buffer, not whichever is convenient.
+    /// The oldest is the one whose size has gone longest without being asked
+    /// for, which in the growing case is the one that will never be asked for
+    /// again.
+    #[test]
+    fn eviction_takes_the_oldest_free_buffer_first() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        // All three allocated and released before anything drains, so they
+        // enter the free list together and the budget applies to the set rather
+        // than to each in turn.
+        let held = vec![
+            alloc(&pool, &dev, 4096),
+            alloc(&pool, &dev, 8192),
+            alloc(&pool, &dev, 12288),
+        ];
+        drop(held);
+
+        // Room for the newest only: 12288 fits in 16384, and adding either
+        // older one would not.
+        pool.set_free_budget(16384);
+        gpu_completes(&pool, &clock);
+
+        assert!(pool.occupancy().free_bytes <= 16384);
+        assert!(
+            pool.acquire(12288).is_some(),
+            "evicted the newest buffer instead of the oldest"
+        );
+        assert!(
+            pool.counters().evicted > 0,
+            "nothing was evicted, so the ordering was never exercised"
+        );
     }
 
     /// A buffer outliving its pool must drop cleanly rather than resurrect it.
