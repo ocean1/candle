@@ -252,6 +252,13 @@ impl ComputeCommandEncoder {
 
     pub fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         let index = self.capture_buffer_index(index);
+        // An arena slot is a region of a shared allocation, so the byte the
+        // kernel must start at is the slot's base plus the layout offset the
+        // caller computed. `base_offset` is 0 for every ordinary allocation,
+        // which is why this is a no-op everywhere except the arena -- see
+        // `Buffer::base_offset` for why the addition belongs here and not at
+        // the call sites.
+        let offset = offset + buffer.map_or(0, Buffer::base_offset);
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
             // Read-after-write against an earlier encoder: order against that
@@ -276,6 +283,9 @@ impl ComputeCommandEncoder {
 
     pub fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         let index = self.capture_buffer_index(index);
+        // See `set_input_buffer`: the arena's `base + offset`, added once at the
+        // choke point every binding passes through.
+        let offset = offset + buffer.map_or(0, Buffer::base_offset);
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
             // Write-after-write or write-after-read against an earlier encoder.

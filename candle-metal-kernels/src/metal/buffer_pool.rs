@@ -150,6 +150,17 @@ pub struct PooledBuffer {
     /// `Weak` so a leaked buffer cannot keep the whole device alive, and so a
     /// buffer outliving its pool drops cleanly instead of resurrecting it.
     pool: Weak<PoolInner>,
+
+    /// Called once when this handle dies, if anyone asked to be told.
+    ///
+    /// `None` on every ordinary allocation, so the cost is one `Option` test in
+    /// `drop`. Set only while an arena plan is being recorded, where the death
+    /// of a value is the end of its liveness interval (`DESIGN.md` §9.2).
+    ///
+    /// It observes and does not decide: the release below is unchanged whether
+    /// or not this is set, so reuse is still governed by GPU completion alone
+    /// and issue #23's single clock is intact.
+    on_death: Option<Box<dyn FnOnce(usize) + Send + Sync>>,
 }
 
 impl PooledBuffer {
@@ -163,11 +174,22 @@ impl PooledBuffer {
             buffer: Some(buffer),
             size,
             pool: Weak::new(),
+            on_death: None,
         }
     }
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Ask to be told, once, when this handle dies.
+    ///
+    /// For recording a liveness interval's end (`DESIGN.md` §9.2). Takes `self`
+    /// because a handle is wrapped in an `Arc` the moment it leaves the pool,
+    /// and there is no point after that at which it could be set.
+    pub fn on_death(mut self, f: impl FnOnce(usize) + Send + Sync + 'static) -> Self {
+        self.on_death = Some(Box::new(f));
+        self
     }
 
     fn buffer(&self) -> &Buffer {
@@ -208,6 +230,15 @@ impl Drop for PooledBuffer {
     /// `Arc<Buffer>` -- except that now it is a notification rather than a
     /// state to be discovered later by a scan.
     fn drop(&mut self) {
+        // The instant a value dies, which is what an arena liveness recording
+        // needs and what nothing else in candle observes. Reported *before* the
+        // release below and deliberately without influencing it: this is an
+        // observer, not a second reuse predicate. `DESIGN.md` §6.7 L4's rule is
+        // that a reuse decision made on a different clock from the one ordering
+        // execution is a correctness bug -- so nothing here decides anything.
+        if let Some(obs) = self.on_death.take() {
+            obs(self.size);
+        }
         let Some(buffer) = self.buffer.take() else {
             return;
         };
@@ -589,6 +620,7 @@ impl BufferPool {
             buffer: Some(buffer),
             size: bucket_size,
             pool: Arc::downgrade(&self.inner),
+            on_death: None,
         }))
     }
 
@@ -607,6 +639,7 @@ impl BufferPool {
             buffer: Some(buffer),
             size,
             pool: Arc::downgrade(&self.inner),
+            on_death: None,
         })
     }
 

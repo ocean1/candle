@@ -2134,6 +2134,11 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
             residency_set,
+            // No arena until one is installed: the classical path is the
+            // default, and the cost of the seam is one `Option` test per
+            // allocation (`DESIGN.md` §9.2a, §11.1).
+            arena: Arc::new(RwLock::new(None)),
+            arena_recorder: Arc::new(Mutex::new(None)),
         })
     }
 

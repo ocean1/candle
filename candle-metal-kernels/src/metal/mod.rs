@@ -1,3 +1,4 @@
+pub mod arena;
 pub mod buffer;
 pub mod buffer_pool;
 pub mod command_buffer;
@@ -14,6 +15,7 @@ mod icb_tests;
 pub mod library;
 pub mod residency_set;
 
+pub use arena::*;
 pub use buffer::*;
 pub use buffer_pool::*;
 pub use command_buffer::*;
