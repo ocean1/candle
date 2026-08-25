@@ -1,9 +1,40 @@
+use crate::kernels::params::{
+    begin_packed_params, finish_packed_params, Col2im1dParams, Conv1dDepthwiseKParams,
+    Conv1dDepthwiseParams, ConvTranspose1dParams, ConvTranspose2dParams, Im2col1dParams,
+    Im2colParams, ParamStyle, Pool2dParams, UpsampleBilinear2dParams, UpsampleNearest2dParams,
+};
 use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
 use crate::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
     Output, Source,
 };
+
+/// Trailing alignment of each packed block, so its length matches the `sizeof`
+/// the kernel sees. Taken from the Rust mirrors rather than written as
+/// literals, and `conv_params_layout_matches_metal` is what proves those
+/// mirrors agree with `conv.metal`.
+const IM2COL_PARAMS_ALIGN: usize = core::mem::align_of::<Im2colParams>();
+const COL2IM1D_PARAMS_ALIGN: usize = core::mem::align_of::<Col2im1dParams>();
+const IM2COL1D_PARAMS_ALIGN: usize = core::mem::align_of::<Im2col1dParams>();
+const UPSAMPLE_NEAREST2D_PARAMS_ALIGN: usize = core::mem::align_of::<UpsampleNearest2dParams>();
+const UPSAMPLE_BILINEAR2D_PARAMS_ALIGN: usize = core::mem::align_of::<UpsampleBilinear2dParams>();
+const POOL2D_PARAMS_ALIGN: usize = core::mem::align_of::<Pool2dParams>();
+const CONV_TRANSPOSE1D_PARAMS_ALIGN: usize = core::mem::align_of::<ConvTranspose1dParams>();
+const CONV_TRANSPOSE2D_PARAMS_ALIGN: usize = core::mem::align_of::<ConvTranspose2dParams>();
+const CONV1D_DEPTHWISE_PARAMS_ALIGN: usize = core::mem::align_of::<Conv1dDepthwiseParams>();
+const CONV1D_DEPTHWISE_K_PARAMS_ALIGN: usize = core::mem::align_of::<Conv1dDepthwiseKParams>();
+
+// A note on widths, since #38 found a latent mismatch of exactly this kind in
+// `reduce.metal`'s callers and predicted it in the remaining six files.
+//
+// `conv.metal` declares every scalar as `constant size_t &` -- 8 bytes -- and
+// every `call_*` below binds a `usize`, which is also 8. So the mismatch #38
+// describes (a `usize` bound to a `constant uint &`, benign under `setBytes`
+// and wrong once packed) **does not occur in this family**. Checked rather than
+// assumed: the two `bool` and two `f32` in `call_upsample_bilinear_2d` are the
+// only non-`usize` binds, and `conv.metal` declares them `bool` and `float` to
+// match. The parity tests are what would have caught it either way.
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_im2col1d_strided(
@@ -17,7 +48,40 @@ pub fn call_im2col1d_strided(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    call_im2col1d_strided_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        strides,
+        (k_size, stride, padding, dilation),
+        input,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_im2col1d_strided`], choosing how the scalars are bound.
+///
+/// The classical entry point above delegates here with [`ParamStyle::Split`],
+/// so there is one body rather than two and the styles cannot drift in what
+/// they bind -- which is the property that makes the bit-identical test
+/// meaningful.
+#[allow(clippy::too_many_arguments)]
+pub fn call_im2col1d_strided_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    (k_size, stride, padding, dilation): (usize, usize, usize, usize),
+    input: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     let l_out = (shape[2] + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
     let dst_el = shape[0] * l_out * shape[1] * k_size;
 
@@ -26,6 +90,7 @@ pub fn call_im2col1d_strided(
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "im2col1d {name} dst_el={dst_el}");
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -41,6 +106,7 @@ pub fn call_im2col1d_strided(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, IM2COL1D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -65,7 +131,37 @@ pub fn call_conv1d_depthwise(
     weight: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    call_conv1d_depthwise_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        strides,
+        (k_size, stride, padding, dilation),
+        input,
+        weight,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_conv1d_depthwise`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv1d_depthwise_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    (k_size, stride, padding, dilation): (usize, usize, usize, usize),
+    input: BufferOffset,
+    weight: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     let l_out = (shape[2] + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
     // One thread per output element, in destination order.
     let dst_el = shape[0] * shape[1] * l_out;
@@ -75,6 +171,7 @@ pub fn call_conv1d_depthwise(
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "conv1d_depthwise {name} dst_el={dst_el}");
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -91,6 +188,7 @@ pub fn call_conv1d_depthwise(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, CONV1D_DEPTHWISE_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -120,7 +218,35 @@ pub fn call_conv1d_depthwise_k(
     weight: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    call_conv1d_depthwise_k_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        (k_size, padding),
+        input,
+        weight,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_conv1d_depthwise_k`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv1d_depthwise_k_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    (k_size, padding): (usize, usize),
+    input: BufferOffset,
+    weight: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     // stride == 1 and dilation == 1 are preconditions, so this reduces to
     // l_in + 2 * padding - (k_size - 1).
     let l_out = shape[2] + 2 * padding - (k_size - 1);
@@ -131,6 +257,7 @@ pub fn call_conv1d_depthwise_k(
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "conv1d_depthwise_k {name} dst_el={dst_el}");
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -143,6 +270,7 @@ pub fn call_conv1d_depthwise_k(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, CONV1D_DEPTHWISE_K_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -159,7 +287,35 @@ pub fn call_col2im1d(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    call_col2im1d_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        k_size,
+        stride,
+        input,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_col2im1d`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_col2im1d_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    k_size: usize,
+    stride: usize,
+    input: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     let l_in = shape[1];
     let c_out = shape[2];
     let l_out = (l_in - 1) * stride + k_size;
@@ -170,6 +326,7 @@ pub fn call_col2im1d(
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "col2im1d {name} dst_el={dst_el}");
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -183,6 +340,7 @@ pub fn call_col2im1d(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, COL2IM1D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -199,7 +357,35 @@ pub fn call_im2col_strided(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    call_im2col_strided_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        strides,
+        (h_k, w_k, stride, padding, dilation),
+        input,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_im2col_strided`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_im2col_strided_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    (h_k, w_k, stride, padding, dilation): (usize, usize, usize, usize, usize),
+    input: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
 
     let h = shape[2];
     let w = shape[3];
@@ -213,6 +399,7 @@ pub fn call_im2col_strided(
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "im2col {name} dst_el={dst_el}");
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -230,6 +417,7 @@ pub fn call_im2col_strided(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, IM2COL_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -247,7 +435,37 @@ pub fn call_upsample_nearest_2d(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    call_upsample_nearest_2d_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        strides,
+        out_w,
+        out_h,
+        input,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_upsample_nearest_2d`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_upsample_nearest_2d_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    out_w: usize,
+    out_h: usize,
+    input: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     let dst_el = out_w * out_h * shape[0] * shape[1];
     let scale_w = shape[2] as f32 / out_w as f32;
     let scale_h = shape[3] as f32 / out_h as f32;
@@ -256,6 +474,7 @@ pub fn call_upsample_nearest_2d(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "upsample_nearest2d {name} {out_w}x{out_h}");
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -269,6 +488,7 @@ pub fn call_upsample_nearest_2d(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, UPSAMPLE_NEAREST2D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -289,7 +509,51 @@ pub fn call_upsample_bilinear_2d(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    call_upsample_bilinear_2d_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        strides,
+        out_w,
+        out_h,
+        align_corners,
+        scale_h,
+        scale_w,
+        input,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_upsample_bilinear_2d`], choosing how the scalars are bound.
+///
+/// This is the family whose packed block exercises both layout hazards issue
+/// #38 names at once: three `bool` (1 byte in MSL as in Rust) and two `f32`
+/// between two `size_t`, so five of the seven fields land at an offset the
+/// padding rule decides. It is also the only conv family whose classical entry
+/// point has pinned `[[buffer(N)]]` indices, which the packed one deliberately
+/// does *not* carry forward -- seven scalars leave the argument list, so the
+/// remaining bindings renumber down to 0..4. See `conv.metal`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_upsample_bilinear_2d_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    out_w: usize,
+    out_h: usize,
+    align_corners: bool,
+    scale_h: Option<f64>,
+    scale_w: Option<f64>,
+    input: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     let dst_el = out_w * out_h * shape[0] * shape[1];
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
@@ -298,6 +562,7 @@ pub fn call_upsample_bilinear_2d(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "upsample_bilinear2d {name} {out_w}x{out_h}");
 
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -314,6 +579,7 @@ pub fn call_upsample_bilinear_2d(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, UPSAMPLE_BILINEAR2D_PARAMS_ALIGN)?;
 
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
@@ -336,13 +602,58 @@ pub fn call_pool2d(
     input: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    call_pool2d_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        strides,
+        out_w,
+        out_h,
+        w_k,
+        h_k,
+        w_stride,
+        h_stride,
+        input,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_pool2d`], choosing how the scalars are bound.
+///
+/// Serves both `max_pool2d` and `avg_pool2d`, which bind the same four scalars
+/// and differ only in their accumulator — a template parameter on the Metal
+/// side, so it is not part of the binding and is untouched here. The integer
+/// `avg_pool2d` instantiations accumulate in their own type rather than
+/// widening (`DESIGN.md` §8.1c), and that is preserved by construction.
+#[allow(clippy::too_many_arguments)]
+pub fn call_pool2d_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    out_w: usize,
+    out_h: usize,
+    w_k: usize,
+    h_k: usize,
+    w_stride: usize,
+    h_stride: usize,
+    input: &Buffer,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
     let dst_el = out_w * out_h * shape[0] * shape[1];
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "pool2d {name} {out_w}x{out_h} k={w_k}x{h_k}");
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -356,6 +667,7 @@ pub fn call_pool2d(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, POOL2D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -383,8 +695,58 @@ pub fn call_conv_transpose1d(
     kernel_offset: usize,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    call_conv_transpose1d_with(
+        device,
+        ep,
+        kernels,
+        name,
+        dilation,
+        stride,
+        padding,
+        out_padding,
+        c_out,
+        l_out,
+        b_size,
+        src_shape,
+        src_strides,
+        kernel_shape,
+        kernel_strides,
+        input,
+        input_offset,
+        kernel,
+        kernel_offset,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_conv_transpose1d`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv_transpose1d_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    dilation: usize,
+    stride: usize,
+    padding: usize,
+    out_padding: usize,
+    c_out: usize,
+    l_out: usize,
+    b_size: usize,
+    src_shape: &[usize],
+    src_strides: &[usize],
+    kernel_shape: &[usize],
+    kernel_strides: &[usize],
+    input: &Buffer,
+    input_offset: usize,
+    kernel: &Buffer,
+    kernel_offset: usize,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
     let dst_el = c_out * l_out * b_size;
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
@@ -393,6 +755,7 @@ pub fn call_conv_transpose1d(
         encoder,
         "conv_transpose1d {name} c_out={c_out} l_out={l_out} b={b_size}"
     );
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -410,6 +773,7 @@ pub fn call_conv_transpose1d(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, CONV_TRANSPOSE1D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -442,8 +806,34 @@ pub fn call_conv_transpose2d(
     kernel: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    call_conv_transpose2d_with(
+        device,
+        ep,
+        kernels,
+        name,
+        cfg,
+        input,
+        kernel,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_conv_transpose2d`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv_transpose2d_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    cfg: CallConvTranspose2dCfg,
+    input: &Buffer,
+    kernel: &Buffer,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
     let dst_el = cfg.c_out * cfg.out_w * cfg.out_h * cfg.b_size;
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
@@ -456,6 +846,7 @@ pub fn call_conv_transpose2d(
         cfg.out_h,
         cfg.b_size
     );
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -474,6 +865,7 @@ pub fn call_conv_transpose2d(
             Output::new(output)
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, CONV_TRANSPOSE2D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }

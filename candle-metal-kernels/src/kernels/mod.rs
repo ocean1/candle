@@ -31,11 +31,18 @@ pub use convolution::*;
 pub use fill::*;
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_with, GemmDType};
+// `ParamStyle` is re-exported here rather than from `reduce`, where it was
+// declared when `reduce.metal` was the only family carrying both binding
+// styles. It moved to `params` when `conv.metal` followed (issue #42) so every
+// family shares one declaration; `pub use reduce::*` used to carry it, and
+// this line is what keeps that spelling working for callers.
 pub use params::{
     AffineParams, AffineStridedParams, BinaryParams, BinaryStridedParams, CastParams,
-    CastStridedParams, Copy2dParams, GemvParams, NormParams, ParamStyle, ReduceParams, RopeIParams,
-    RopeParams, RopeThdParams, ScaleParams, ScaleStridedParams, SoftmaxParams, UnaryParams,
-    UnaryStridedParams,
+    CastStridedParams, Col2im1dParams, Conv1dDepthwiseKParams, Conv1dDepthwiseParams,
+    ConvTranspose1dParams, ConvTranspose2dParams, Copy2dParams, GemvParams, Im2col1dParams,
+    Im2colParams, NormParams, ParamStyle, Pool2dParams, ReduceParams, RopeIParams, RopeParams,
+    RopeThdParams, ScaleParams, ScaleStridedParams, SoftmaxParams, UnaryParams, UnaryStridedParams,
+    UpsampleBilinear2dParams, UpsampleNearest2dParams,
 };
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,

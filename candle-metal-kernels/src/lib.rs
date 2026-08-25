@@ -7,6 +7,10 @@ pub mod utils;
 
 pub use err::MetalKernelError;
 pub use kernel::Kernels;
+// `ParamStyle` used to arrive via `reduce::*`, where it was declared when
+// `reduce.metal` was the only family carrying both binding styles. It moved to
+// `kernels::params` when `conv.metal` followed (issue #42), so it is named
+// explicitly here; the spelling callers use is unchanged.
 pub use kernels::{
     affine::*, call_binary_contiguous, call_binary_contiguous_with, call_binary_strided,
     call_binary_strided_with, call_mlx_gemm, call_mlx_gemv_with, cast::*, convolution::*, fill::*,

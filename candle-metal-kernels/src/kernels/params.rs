@@ -2,9 +2,10 @@
 //! styles, and the layout checks that keep them honest.
 //!
 //! `reduce.metal` came first (issue #38); `unary`, `binary`, `cast` and
-//! `affine` followed (issue #40). Each family declares its own structs and its
-//! own layout kernel, because each `.metal` file is compiled into its own
-//! library -- a kernel in one cannot see a struct in another.
+//! `affine` followed (issue #40), then `gemv` (issue #41) and `conv` (issue
+//! #42). Each family declares its own structs and its own layout kernel,
+//! because each `.metal` file is compiled into its own library -- a kernel in
+//! one cannot see a struct in another.
 //!
 //! # Why these exist
 //!
@@ -134,6 +135,430 @@ pub struct GemvParams {
     pub beta: f32,
     pub batch_ndim: i32,
     pub bias_stride: i32,
+}
+
+// ---------------------------------------------------------------------------
+// `conv.metal` (issue #42).
+//
+// Ten families, 59 `constant &` parameters -- more than any other file bar
+// `reduce`. Two things distinguish them from the reduce structs above and are
+// worth stating where they are decided:
+//
+// * **`size_t` throughout, so these are 8-aligned** where the reduction structs
+//   are 4-aligned `uint`. The one exception is `UpsampleBilinear2dParams`.
+// * **`UpsampleBilinear2dParams` mixes widths.** Three `bool` (1 byte in MSL, as
+//   in Rust) and two `float` sit between two `size_t`, so five of its seven
+//   fields land at an offset the padding rule decides rather than at a multiple
+//   of a field width. It exercises both hazards issue #38 names -- sub-word
+//   types and mixed widths -- in one struct, where #40's `AffineParams` (12
+//   bytes of fields, `sizeof` 16) exercises the padding half alone. Neither is
+//   obvious by inspection, which is the argument for checking offsets across
+//   the boundary rather than asserting them on one side.
+//
+// Field order mirrors each kernel's classical argument list exactly. That is
+// load-bearing rather than stylistic: the packed block is built by letting the
+// existing `set_params!` call run and diverting each scalar as it passes, so a
+// struct whose order differs from the argument list would silently misread every
+// field after the first divergence.
+// ---------------------------------------------------------------------------
+
+/// Scalars bound by `im2col`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Im2colParams {
+    pub dst_numel: u64,
+    pub h_out: u64,
+    pub w_out: u64,
+    pub h_k: u64,
+    pub w_k: u64,
+    pub stride: u64,
+    pub padding: u64,
+    pub dilation: u64,
+}
+
+/// Scalars bound by `col2im1d`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Col2im1dParams {
+    pub dst_el: u64,
+    pub l_out: u64,
+    pub l_in: u64,
+    pub c_out: u64,
+    pub k_size: u64,
+    pub stride: u64,
+}
+
+/// Scalars bound by `im2col1d`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Im2col1dParams {
+    pub dst_numel: u64,
+    pub l_out: u64,
+    pub l_k: u64,
+    pub stride: u64,
+    pub padding: u64,
+    pub dilation: u64,
+}
+
+/// Scalars bound by `upsample_nearest2d`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UpsampleNearest2dParams {
+    pub w_out: u64,
+    pub h_out: u64,
+    pub w_scale: f32,
+    pub h_scale: f32,
+}
+
+/// Scalars bound by `upsample_bilinear2d`.
+///
+/// The mixed-width struct. `bool` is 1 byte on both sides, and the two `f32`
+/// pad to 4 after it, so the offsets are 0, 8, 16, 17, 20, 24, 28 and the whole
+/// thing pads to 32 for its own 8-byte alignment. None of those numbers is a
+/// field width; every one is a padding rule, which is why
+/// `conv_params_layout_matches_metal` ships them across the boundary instead of
+/// either side asserting its own.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UpsampleBilinear2dParams {
+    pub w_out: u64,
+    pub h_out: u64,
+    pub align_corners: bool,
+    pub has_scale_h: bool,
+    pub scale_h_factor: f32,
+    pub has_scale_w: bool,
+    pub scale_w_factor: f32,
+}
+
+/// Scalars bound by `max_pool2d` and `avg_pool2d`.
+///
+/// One struct for both because they bind the same four scalars. They differ in
+/// their accumulator, which is a template parameter on the Metal side and not
+/// part of the binding — the integer `avg_pool2d` instantiations accumulate in
+/// their own type rather than widening, and that must not move (`DESIGN.md`
+/// §8.1c).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pool2dParams {
+    pub w_k: u64,
+    pub h_k: u64,
+    pub w_stride: u64,
+    pub h_stride: u64,
+}
+
+/// Scalars bound by `conv_transpose1d`.
+///
+/// `out_padding` is bound but never read by the kernel. It stays a field
+/// because the struct must mirror the argument list; dropping it would move
+/// `dilation` by 8 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvTranspose1dParams {
+    pub l_out: u64,
+    pub stride: u64,
+    pub padding: u64,
+    pub out_padding: u64,
+    pub dilation: u64,
+}
+
+/// Scalars bound by `conv_transpose2d`. `out_padding` is unread, as above.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvTranspose2dParams {
+    pub w_out: u64,
+    pub h_out: u64,
+    pub stride: u64,
+    pub padding: u64,
+    pub out_padding: u64,
+    pub dilation: u64,
+}
+
+/// Scalars bound by `conv1d_depthwise`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conv1dDepthwiseParams {
+    pub dst_numel: u64,
+    pub l_out: u64,
+    pub k_size: u64,
+    pub stride: u64,
+    pub padding: u64,
+    pub dilation: u64,
+}
+
+/// Scalars bound by `conv1d_depthwise_k`, whose `k_size`, `stride` and
+/// `dilation` are compile-time or preconditions rather than bindings.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conv1dDepthwiseKParams {
+    pub dst_numel: u64,
+    pub l_out: u64,
+    pub padding: u64,
+}
+
+/// The kernel in `conv.metal` that reports the device-side layout.
+pub const CONV_LAYOUT_KERNEL: &str = "conv_params_layout";
+
+/// How many `u32` slots [`CONV_LAYOUT_KERNEL`] writes.
+pub const CONV_LAYOUT_SLOTS: usize = 65;
+
+/// What each slot of [`CONV_LAYOUT_KERNEL`]'s output means, and what Rust
+/// computes for it.
+///
+/// Same shape as [`expected_layout`], and deliberately a separate function
+/// rather than an extension of it: `conv.metal` and `reduce.metal` are compiled
+/// as separate libraries, so their layout kernels are separate dispatches and
+/// each family's slots have to be addressed against its own.
+///
+/// **Note for whoever lands after #40.** That change adds `UNARY_LAYOUT_SLOTS`,
+/// `BINARY_LAYOUT_SLOTS`, `CAST_LAYOUT_SLOTS` and `AFFINE_LAYOUT_SLOTS` in the
+/// same flat shape, and this is a fifth. The repetition is real and a composable
+/// per-family descriptor would be better; it is left flat here so that this
+/// change and #40 conflict textually rather than semantically, and so that
+/// restructuring is one deliberate change rather than a side effect of whichever
+/// family landed last.
+pub fn expected_conv_layout() -> [(&'static str, u32); CONV_LAYOUT_SLOTS] {
+    use core::mem::{align_of, offset_of, size_of};
+
+    debug_assert_eq!(align_of::<Im2colParams>(), 8);
+    debug_assert_eq!(align_of::<Col2im1dParams>(), 8);
+    debug_assert_eq!(align_of::<Im2col1dParams>(), 8);
+    debug_assert_eq!(align_of::<UpsampleNearest2dParams>(), 8);
+    debug_assert_eq!(align_of::<UpsampleBilinear2dParams>(), 8);
+    debug_assert_eq!(align_of::<Pool2dParams>(), 8);
+    debug_assert_eq!(align_of::<ConvTranspose1dParams>(), 8);
+    debug_assert_eq!(align_of::<ConvTranspose2dParams>(), 8);
+    debug_assert_eq!(align_of::<Conv1dDepthwiseParams>(), 8);
+    debug_assert_eq!(align_of::<Conv1dDepthwiseKParams>(), 8);
+
+    [
+        ("sizeof(Im2colParams)", size_of::<Im2colParams>() as u32),
+        (
+            "Im2colParams.dst_numel",
+            offset_of!(Im2colParams, dst_numel) as u32,
+        ),
+        ("Im2colParams.h_out", offset_of!(Im2colParams, h_out) as u32),
+        ("Im2colParams.w_out", offset_of!(Im2colParams, w_out) as u32),
+        ("Im2colParams.h_k", offset_of!(Im2colParams, h_k) as u32),
+        ("Im2colParams.w_k", offset_of!(Im2colParams, w_k) as u32),
+        (
+            "Im2colParams.stride",
+            offset_of!(Im2colParams, stride) as u32,
+        ),
+        (
+            "Im2colParams.padding",
+            offset_of!(Im2colParams, padding) as u32,
+        ),
+        (
+            "Im2colParams.dilation",
+            offset_of!(Im2colParams, dilation) as u32,
+        ),
+        ("sizeof(Col2im1dParams)", size_of::<Col2im1dParams>() as u32),
+        (
+            "Col2im1dParams.dst_el",
+            offset_of!(Col2im1dParams, dst_el) as u32,
+        ),
+        (
+            "Col2im1dParams.l_out",
+            offset_of!(Col2im1dParams, l_out) as u32,
+        ),
+        (
+            "Col2im1dParams.l_in",
+            offset_of!(Col2im1dParams, l_in) as u32,
+        ),
+        (
+            "Col2im1dParams.c_out",
+            offset_of!(Col2im1dParams, c_out) as u32,
+        ),
+        (
+            "Col2im1dParams.k_size",
+            offset_of!(Col2im1dParams, k_size) as u32,
+        ),
+        (
+            "Col2im1dParams.stride",
+            offset_of!(Col2im1dParams, stride) as u32,
+        ),
+        ("sizeof(Im2col1dParams)", size_of::<Im2col1dParams>() as u32),
+        (
+            "Im2col1dParams.dst_numel",
+            offset_of!(Im2col1dParams, dst_numel) as u32,
+        ),
+        (
+            "Im2col1dParams.l_out",
+            offset_of!(Im2col1dParams, l_out) as u32,
+        ),
+        ("Im2col1dParams.l_k", offset_of!(Im2col1dParams, l_k) as u32),
+        (
+            "Im2col1dParams.stride",
+            offset_of!(Im2col1dParams, stride) as u32,
+        ),
+        (
+            "Im2col1dParams.padding",
+            offset_of!(Im2col1dParams, padding) as u32,
+        ),
+        (
+            "Im2col1dParams.dilation",
+            offset_of!(Im2col1dParams, dilation) as u32,
+        ),
+        (
+            "sizeof(UpsampleNearest2dParams)",
+            size_of::<UpsampleNearest2dParams>() as u32,
+        ),
+        (
+            "UpsampleNearest2dParams.w_out",
+            offset_of!(UpsampleNearest2dParams, w_out) as u32,
+        ),
+        (
+            "UpsampleNearest2dParams.h_out",
+            offset_of!(UpsampleNearest2dParams, h_out) as u32,
+        ),
+        (
+            "UpsampleNearest2dParams.w_scale",
+            offset_of!(UpsampleNearest2dParams, w_scale) as u32,
+        ),
+        (
+            "UpsampleNearest2dParams.h_scale",
+            offset_of!(UpsampleNearest2dParams, h_scale) as u32,
+        ),
+        (
+            "sizeof(UpsampleBilinear2dParams)",
+            size_of::<UpsampleBilinear2dParams>() as u32,
+        ),
+        (
+            "UpsampleBilinear2dParams.w_out",
+            offset_of!(UpsampleBilinear2dParams, w_out) as u32,
+        ),
+        (
+            "UpsampleBilinear2dParams.h_out",
+            offset_of!(UpsampleBilinear2dParams, h_out) as u32,
+        ),
+        (
+            "UpsampleBilinear2dParams.align_corners",
+            offset_of!(UpsampleBilinear2dParams, align_corners) as u32,
+        ),
+        (
+            "UpsampleBilinear2dParams.has_scale_h",
+            offset_of!(UpsampleBilinear2dParams, has_scale_h) as u32,
+        ),
+        (
+            "UpsampleBilinear2dParams.scale_h_factor",
+            offset_of!(UpsampleBilinear2dParams, scale_h_factor) as u32,
+        ),
+        (
+            "UpsampleBilinear2dParams.has_scale_w",
+            offset_of!(UpsampleBilinear2dParams, has_scale_w) as u32,
+        ),
+        (
+            "UpsampleBilinear2dParams.scale_w_factor",
+            offset_of!(UpsampleBilinear2dParams, scale_w_factor) as u32,
+        ),
+        ("sizeof(Pool2dParams)", size_of::<Pool2dParams>() as u32),
+        ("Pool2dParams.w_k", offset_of!(Pool2dParams, w_k) as u32),
+        ("Pool2dParams.h_k", offset_of!(Pool2dParams, h_k) as u32),
+        (
+            "Pool2dParams.w_stride",
+            offset_of!(Pool2dParams, w_stride) as u32,
+        ),
+        (
+            "Pool2dParams.h_stride",
+            offset_of!(Pool2dParams, h_stride) as u32,
+        ),
+        (
+            "sizeof(ConvTranspose1dParams)",
+            size_of::<ConvTranspose1dParams>() as u32,
+        ),
+        (
+            "ConvTranspose1dParams.l_out",
+            offset_of!(ConvTranspose1dParams, l_out) as u32,
+        ),
+        (
+            "ConvTranspose1dParams.stride",
+            offset_of!(ConvTranspose1dParams, stride) as u32,
+        ),
+        (
+            "ConvTranspose1dParams.padding",
+            offset_of!(ConvTranspose1dParams, padding) as u32,
+        ),
+        (
+            "ConvTranspose1dParams.out_padding",
+            offset_of!(ConvTranspose1dParams, out_padding) as u32,
+        ),
+        (
+            "ConvTranspose1dParams.dilation",
+            offset_of!(ConvTranspose1dParams, dilation) as u32,
+        ),
+        (
+            "sizeof(ConvTranspose2dParams)",
+            size_of::<ConvTranspose2dParams>() as u32,
+        ),
+        (
+            "ConvTranspose2dParams.w_out",
+            offset_of!(ConvTranspose2dParams, w_out) as u32,
+        ),
+        (
+            "ConvTranspose2dParams.h_out",
+            offset_of!(ConvTranspose2dParams, h_out) as u32,
+        ),
+        (
+            "ConvTranspose2dParams.stride",
+            offset_of!(ConvTranspose2dParams, stride) as u32,
+        ),
+        (
+            "ConvTranspose2dParams.padding",
+            offset_of!(ConvTranspose2dParams, padding) as u32,
+        ),
+        (
+            "ConvTranspose2dParams.out_padding",
+            offset_of!(ConvTranspose2dParams, out_padding) as u32,
+        ),
+        (
+            "ConvTranspose2dParams.dilation",
+            offset_of!(ConvTranspose2dParams, dilation) as u32,
+        ),
+        (
+            "sizeof(Conv1dDepthwiseParams)",
+            size_of::<Conv1dDepthwiseParams>() as u32,
+        ),
+        (
+            "Conv1dDepthwiseParams.dst_numel",
+            offset_of!(Conv1dDepthwiseParams, dst_numel) as u32,
+        ),
+        (
+            "Conv1dDepthwiseParams.l_out",
+            offset_of!(Conv1dDepthwiseParams, l_out) as u32,
+        ),
+        (
+            "Conv1dDepthwiseParams.k_size",
+            offset_of!(Conv1dDepthwiseParams, k_size) as u32,
+        ),
+        (
+            "Conv1dDepthwiseParams.stride",
+            offset_of!(Conv1dDepthwiseParams, stride) as u32,
+        ),
+        (
+            "Conv1dDepthwiseParams.padding",
+            offset_of!(Conv1dDepthwiseParams, padding) as u32,
+        ),
+        (
+            "Conv1dDepthwiseParams.dilation",
+            offset_of!(Conv1dDepthwiseParams, dilation) as u32,
+        ),
+        (
+            "sizeof(Conv1dDepthwiseKParams)",
+            size_of::<Conv1dDepthwiseKParams>() as u32,
+        ),
+        (
+            "Conv1dDepthwiseKParams.dst_numel",
+            offset_of!(Conv1dDepthwiseKParams, dst_numel) as u32,
+        ),
+        (
+            "Conv1dDepthwiseKParams.l_out",
+            offset_of!(Conv1dDepthwiseKParams, l_out) as u32,
+        ),
+        (
+            "Conv1dDepthwiseKParams.padding",
+            offset_of!(Conv1dDepthwiseKParams, padding) as u32,
+        ),
+    ]
 }
 
 /// The kernel in `reduce.metal` that reports the device-side layout.

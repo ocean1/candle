@@ -4,24 +4,157 @@ using namespace metal;
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
-template <typename T>
-[[kernel]] void im2col(
-    constant size_t &dst_numel,
-    constant size_t &h_out,
-    constant size_t &w_out,
-    constant size_t &h_k,
-    constant size_t &w_k,
-    constant size_t &stride,
-    constant size_t &padding,
-    constant size_t &dilation,
-    constant size_t *src_dims,
-    constant size_t *src_strides,
+// Packed parameter blocks.
+//
+// An ICB command cannot carry an inline constant -- `MTLIndirectComputeCommand`
+// has no `setBytes` in any form (`DESIGN.md` §3.7c) -- so every scalar a kernel
+// takes as `constant size_t &n` has to arrive in a buffer instead. These are the
+// structs the `_packed` entry points read, mirrored by `#[repr(C)]` types in
+// `kernels/params.rs` and checked against them by `conv_params_layout`.
+//
+// `size_t` is 8 bytes in MSL, so most of these are 8-aligned -- unlike
+// `reduce.metal`'s `uint` structs, which are 4-aligned. `UpsampleBilinear2dParams`
+// is the one that mixes widths, and it is the reason the layout check ships the
+// numbers across the boundary rather than trusting either side: it holds three
+// `bool` (1 byte each in MSL) and two `float` between two `size_t`, so every
+// field after the first is at an offset the padding rule decides.
+//
+// `dims` and `strides` are deliberately not fields: their length comes from the
+// tensor's layout, not from the struct. They stay separate bindings, which an
+// ICB can express -- `setKernelBuffer` binds a buffer of any length.
+struct Im2colParams {
+    size_t dst_numel;
+    size_t h_out;
+    size_t w_out;
+    size_t h_k;
+    size_t w_k;
+    size_t stride;
+    size_t padding;
+    size_t dilation;
+};
+
+struct Col2im1dParams {
+    size_t dst_el;
+    size_t l_out;
+    size_t l_in;
+    size_t c_out;
+    size_t k_size;
+    size_t stride;
+};
+
+struct Im2col1dParams {
+    size_t dst_numel;
+    size_t l_out;
+    size_t l_k;
+    size_t stride;
+    size_t padding;
+    size_t dilation;
+};
+
+struct UpsampleNearest2dParams {
+    size_t w_out;
+    size_t h_out;
+    float w_scale;
+    float h_scale;
+};
+
+// The one struct here that mixes widths. `bool` is 1 byte in MSL as it is in
+// Rust, and a `float` after it pads to 4 -- both hazards issue #38 names, in one
+// struct. Field order mirrors the classical argument list exactly, so that the
+// capture (which appends in bind order) produces this layout without anyone
+// restating it.
+struct UpsampleBilinear2dParams {
+    size_t w_out;
+    size_t h_out;
+    bool align_corners;
+    bool has_scale_h;
+    float scale_h_factor;
+    bool has_scale_w;
+    float scale_w_factor;
+};
+
+// `max_pool2d` and `avg_pool2d` bind the same four scalars, so they share a
+// struct. They differ in their *accumulator*, which is a template parameter and
+// not part of the binding -- see the instantiation list, where the integer
+// `avg_pool2d` rows deliberately accumulate in their own type.
+struct Pool2dParams {
+    size_t w_k;
+    size_t h_k;
+    size_t w_stride;
+    size_t h_stride;
+};
+
+struct ConvTranspose1dParams {
+    size_t l_out;
+    size_t stride;
+    size_t padding;
+    size_t out_padding;
+    size_t dilation;
+};
+
+struct ConvTranspose2dParams {
+    size_t w_out;
+    size_t h_out;
+    size_t stride;
+    size_t padding;
+    size_t out_padding;
+    size_t dilation;
+};
+
+struct Conv1dDepthwiseParams {
+    size_t dst_numel;
+    size_t l_out;
+    size_t k_size;
+    size_t stride;
+    size_t padding;
+    size_t dilation;
+};
+
+struct Conv1dDepthwiseKParams {
+    size_t dst_numel;
+    size_t l_out;
+    size_t padding;
+};
+
+// Kernels
+//
+// One body per kernel, two entry points around it. The classical wrapper binds
+// its scalars with `setBytes` exactly as before; the `_packed` one reads them
+// from a single `device const Params*`. Neither the arithmetic nor the loop
+// structure is duplicated, so the two styles cannot compute different things --
+// which is what makes the bit-identical parity test meaningful rather than
+// merely reassuring.
+//
+// Nothing in this file declares threadgroup memory, so the whole-body-plus-two-
+// thin-wrappers factoring that #38 could not use for `reduce.metal` does work
+// here. (MSL permits a `threadgroup` variable only inside a `[[kernel]]`-
+// qualified function; there is no such variable in any of these ten families.)
+//
+// The array pointers are templated on the pointer *type* rather than written
+// once per address space: the classical entry points pass `constant size_t *`,
+// the packed ones `device const size_t *`. Deducing the address space from the
+// pointer type is what lets one body serve both, and it is the same move #38
+// made for `reduce.metal`'s `strided_indexer`.
+
+template <typename T, typename PtrT>
+METAL_FUNC void im2col_body(
+    thread const Im2colParams &p,
+    PtrT src_dims,
+    PtrT src_strides,
     device const T *src,
     device T *dst,
-    uint tid [[ thread_position_in_grid ]]
+    uint tid
 ) {
   // dst: (b_size, h_out, w_out, c_in, h_k, w_k)
   // src: (b_size, c_in, h_in, w_in)
+  const size_t dst_numel = p.dst_numel;
+  const size_t h_out = p.h_out;
+  const size_t w_out = p.w_out;
+  const size_t h_k = p.h_k;
+  const size_t w_k = p.w_k;
+  const size_t stride = p.stride;
+  const size_t padding = p.padding;
+  const size_t dilation = p.dilation;
   if (tid >= dst_numel) {
     return;
   }
@@ -69,19 +202,53 @@ template <typename T>
 }
 
 template <typename T>
-[[kernel]] void col2im1d(
-    constant size_t &dst_el,
-    constant size_t &l_out,
-    constant size_t &l_in,
-    constant size_t &c_out,
-    constant size_t &k_size,
+[[kernel]] void im2col(
+    constant size_t &dst_numel,
+    constant size_t &h_out,
+    constant size_t &w_out,
+    constant size_t &h_k,
+    constant size_t &w_k,
     constant size_t &stride,
+    constant size_t &padding,
+    constant size_t &dilation,
+    constant size_t *src_dims,
+    constant size_t *src_strides,
     device const T *src,
     device T *dst,
-    uint dst_i [[ thread_position_in_grid ]]
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Im2colParams p { dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation };
+  im2col_body<T, constant size_t *>(p, src_dims, src_strides, src, dst, tid);
+}
+
+template <typename T>
+[[kernel]] void im2col_packed(
+    device const Im2colParams *pp,
+    device const size_t *src_dims,
+    device const size_t *src_strides,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Im2colParams p = *pp;
+  im2col_body<T, device const size_t *>(p, src_dims, src_strides, src, dst, tid);
+}
+
+template <typename T>
+METAL_FUNC void col2im1d_body(
+    thread const Col2im1dParams &p,
+    device const T *src,
+    device T *dst,
+    uint dst_i
 ) {
   // src: (b_size, l_in, c_out, l_k)
   // dst: (b_size, c_out, l_out)
+  const size_t dst_el = p.dst_el;
+  const size_t l_out = p.l_out;
+  const size_t l_in = p.l_in;
+  const size_t c_out = p.c_out;
+  const size_t k_size = p.k_size;
+  const size_t stride = p.stride;
   if (dst_i >= dst_el) {
     return;
   }
@@ -113,21 +280,49 @@ template <typename T>
 }
 
 template <typename T>
-[[kernel]] void im2col1d(
-    constant size_t &dst_numel,
+[[kernel]] void col2im1d(
+    constant size_t &dst_el,
     constant size_t &l_out,
-    constant size_t &l_k,
+    constant size_t &l_in,
+    constant size_t &c_out,
+    constant size_t &k_size,
     constant size_t &stride,
-    constant size_t &padding,
-    constant size_t &dilation,
-    constant size_t *src_dims,
-    constant size_t *src_strides,
     device const T *src,
     device T *dst,
-    uint tid [[ thread_position_in_grid ]]
+    uint dst_i [[ thread_position_in_grid ]]
+) {
+  Col2im1dParams p { dst_el, l_out, l_in, c_out, k_size, stride };
+  col2im1d_body<T>(p, src, dst, dst_i);
+}
+
+template <typename T>
+[[kernel]] void col2im1d_packed(
+    device const Col2im1dParams *pp,
+    device const T *src,
+    device T *dst,
+    uint dst_i [[ thread_position_in_grid ]]
+) {
+  Col2im1dParams p = *pp;
+  col2im1d_body<T>(p, src, dst, dst_i);
+}
+
+template <typename T, typename PtrT>
+METAL_FUNC void im2col1d_body(
+    thread const Im2col1dParams &p,
+    PtrT src_dims,
+    PtrT src_strides,
+    device const T *src,
+    device T *dst,
+    uint tid
 ) {
   // dst: (b_size, l_out, c_in, l_k)
   // src: (b_size, c_in, l_in)
+  const size_t dst_numel = p.dst_numel;
+  const size_t l_out = p.l_out;
+  const size_t l_k = p.l_k;
+  const size_t stride = p.stride;
+  const size_t padding = p.padding;
+  const size_t dilation = p.dilation;
   if (tid >= dst_numel) {
     return;
   }
@@ -159,18 +354,50 @@ template <typename T>
 }
 
 template <typename T>
-[[kernel]] void upsample_nearest2d(
-    constant size_t &w_out,
-    constant size_t &h_out,
-    constant float &w_scale,
-    constant float &h_scale,
+[[kernel]] void im2col1d(
+    constant size_t &dst_numel,
+    constant size_t &l_out,
+    constant size_t &l_k,
+    constant size_t &stride,
+    constant size_t &padding,
+    constant size_t &dilation,
     constant size_t *src_dims,
-    constant size_t *src_s,
+    constant size_t *src_strides,
     device const T *src,
     device T *dst,
     uint tid [[ thread_position_in_grid ]]
 ) {
+  Im2col1dParams p { dst_numel, l_out, l_k, stride, padding, dilation };
+  im2col1d_body<T, constant size_t *>(p, src_dims, src_strides, src, dst, tid);
+}
+
+template <typename T>
+[[kernel]] void im2col1d_packed(
+    device const Im2col1dParams *pp,
+    device const size_t *src_dims,
+    device const size_t *src_strides,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Im2col1dParams p = *pp;
+  im2col1d_body<T, device const size_t *>(p, src_dims, src_strides, src, dst, tid);
+}
+
+template <typename T, typename PtrT>
+METAL_FUNC void upsample_nearest2d_body(
+    thread const UpsampleNearest2dParams &p,
+    PtrT src_dims,
+    PtrT src_s,
+    device const T *src,
+    device T *dst,
+    uint tid
+) {
   // src: (b_size, c_in, w_in, h_in)
+  const size_t w_out = p.w_out;
+  const size_t h_out = p.h_out;
+  const float w_scale = p.w_scale;
+  const float h_scale = p.h_scale;
 
   const size_t c = src_dims[1];
   const size_t w_in = src_dims[2];
@@ -199,24 +426,52 @@ template <typename T>
   dst[tid] = src[src_i];
 }
 
-// Buffer indices are explicit here because the macro that used to generate this
-// kernel's signature spelled them out; keeping them pinned means the binding
-// layout stays fixed even if a parameter is added above.
 template <typename T>
-[[kernel]] void upsample_bilinear2d(
-    constant size_t &w_out [[buffer(0)]],
-    constant size_t &h_out [[buffer(1)]],
-    constant bool &align_corners [[buffer(2)]],
-    constant bool &has_scale_h [[buffer(3)]],
-    constant float &scale_h_factor [[buffer(4)]],
-    constant bool &has_scale_w [[buffer(5)]],
-    constant float &scale_w_factor [[buffer(6)]],
-    constant size_t *src_dims [[buffer(7)]],
-    constant size_t *src_s [[buffer(8)]],
-    device const T *src [[buffer(9)]],
-    device T *dst [[buffer(10)]],
-    uint tid [[thread_position_in_grid]]
+[[kernel]] void upsample_nearest2d(
+    constant size_t &w_out,
+    constant size_t &h_out,
+    constant float &w_scale,
+    constant float &h_scale,
+    constant size_t *src_dims,
+    constant size_t *src_s,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
 ) {
+  UpsampleNearest2dParams p { w_out, h_out, w_scale, h_scale };
+  upsample_nearest2d_body<T, constant size_t *>(p, src_dims, src_s, src, dst, tid);
+}
+
+template <typename T>
+[[kernel]] void upsample_nearest2d_packed(
+    device const UpsampleNearest2dParams *pp,
+    device const size_t *src_dims,
+    device const size_t *src_s,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  UpsampleNearest2dParams p = *pp;
+  upsample_nearest2d_body<T, device const size_t *>(p, src_dims, src_s, src, dst, tid);
+}
+
+template <typename T, typename PtrT>
+METAL_FUNC void upsample_bilinear2d_body(
+    thread const UpsampleBilinear2dParams &p,
+    PtrT src_dims,
+    PtrT src_s,
+    device const T *src,
+    device T *dst,
+    uint tid
+) {
+    const size_t w_out = p.w_out;
+    const size_t h_out = p.h_out;
+    const bool align_corners = p.align_corners;
+    const bool has_scale_h = p.has_scale_h;
+    const float scale_h_factor = p.scale_h_factor;
+    const bool has_scale_w = p.has_scale_w;
+    const float scale_w_factor = p.scale_w_factor;
+
     // src: (b_size, c_in, h_in, w_in)  // Standard NCHW layout
     const size_t c = src_dims[1];
     const size_t h_in = src_dims[2];  // dims[2] = height
@@ -286,18 +541,65 @@ template <typename T>
     dst[tid] = T(value);
 }
 
-template <typename T, typename A>
-[[kernel]] void avg_pool2d(
-    constant size_t &w_k,
-    constant size_t &h_k,
-    constant size_t &w_stride,
-    constant size_t &h_stride,
-    constant size_t *src_dims,
-    constant size_t *src_strides,
+// Buffer indices are explicit here because the macro that used to generate this
+// kernel's signature spelled them out; keeping them pinned means the binding
+// layout stays fixed even if a parameter is added above.
+template <typename T>
+[[kernel]] void upsample_bilinear2d(
+    constant size_t &w_out [[buffer(0)]],
+    constant size_t &h_out [[buffer(1)]],
+    constant bool &align_corners [[buffer(2)]],
+    constant bool &has_scale_h [[buffer(3)]],
+    constant float &scale_h_factor [[buffer(4)]],
+    constant bool &has_scale_w [[buffer(5)]],
+    constant float &scale_w_factor [[buffer(6)]],
+    constant size_t *src_dims [[buffer(7)]],
+    constant size_t *src_s [[buffer(8)]],
+    device const T *src [[buffer(9)]],
+    device T *dst [[buffer(10)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    UpsampleBilinear2dParams p {
+        w_out, h_out, align_corners, has_scale_h, scale_h_factor,
+        has_scale_w, scale_w_factor
+    };
+    upsample_bilinear2d_body<T, constant size_t *>(p, src_dims, src_s, src, dst, tid);
+}
+
+// The packed indices are contiguous from 0 rather than carrying the classical
+// pins forward: seven scalars leave the argument list, so slots 0..6 are gone
+// and everything after them moves down. That renumbering is exactly what
+// `ParamCapture` performs on the Rust side, and stating it explicitly here keeps
+// the two descriptions of one layout next to each other. Getting it wrong is
+// silent under `HazardTrackingModeUntracked` (`DESIGN.md` §3.5), which is what
+// the bit-identical parity test exists to catch.
+template <typename T>
+[[kernel]] void upsample_bilinear2d_packed(
+    device const UpsampleBilinear2dParams *pp [[buffer(0)]],
+    device const size_t *src_dims [[buffer(1)]],
+    device const size_t *src_s [[buffer(2)]],
+    device const T *src [[buffer(3)]],
+    device T *dst [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    UpsampleBilinear2dParams p = *pp;
+    upsample_bilinear2d_body<T, device const size_t *>(p, src_dims, src_s, src, dst, tid);
+}
+
+template <typename T, typename A, typename PtrT>
+METAL_FUNC void avg_pool2d_body(
+    thread const Pool2dParams &p,
+    PtrT src_dims,
+    PtrT src_strides,
     device const T *src,
     device T *dst,
-    uint tid [[ thread_position_in_grid ]]
+    uint tid
 ) {
+  const size_t w_k = p.w_k;
+  const size_t h_k = p.h_k;
+  const size_t w_stride = p.w_stride;
+  const size_t h_stride = p.h_stride;
+
   const size_t c = src_dims[1];
   const size_t w_in = src_dims[2];
   const size_t h_in = src_dims[3];
@@ -332,8 +634,12 @@ template <typename T, typename A>
   dst[tid] = static_cast<T>(d / (w_k * h_k));
 }
 
-template <typename T>
-[[kernel]] void max_pool2d(
+// `A` is the accumulator and stays a template parameter on both wrappers. The
+// integer instantiations accumulate in their own type rather than widening, so
+// their averaging truncates exactly where it did before -- a binding change must
+// not move that (`DESIGN.md` §8.1c).
+template <typename T, typename A>
+[[kernel]] void avg_pool2d(
     constant size_t &w_k,
     constant size_t &h_k,
     constant size_t &w_stride,
@@ -344,6 +650,37 @@ template <typename T>
     device T *dst,
     uint tid [[ thread_position_in_grid ]]
 ) {
+  Pool2dParams p { w_k, h_k, w_stride, h_stride };
+  avg_pool2d_body<T, A, constant size_t *>(p, src_dims, src_strides, src, dst, tid);
+}
+
+template <typename T, typename A>
+[[kernel]] void avg_pool2d_packed(
+    device const Pool2dParams *pp,
+    device const size_t *src_dims,
+    device const size_t *src_strides,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Pool2dParams p = *pp;
+  avg_pool2d_body<T, A, device const size_t *>(p, src_dims, src_strides, src, dst, tid);
+}
+
+template <typename T, typename PtrT>
+METAL_FUNC void max_pool2d_body(
+    thread const Pool2dParams &p,
+    PtrT src_dims,
+    PtrT src_strides,
+    device const T *src,
+    device T *dst,
+    uint tid
+) {
+  const size_t w_k = p.w_k;
+  const size_t h_k = p.h_k;
+  const size_t w_stride = p.w_stride;
+  const size_t h_stride = p.h_stride;
+
   const size_t c = src_dims[1];
   const size_t w_in = src_dims[2];
   const size_t h_in = src_dims[3];
@@ -385,26 +722,55 @@ template <typename T>
   dst[tid] = d;
 }
 
-
-// Naive implementation of conv_transpose1d.
-template <typename T, typename A>
-[[kernel]] void conv_transpose1d(
-    constant size_t &l_out,
-    constant size_t &stride,
-    constant size_t &padding,
-    constant size_t &out_padding,
-    constant size_t &dilation,
+template <typename T>
+[[kernel]] void max_pool2d(
+    constant size_t &w_k,
+    constant size_t &h_k,
+    constant size_t &w_stride,
+    constant size_t &h_stride,
     constant size_t *src_dims,
     constant size_t *src_strides,
-    constant size_t *k_dims,
-    constant size_t *k_strides,
     device const T *src,
-    device const T *k,
     device T *dst,
     uint tid [[ thread_position_in_grid ]]
 ) {
+  Pool2dParams p { w_k, h_k, w_stride, h_stride };
+  max_pool2d_body<T, constant size_t *>(p, src_dims, src_strides, src, dst, tid);
+}
+
+template <typename T>
+[[kernel]] void max_pool2d_packed(
+    device const Pool2dParams *pp,
+    device const size_t *src_dims,
+    device const size_t *src_strides,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Pool2dParams p = *pp;
+  max_pool2d_body<T, device const size_t *>(p, src_dims, src_strides, src, dst, tid);
+}
+
+
+// Naive implementation of conv_transpose1d.
+template <typename T, typename A, typename PtrT>
+METAL_FUNC void conv_transpose1d_body(
+    thread const ConvTranspose1dParams &p,
+    PtrT src_dims,
+    PtrT src_strides,
+    PtrT k_dims,
+    PtrT k_strides,
+    device const T *src,
+    device const T *k,
+    device T *dst,
+    uint tid
+) {
   // src: (b_size, c_in, l_in)
   // kernel: (c_in, c_out, l_k)
+  const size_t l_out = p.l_out;
+  const size_t stride = p.stride;
+  const size_t padding = p.padding;
+  const size_t dilation = p.dilation;
   const size_t l_k = k_dims[2];
   const size_t c_out = k_dims[1];
   const size_t c_in = src_dims[1];
@@ -436,23 +802,66 @@ template <typename T, typename A>
   dst[tid] = static_cast<T>(d);
 }
 
+// `out_padding` is bound but never read by the body, here and in
+// `conv_transpose2d`. It stays a field rather than being dropped: the packed
+// block is built by letting the existing `set_params!` call run and diverting
+// each scalar as it passes, so the struct must mirror the argument list exactly
+// or every field after the omission lands at the wrong offset.
 template <typename T, typename A>
-[[kernel]] void conv_transpose2d(
-  constant size_t &w_out,
-  constant size_t &h_out,
-  constant size_t &stride,
-  constant size_t &padding,
-  constant size_t &out_padding,
-  constant size_t &dilation,
-  constant size_t *input_dims,
-  constant size_t *input_stride,
-  constant size_t *k_dims,
-  constant size_t *k_stride,
+[[kernel]] void conv_transpose1d(
+    constant size_t &l_out,
+    constant size_t &stride,
+    constant size_t &padding,
+    constant size_t &out_padding,
+    constant size_t &dilation,
+    constant size_t *src_dims,
+    constant size_t *src_strides,
+    constant size_t *k_dims,
+    constant size_t *k_strides,
+    device const T *src,
+    device const T *k,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  ConvTranspose1dParams p { l_out, stride, padding, out_padding, dilation };
+  conv_transpose1d_body<T, A, constant size_t *>(
+      p, src_dims, src_strides, k_dims, k_strides, src, k, dst, tid);
+}
+
+template <typename T, typename A>
+[[kernel]] void conv_transpose1d_packed(
+    device const ConvTranspose1dParams *pp,
+    device const size_t *src_dims,
+    device const size_t *src_strides,
+    device const size_t *k_dims,
+    device const size_t *k_strides,
+    device const T *src,
+    device const T *k,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  ConvTranspose1dParams p = *pp;
+  conv_transpose1d_body<T, A, device const size_t *>(
+      p, src_dims, src_strides, k_dims, k_strides, src, k, dst, tid);
+}
+
+template <typename T, typename A, typename PtrT>
+METAL_FUNC void conv_transpose2d_body(
+  thread const ConvTranspose2dParams &p,
+  PtrT input_dims,
+  PtrT input_stride,
+  PtrT k_dims,
+  PtrT k_stride,
   device const T *src,
   device const T *k,
   device T *dst,
-  uint tid [[ thread_position_in_grid ]]
+  uint tid
 ) {
+  const size_t w_out = p.w_out;
+  const size_t h_out = p.h_out;
+  const size_t stride = p.stride;
+  const size_t padding = p.padding;
+  const size_t dilation = p.dilation;
   const size_t h_k = k_dims[2];
   const size_t w_k = k_dims[3];
   const size_t c_out = k_dims[1];
@@ -496,6 +905,45 @@ template <typename T, typename A>
   dst[tid] = static_cast<T>(d);
 }
 
+template <typename T, typename A>
+[[kernel]] void conv_transpose2d(
+  constant size_t &w_out,
+  constant size_t &h_out,
+  constant size_t &stride,
+  constant size_t &padding,
+  constant size_t &out_padding,
+  constant size_t &dilation,
+  constant size_t *input_dims,
+  constant size_t *input_stride,
+  constant size_t *k_dims,
+  constant size_t *k_stride,
+  device const T *src,
+  device const T *k,
+  device T *dst,
+  uint tid [[ thread_position_in_grid ]]
+) {
+  ConvTranspose2dParams p { w_out, h_out, stride, padding, out_padding, dilation };
+  conv_transpose2d_body<T, A, constant size_t *>(
+      p, input_dims, input_stride, k_dims, k_stride, src, k, dst, tid);
+}
+
+template <typename T, typename A>
+[[kernel]] void conv_transpose2d_packed(
+  device const ConvTranspose2dParams *pp,
+  device const size_t *input_dims,
+  device const size_t *input_stride,
+  device const size_t *k_dims,
+  device const size_t *k_stride,
+  device const T *src,
+  device const T *k,
+  device T *dst,
+  uint tid [[ thread_position_in_grid ]]
+) {
+  ConvTranspose2dParams p = *pp;
+  conv_transpose2d_body<T, A, device const size_t *>(
+      p, input_dims, input_stride, k_dims, k_stride, src, k, dst, tid);
+}
+
 // Depthwise 1D convolution, fused.
 //
 // The generic path builds an im2col matrix, runs a matmul, then transposes the
@@ -506,21 +954,22 @@ template <typename T, typename A>
 // concatenates, so a 2048-channel depthwise layer becomes thousands of
 // dispatches. This does the whole layer in one, writing straight to the final
 // (b, c, l_out) layout so no transpose copy is needed.
-template <typename T, typename A>
-[[kernel]] void conv1d_depthwise(
-    constant size_t &dst_numel,
-    constant size_t &l_out,
-    constant size_t &k_size,
-    constant size_t &stride,
-    constant size_t &padding,
-    constant size_t &dilation,
-    constant size_t *src_dims,
-    constant size_t *src_strides,
+template <typename T, typename A, typename PtrT>
+METAL_FUNC void conv1d_depthwise_body(
+    thread const Conv1dDepthwiseParams &p,
+    PtrT src_dims,
+    PtrT src_strides,
     device const T *src,
     device const T *weight,
     device T *dst,
-    uint tid [[ thread_position_in_grid ]]
+    uint tid
 ) {
+  const size_t dst_numel = p.dst_numel;
+  const size_t l_out = p.l_out;
+  const size_t k_size = p.k_size;
+  const size_t stride = p.stride;
+  const size_t padding = p.padding;
+  const size_t dilation = p.dilation;
   if (tid >= dst_numel) {
     return;
   }
@@ -557,6 +1006,41 @@ template <typename T, typename A>
   dst[tid] = static_cast<T>(acc);
 }
 
+template <typename T, typename A>
+[[kernel]] void conv1d_depthwise(
+    constant size_t &dst_numel,
+    constant size_t &l_out,
+    constant size_t &k_size,
+    constant size_t &stride,
+    constant size_t &padding,
+    constant size_t &dilation,
+    constant size_t *src_dims,
+    constant size_t *src_strides,
+    device const T *src,
+    device const T *weight,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Conv1dDepthwiseParams p { dst_numel, l_out, k_size, stride, padding, dilation };
+  conv1d_depthwise_body<T, A, constant size_t *>(
+      p, src_dims, src_strides, src, weight, dst, tid);
+}
+
+template <typename T, typename A>
+[[kernel]] void conv1d_depthwise_packed(
+    device const Conv1dDepthwiseParams *pp,
+    device const size_t *src_dims,
+    device const size_t *src_strides,
+    device const T *src,
+    device const T *weight,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Conv1dDepthwiseParams p = *pp;
+  conv1d_depthwise_body<T, A, device const size_t *>(
+      p, src_dims, src_strides, src, weight, dst, tid);
+}
+
 // Depthwise 1D convolution, specialized for the common contiguous case.
 //
 // Same computation as `conv1d_depthwise` above, with three things moved from
@@ -579,17 +1063,18 @@ template <typename T, typename A>
 // Preconditions the caller must check (see `call_conv1d_depthwise_k`):
 // stride == 1, dilation == 1, contiguous source, and K_SIZE matching an
 // instantiated variant. Anything else uses the generic kernel above.
-template <typename T, typename A, ushort K_SIZE>
-[[kernel]] void conv1d_depthwise_k(
-    constant size_t &dst_numel,
-    constant size_t &l_out,
-    constant size_t &padding,
-    constant size_t *src_dims,
+template <typename T, typename A, ushort K_SIZE, typename PtrT>
+METAL_FUNC void conv1d_depthwise_k_body(
+    thread const Conv1dDepthwiseKParams &p,
+    PtrT src_dims,
     device const T *src,
     device const T *weight,
     device T *dst,
-    uint tid [[ thread_position_in_grid ]]
+    uint tid
 ) {
+  const size_t dst_numel = p.dst_numel;
+  const size_t l_out = p.l_out;
+  const size_t padding = p.padding;
   if (tid >= dst_numel) {
     return;
   }
@@ -626,6 +1111,186 @@ template <typename T, typename A, ushort K_SIZE>
   dst[tid] = static_cast<T>(acc);
 }
 
+// `K_SIZE` stays a template parameter on both wrappers -- it is a compile-tier
+// axis (`DESIGN.md` §7.4) that fixes the tap loop's trip count so it unrolls,
+// which is the whole point of this variant. The binding style is a *second*,
+// independent axis, and the two compose rather than interacting.
+template <typename T, typename A, ushort K_SIZE>
+[[kernel]] void conv1d_depthwise_k(
+    constant size_t &dst_numel,
+    constant size_t &l_out,
+    constant size_t &padding,
+    constant size_t *src_dims,
+    device const T *src,
+    device const T *weight,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Conv1dDepthwiseKParams p { dst_numel, l_out, padding };
+  conv1d_depthwise_k_body<T, A, K_SIZE, constant size_t *>(
+      p, src_dims, src, weight, dst, tid);
+}
+
+template <typename T, typename A, ushort K_SIZE>
+[[kernel]] void conv1d_depthwise_k_packed(
+    device const Conv1dDepthwiseKParams *pp,
+    device const size_t *src_dims,
+    device const T *src,
+    device const T *weight,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Conv1dDepthwiseKParams p = *pp;
+  conv1d_depthwise_k_body<T, A, K_SIZE, device const size_t *>(
+      p, src_dims, src, weight, dst, tid);
+}
+
+// Layout, asserted rather than hoped.
+//
+// A field at the wrong offset does not crash: the kernel reads a well-formed
+// number from the wrong place and computes a plausible wrong answer, which
+// under `HazardTrackingModeUntracked` is the failure mode `DESIGN.md` §3.5 and
+// §15.1 both single out.
+//
+// Only sizes and alignments are `static_assert`ed. Offsets cannot be: MSL has
+// no `<cstddef>` and the null-pointer-member form of `offsetof` is not a
+// constant expression. They are reported by `conv_params_layout` below and
+// compared against Rust's `offset_of!`, which is the stronger check regardless
+// -- a `static_assert` on either side proves only that side agrees with itself.
+static_assert(sizeof(Im2colParams) == 64, "Im2colParams layout");
+static_assert(alignof(Im2colParams) == 8, "Im2colParams alignment");
+
+static_assert(sizeof(Col2im1dParams) == 48, "Col2im1dParams layout");
+static_assert(alignof(Col2im1dParams) == 8, "Col2im1dParams alignment");
+
+static_assert(sizeof(Im2col1dParams) == 48, "Im2col1dParams layout");
+static_assert(alignof(Im2col1dParams) == 8, "Im2col1dParams alignment");
+
+static_assert(sizeof(UpsampleNearest2dParams) == 24, "UpsampleNearest2dParams layout");
+static_assert(alignof(UpsampleNearest2dParams) == 8, "UpsampleNearest2dParams alignment");
+
+// The mixed-width one. Three `bool` at 1 byte each and two `float` between two
+// `size_t`: `align_corners` and `has_scale_h` sit adjacent at 16 and 17, then
+// `scale_h_factor` pads to 20, `has_scale_w` lands at 24, `scale_w_factor` pads
+// to 28, and the struct pads up to its own 8-byte alignment at 32. Every one of
+// those numbers is a padding rule rather than a field width, which is why the
+// cross-boundary check matters more here than anywhere else in the file.
+static_assert(sizeof(UpsampleBilinear2dParams) == 32, "UpsampleBilinear2dParams layout");
+static_assert(alignof(UpsampleBilinear2dParams) == 8, "UpsampleBilinear2dParams alignment");
+
+static_assert(sizeof(Pool2dParams) == 32, "Pool2dParams layout");
+static_assert(alignof(Pool2dParams) == 8, "Pool2dParams alignment");
+
+static_assert(sizeof(ConvTranspose1dParams) == 40, "ConvTranspose1dParams layout");
+static_assert(alignof(ConvTranspose1dParams) == 8, "ConvTranspose1dParams alignment");
+
+static_assert(sizeof(ConvTranspose2dParams) == 48, "ConvTranspose2dParams layout");
+static_assert(alignof(ConvTranspose2dParams) == 8, "ConvTranspose2dParams alignment");
+
+static_assert(sizeof(Conv1dDepthwiseParams) == 48, "Conv1dDepthwiseParams layout");
+static_assert(alignof(Conv1dDepthwiseParams) == 8, "Conv1dDepthwiseParams alignment");
+
+static_assert(sizeof(Conv1dDepthwiseKParams) == 24, "Conv1dDepthwiseKParams layout");
+static_assert(alignof(Conv1dDepthwiseKParams) == 8, "Conv1dDepthwiseKParams alignment");
+
+// The offset is taken from a real `thread` instance rather than the usual
+// null-pointer form, which MSL rejects in constant evaluation. Measuring it at
+// runtime is what this kernel is for.
+#define offsetof_rt(S, F) \
+    ((uint)((thread const char *)&(probe_##S.F) - (thread const char *)&probe_##S))
+
+[[kernel]] void conv_params_layout(
+    device uint *out,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    if (tid != 0) { return; }
+    Im2colParams              probe_Im2colParams;
+    Col2im1dParams            probe_Col2im1dParams;
+    Im2col1dParams            probe_Im2col1dParams;
+    UpsampleNearest2dParams   probe_UpsampleNearest2dParams;
+    UpsampleBilinear2dParams  probe_UpsampleBilinear2dParams;
+    Pool2dParams              probe_Pool2dParams;
+    ConvTranspose1dParams     probe_ConvTranspose1dParams;
+    ConvTranspose2dParams     probe_ConvTranspose2dParams;
+    Conv1dDepthwiseParams     probe_Conv1dDepthwiseParams;
+    Conv1dDepthwiseKParams    probe_Conv1dDepthwiseKParams;
+
+    out[0]  = sizeof(Im2colParams);
+    out[1]  = offsetof_rt(Im2colParams, dst_numel);
+    out[2]  = offsetof_rt(Im2colParams, h_out);
+    out[3]  = offsetof_rt(Im2colParams, w_out);
+    out[4]  = offsetof_rt(Im2colParams, h_k);
+    out[5]  = offsetof_rt(Im2colParams, w_k);
+    out[6]  = offsetof_rt(Im2colParams, stride);
+    out[7]  = offsetof_rt(Im2colParams, padding);
+    out[8]  = offsetof_rt(Im2colParams, dilation);
+
+    out[9]  = sizeof(Col2im1dParams);
+    out[10] = offsetof_rt(Col2im1dParams, dst_el);
+    out[11] = offsetof_rt(Col2im1dParams, l_out);
+    out[12] = offsetof_rt(Col2im1dParams, l_in);
+    out[13] = offsetof_rt(Col2im1dParams, c_out);
+    out[14] = offsetof_rt(Col2im1dParams, k_size);
+    out[15] = offsetof_rt(Col2im1dParams, stride);
+
+    out[16] = sizeof(Im2col1dParams);
+    out[17] = offsetof_rt(Im2col1dParams, dst_numel);
+    out[18] = offsetof_rt(Im2col1dParams, l_out);
+    out[19] = offsetof_rt(Im2col1dParams, l_k);
+    out[20] = offsetof_rt(Im2col1dParams, stride);
+    out[21] = offsetof_rt(Im2col1dParams, padding);
+    out[22] = offsetof_rt(Im2col1dParams, dilation);
+
+    out[23] = sizeof(UpsampleNearest2dParams);
+    out[24] = offsetof_rt(UpsampleNearest2dParams, w_out);
+    out[25] = offsetof_rt(UpsampleNearest2dParams, h_out);
+    out[26] = offsetof_rt(UpsampleNearest2dParams, w_scale);
+    out[27] = offsetof_rt(UpsampleNearest2dParams, h_scale);
+
+    out[28] = sizeof(UpsampleBilinear2dParams);
+    out[29] = offsetof_rt(UpsampleBilinear2dParams, w_out);
+    out[30] = offsetof_rt(UpsampleBilinear2dParams, h_out);
+    out[31] = offsetof_rt(UpsampleBilinear2dParams, align_corners);
+    out[32] = offsetof_rt(UpsampleBilinear2dParams, has_scale_h);
+    out[33] = offsetof_rt(UpsampleBilinear2dParams, scale_h_factor);
+    out[34] = offsetof_rt(UpsampleBilinear2dParams, has_scale_w);
+    out[35] = offsetof_rt(UpsampleBilinear2dParams, scale_w_factor);
+
+    out[36] = sizeof(Pool2dParams);
+    out[37] = offsetof_rt(Pool2dParams, w_k);
+    out[38] = offsetof_rt(Pool2dParams, h_k);
+    out[39] = offsetof_rt(Pool2dParams, w_stride);
+    out[40] = offsetof_rt(Pool2dParams, h_stride);
+
+    out[41] = sizeof(ConvTranspose1dParams);
+    out[42] = offsetof_rt(ConvTranspose1dParams, l_out);
+    out[43] = offsetof_rt(ConvTranspose1dParams, stride);
+    out[44] = offsetof_rt(ConvTranspose1dParams, padding);
+    out[45] = offsetof_rt(ConvTranspose1dParams, out_padding);
+    out[46] = offsetof_rt(ConvTranspose1dParams, dilation);
+
+    out[47] = sizeof(ConvTranspose2dParams);
+    out[48] = offsetof_rt(ConvTranspose2dParams, w_out);
+    out[49] = offsetof_rt(ConvTranspose2dParams, h_out);
+    out[50] = offsetof_rt(ConvTranspose2dParams, stride);
+    out[51] = offsetof_rt(ConvTranspose2dParams, padding);
+    out[52] = offsetof_rt(ConvTranspose2dParams, out_padding);
+    out[53] = offsetof_rt(ConvTranspose2dParams, dilation);
+
+    out[54] = sizeof(Conv1dDepthwiseParams);
+    out[55] = offsetof_rt(Conv1dDepthwiseParams, dst_numel);
+    out[56] = offsetof_rt(Conv1dDepthwiseParams, l_out);
+    out[57] = offsetof_rt(Conv1dDepthwiseParams, k_size);
+    out[58] = offsetof_rt(Conv1dDepthwiseParams, stride);
+    out[59] = offsetof_rt(Conv1dDepthwiseParams, padding);
+    out[60] = offsetof_rt(Conv1dDepthwiseParams, dilation);
+
+    out[61] = sizeof(Conv1dDepthwiseKParams);
+    out[62] = offsetof_rt(Conv1dDepthwiseKParams, dst_numel);
+    out[63] = offsetof_rt(Conv1dDepthwiseKParams, l_out);
+    out[64] = offsetof_rt(Conv1dDepthwiseKParams, padding);
+}
+
 // Explicit instantiation. `decltype(func<...>)` restates the template's own
 // signature, so a variant is declared by naming the type arguments and the
 // `[[host_name]]` string only — the parameter list is written once, in the
@@ -637,45 +1302,66 @@ template <typename T, typename A, ushort K_SIZE>
 #define init_kernel(name, func, ...) \
   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
 
+// Both binding styles from one instantiation row, so a variant cannot exist in
+// one style and not the other. `_packed` is a name segment appended after the
+// dtype and any `_k<K>`, and `packed_names_resolve` checks every result against
+// the compiled library rather than against these macros -- which is
+// `DESIGN.md` §8.1b's argument, and #26 shipped 48 names absent from a metallib
+// that compiled cleanly.
+//
 // bfloat is gated per family exactly as before this conversion: the depthwise
 // kernel on __METAL_VERSION__ >= 310, every other family on __HAVE_BFLOAT__.
 // The two guards are not interchangeable, so they are kept as they were rather
-// than unified.
+// than unified. Because each row emits both styles, the guards carry the packed
+// variants with them and the two styles cannot come apart per dtype.
 #define init_conv1d_depthwise(tname, t, acc) \
-    init_kernel("conv1d_depthwise_" #tname, conv1d_depthwise, t, acc)
+    init_kernel("conv1d_depthwise_" #tname, conv1d_depthwise, t, acc) \
+    init_kernel("conv1d_depthwise_" #tname "_packed", conv1d_depthwise_packed, t, acc)
 
 // The specialized variant carries k_size in its name, per DESIGN.md §7.4's
 // `<op>_<dtype>_k<K>` shape. K is a compile-tier axis: it fixes the tap loop's
 // trip count, so it changes the generated code and the register allocation.
+// The binding style is a second, independent compile-tier axis, and `_packed`
+// follows `_k<K>` so the name reads outermost-axis-last.
 #define init_conv1d_depthwise_k(tname, t, acc, k) \
-    init_kernel("conv1d_depthwise_" #tname "_k" #k, conv1d_depthwise_k, t, acc, k)
+    init_kernel("conv1d_depthwise_" #tname "_k" #k, conv1d_depthwise_k, t, acc, k) \
+    init_kernel("conv1d_depthwise_" #tname "_k" #k "_packed", conv1d_depthwise_k_packed, t, acc, k)
 
 #define init_im2col1d(tname, t) \
-    init_kernel("im2col1d_" #tname, im2col1d, t)
+    init_kernel("im2col1d_" #tname, im2col1d, t) \
+    init_kernel("im2col1d_" #tname "_packed", im2col1d_packed, t)
 
 #define init_im2col(tname, t) \
-    init_kernel("im2col_" #tname, im2col, t)
+    init_kernel("im2col_" #tname, im2col, t) \
+    init_kernel("im2col_" #tname "_packed", im2col_packed, t)
 
 #define init_col2im1d(tname, t) \
-    init_kernel("col2im1d_" #tname, col2im1d, t)
+    init_kernel("col2im1d_" #tname, col2im1d, t) \
+    init_kernel("col2im1d_" #tname "_packed", col2im1d_packed, t)
 
 #define init_upsample_nearest2d(tname, t) \
-    init_kernel("upsample_nearest2d_" #tname, upsample_nearest2d, t)
+    init_kernel("upsample_nearest2d_" #tname, upsample_nearest2d, t) \
+    init_kernel("upsample_nearest2d_" #tname "_packed", upsample_nearest2d_packed, t)
 
 #define init_upsample_bilinear2d(tname, t) \
-    init_kernel("upsample_bilinear2d_" #tname, upsample_bilinear2d, t)
+    init_kernel("upsample_bilinear2d_" #tname, upsample_bilinear2d, t) \
+    init_kernel("upsample_bilinear2d_" #tname "_packed", upsample_bilinear2d_packed, t)
 
 #define init_max_pool2d(tname, t) \
-    init_kernel("max_pool2d_" #tname, max_pool2d, t)
+    init_kernel("max_pool2d_" #tname, max_pool2d, t) \
+    init_kernel("max_pool2d_" #tname "_packed", max_pool2d_packed, t)
 
 #define init_avg_pool2d(tname, t, acc) \
-    init_kernel("avg_pool2d_" #tname, avg_pool2d, t, acc)
+    init_kernel("avg_pool2d_" #tname, avg_pool2d, t, acc) \
+    init_kernel("avg_pool2d_" #tname "_packed", avg_pool2d_packed, t, acc)
 
 #define init_conv_transpose1d(tname, t, acc) \
-    init_kernel("conv_transpose1d_" #tname, conv_transpose1d, t, acc)
+    init_kernel("conv_transpose1d_" #tname, conv_transpose1d, t, acc) \
+    init_kernel("conv_transpose1d_" #tname "_packed", conv_transpose1d_packed, t, acc)
 
 #define init_conv_transpose2d(tname, t, acc) \
-    init_kernel("conv_transpose2d_" #tname, conv_transpose2d, t, acc)
+    init_kernel("conv_transpose2d_" #tname, conv_transpose2d, t, acc) \
+    init_kernel("conv_transpose2d_" #tname "_packed", conv_transpose2d_packed, t, acc)
 
 init_im2col(f32, float);
 init_im2col(f16, half);

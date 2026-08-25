@@ -42,6 +42,14 @@ const ROPE_THD_PARAMS_ALIGN: usize = core::mem::align_of::<RopeThdParams>();
 // path (the same low four bytes reach the same slot), and it is why the LFM2
 // digests are unchanged.
 
+// `ParamStyle`, `begin_packed_params` and `finish_packed_params` were declared
+// here when `reduce.metal` was the only family carrying both styles. They moved
+// to `kernels/params.rs` once other families followed (issues #40, #41, #42),
+// because the capture protocol is identical and a copy per family would be the
+// hand-sync `DESIGN.md` §8.1b exists to remove. `kernels/mod.rs` re-exports
+// `ParamStyle` from there, so callers naming it through this module still
+// resolve.
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_reduce_contiguous(
     device: &Device,

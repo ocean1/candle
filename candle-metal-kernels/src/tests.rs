@@ -4401,3 +4401,857 @@ fn gemv_packed_does_not_change_occupancy() {
         differences.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// `conv.metal` in both binding styles (issue #42).
+//
+// Same three obligations as the `reduce.metal` block above -- layout, name
+// resolution, bit-identical output -- applied to the family with the most
+// `constant &` parameters after `reduce`: 59 across ten families.
+//
+// Two things make this family's checks carry more than repetition:
+//
+//  * **`UpsampleBilinear2dParams` mixes widths.** Three `bool` and two `float`
+//    between two `size_t`, so five of seven fields land at an offset the
+//    padding rule decides. It is the only struct in the tree that exercises
+//    both hazards issue #38 names at once.
+//  * **`im2col` is the shape `DESIGN.md` §8.1c warns about.** Eight consecutive
+//    `constant size_t` parameters, where reordering two is silent -- no size
+//    change, no type error, a plausible wrong answer. The mutation test below
+//    swaps two of exactly those.
+// ---------------------------------------------------------------------------
+
+/// The device's own view of every conv packed struct's layout, against Rust's.
+///
+/// Separate from `reduce_params_layout_matches_metal` because `conv.metal` and
+/// `reduce.metal` are compiled as separate libraries, so each has its own
+/// layout kernel and its own slot numbering.
+#[test]
+fn conv_params_layout_matches_metal() {
+    use crate::kernels::params::{expected_conv_layout, CONV_LAYOUT_KERNEL, CONV_LAYOUT_SLOTS};
+
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let out = device
+        .new_buffer(
+            CONV_LAYOUT_SLOTS * core::mem::size_of::<u32>(),
+            RESOURCE_OPTIONS,
+        )
+        .unwrap();
+
+    let pipeline = kernels
+        .load_pipeline(&device, Source::Conv, CONV_LAYOUT_KERNEL)
+        .unwrap();
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_output_buffer(0, Some(&out), 0);
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let device_side: Vec<u32> = read_to_vec(&out, CONV_LAYOUT_SLOTS);
+    let mut disagreements = Vec::new();
+    for (slot, (what, rust)) in expected_conv_layout().into_iter().enumerate() {
+        if device_side[slot] != rust {
+            disagreements.push(format!(
+                "  {what}: metal {} vs rust {rust}",
+                device_side[slot]
+            ));
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "packed parameter layout differs between conv.metal and params.rs.\n\
+         A field at the wrong offset is silent corruption, not a crash:\n{}",
+        disagreements.join("\n")
+    );
+}
+
+/// The conv layout check must be able to fail.
+///
+/// `CONTRIBUTING.md` §3.1 #2. The mutation swaps **`Im2colParams.h_k` and
+/// `Im2colParams.w_k`** -- two adjacent `size_t` fields in the middle of eight
+/// consecutive ones. That is the case `DESIGN.md` §8.1c names for `im2col`
+/// specifically, and it is the one nothing else catches:
+///
+/// * `sizeof` is unchanged, so the `static_assert` in `conv.metal` passes;
+/// * both are `size_t`, so the brace initializer still type-checks -- a field
+///   of a *different* type is rejected by C++11 narrowing before reaching a
+///   GPU, which is a real layer of defence but not this one;
+/// * the kernel runs and computes a plausible wrong convolution.
+///
+/// Applied to a copy of `conv.metal` compiled at runtime; the real source is
+/// untouched.
+#[test]
+fn conv_params_layout_check_detects_a_moved_field() {
+    use crate::kernels::params::{expected_conv_layout, CONV_LAYOUT_KERNEL, CONV_LAYOUT_SLOTS};
+
+    let original = "    size_t h_k;\n    size_t w_k;\n    size_t stride;\n    size_t padding;\n    size_t dilation;\n};";
+    let swapped = "    size_t w_k;\n    size_t h_k;\n    size_t stride;\n    size_t padding;\n    size_t dilation;\n};";
+    assert!(
+        crate::source::CONV.contains(original),
+        "the struct this test mutates has been reworded; update the mutation"
+    );
+    let mutant = crate::source::CONV.replace(original, swapped);
+
+    let device = device();
+    let library = device.new_library_with_source(&mutant, None).unwrap();
+    let function = library.get_function(CONV_LAYOUT_KERNEL, None).unwrap();
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .unwrap();
+
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let out = device
+        .new_buffer(
+            CONV_LAYOUT_SLOTS * core::mem::size_of::<u32>(),
+            RESOURCE_OPTIONS,
+        )
+        .unwrap();
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_output_buffer(0, Some(&out), 0);
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let device_side: Vec<u32> = read_to_vec(&out, CONV_LAYOUT_SLOTS);
+    let disagreements: Vec<String> = expected_conv_layout()
+        .into_iter()
+        .enumerate()
+        .filter(|(slot, (_, rust))| device_side[*slot] != *rust)
+        .map(|(slot, (what, rust))| format!("{what}: metal {} vs rust {rust}", device_side[slot]))
+        .collect();
+
+    assert!(
+        disagreements
+            .iter()
+            .any(|d| d.starts_with("Im2colParams.h_k")),
+        "swapping h_k must be reported; got {disagreements:?}"
+    );
+    assert!(
+        disagreements
+            .iter()
+            .any(|d| d.starts_with("Im2colParams.w_k")),
+        "swapping w_k must be reported; got {disagreements:?}"
+    );
+    assert!(
+        !disagreements
+            .iter()
+            .any(|d| d.starts_with("sizeof(Im2colParams)")),
+        "the swap must not change sizeof, or it is not the silent case; got {disagreements:?}"
+    );
+}
+
+/// Every classical conv name has a `_packed` counterpart in the compiled
+/// library.
+///
+/// The same argument as `conv_names_resolve` and `packed_names_resolve`: an
+/// absent instantiation is not a compile error on either side, and #26 shipped
+/// exactly that for 48 variants.
+#[test]
+fn conv_packed_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let mut checked = 0usize;
+    for family in ConvKernel::ALL {
+        for (suffix, name) in family.variants() {
+            let packed = crate::kernels::params::packed_name(name);
+            kernels
+                .load_pipeline(&device, Source::Conv, packed.clone())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "conv.metal has no kernel named {packed:?} \
+                         (the packed form of {name:?}, ConvKernel::{}{} for {suffix:?}): {e:?}",
+                        family.stem(),
+                        family.tail(),
+                    )
+                });
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked, 55,
+        "expected a packed counterpart for all 55 declared conv variants, found {checked}"
+    );
+}
+
+/// `conv1d_depthwise_f16_k3` — LFM2's shape, and the only conv kernel on any
+/// LFM2 dispatch (22 per generation, at prefill; `DESIGN.md` §6.7 L7).
+///
+/// Bit-identical rather than approximately equal, for the reason the reduce
+/// tests give: the two variants come from one body, so any difference means the
+/// binding style changed what the kernel computed.
+#[test]
+fn conv_packed_matches_split_for_conv1d_depthwise_k() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (b, c, l_in, k_size, padding) = (2usize, 8usize, 16usize, 3usize, 2usize);
+    let shape = vec![b, c, l_in];
+    let l_out = l_in + 2 * padding - (k_size - 1);
+    let dst_el = b * c * l_out;
+
+    let src: Vec<f16> = (0..b * c * l_in)
+        .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 25.0))
+        .collect();
+    let weight: Vec<f16> = (0..c * k_size)
+        .map(|i| f16::from_f32(((i * 61 % 97) as f32 - 48.0) / 40.0))
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let w_buf = new_buffer(&device, &weight);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_conv1d_depthwise_k_with(
+            &device,
+            &encoder,
+            &kernels,
+            "conv1d_depthwise_f16_k3",
+            &shape,
+            (k_size, padding),
+            BufferOffset::zero_offset(&src_buf),
+            BufferOffset::zero_offset(&w_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "conv1d_depthwise_f16_k3 and its packed form disagree"
+    );
+}
+
+/// The generic depthwise kernel, which binds six scalars *and* two arrays.
+///
+/// Distinct from the `_k` variant above: this one takes `src_strides` as well
+/// as `src_dims`, so both arrays take the promoted-to-a-device-buffer path
+/// while six scalars are diverted. That is the combination where a renumbering
+/// error would land a buffer at the wrong index.
+#[test]
+fn conv_packed_matches_split_for_conv1d_depthwise() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (b, c, l_in, k_size, stride, padding, dilation) = (2usize, 8usize, 16usize, 3, 1, 2, 1);
+    let shape = vec![b, c, l_in];
+    let strides = vec![c * l_in, l_in, 1];
+    let l_out = (l_in + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
+    let dst_el = b * c * l_out;
+
+    let src: Vec<f32> = (0..b * c * l_in)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+        .collect();
+    let weight: Vec<f32> = (0..c * k_size)
+        .map(|i| ((i * 61 % 97) as f32 - 48.0) / 40.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let w_buf = new_buffer(&device, &weight);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_conv1d_depthwise_with(
+            &device,
+            &encoder,
+            &kernels,
+            "conv1d_depthwise_f32",
+            &shape,
+            &strides,
+            (k_size, stride, padding, dilation),
+            BufferOffset::zero_offset(&src_buf),
+            BufferOffset::zero_offset(&w_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "conv1d_depthwise_f32 and its packed form disagree"
+    );
+}
+
+/// `im2col` — eight consecutive `constant size_t` parameters, the largest
+/// packed block in the file at 64 bytes.
+///
+/// This is the family `DESIGN.md` §8.1c singles out as the one where reordering
+/// two same-typed arguments is silent, so it is the one whose parity check
+/// matters most.
+#[test]
+fn conv_packed_matches_split_for_im2col() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // Asymmetric deliberately: `h != w` and `h_k != w_k`, so that swapping two
+    // adjacent same-typed fields of `Im2colParams` changes the output. With a
+    // square kernel over a square input such a swap is a no-op and this test
+    // cannot fail -- found by mutation, and the reason these are not 8x8 / 3x3.
+    let (b, c, h, w) = (2usize, 3usize, 7usize, 9usize);
+    let (h_k, w_k, stride, padding, dilation) = (2usize, 3usize, 1usize, 1usize, 1usize);
+    let shape = vec![b, c, h, w];
+    let strides = vec![c * h * w, h * w, w, 1];
+    let h_out = (h + 2 * padding - dilation * (h_k - 1) - 1) / stride + 1;
+    let w_out = (w + 2 * padding - dilation * (w_k - 1) - 1) / stride + 1;
+    let dst_el = b * h_out * w_out * c * h_k * w_k;
+
+    let src: Vec<f32> = (0..b * c * h * w)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_im2col_strided_with(
+            &device,
+            &encoder,
+            &kernels,
+            "im2col_f32",
+            &shape,
+            &strides,
+            (h_k, w_k, stride, padding, dilation),
+            BufferOffset::zero_offset(&src_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "im2col_f32 and its packed form disagree"
+    );
+}
+
+/// `im2col1d` — the 1D form, six scalars and two arrays.
+#[test]
+fn conv_packed_matches_split_for_im2col1d() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (b, c, l_in, k_size, stride, padding, dilation) = (2usize, 4usize, 12usize, 3, 1, 1, 1);
+    let shape = vec![b, c, l_in];
+    let strides = vec![c * l_in, l_in, 1];
+    let l_out = (l_in + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
+    let dst_el = b * l_out * c * k_size;
+
+    let src: Vec<f16> = (0..b * c * l_in)
+        .map(|i| f16::from_f32(((i * 29 % 83) as f32 - 41.0) / 13.0))
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_im2col1d_strided_with(
+            &device,
+            &encoder,
+            &kernels,
+            "im2col1d_f16",
+            &shape,
+            &strides,
+            (k_size, stride, padding, dilation),
+            BufferOffset::zero_offset(&src_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "im2col1d_f16 and its packed form disagree"
+    );
+}
+
+/// `col2im1d` — six scalars and *no* arrays, so nothing takes the promoted
+/// path and slot 1 is the first real buffer.
+#[test]
+fn conv_packed_matches_split_for_col2im1d() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (b, l_in, c_out, k_size, stride) = (2usize, 6usize, 4usize, 3usize, 1usize);
+    let shape = vec![b, l_in, c_out, k_size];
+    let l_out = (l_in - 1) * stride + k_size;
+    let dst_el = b * c_out * l_out;
+
+    let src: Vec<f32> = (0..b * l_in * c_out * k_size)
+        .map(|i| ((i * 43 % 89) as f32 - 44.0) / 11.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_col2im1d_with(
+            &device,
+            &encoder,
+            &kernels,
+            "col2im1d_f32",
+            &shape,
+            k_size,
+            stride,
+            BufferOffset::zero_offset(&src_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "col2im1d_f32 and its packed form disagree"
+    );
+}
+
+/// `upsample_bilinear2d` — the mixed-width struct, and the family with pinned
+/// `[[buffer(N)]]` indices on its classical entry point.
+///
+/// The one packed block in the tree holding both hazards issue #38 names: three
+/// `bool` at 1 byte and two `float` between two `size_t`, so five of seven
+/// fields land at a padding-decided offset. Run with `align_corners = false`
+/// and one scale supplied, so all three `bool` are exercised at different
+/// values rather than all being false.
+#[test]
+fn conv_packed_matches_split_for_upsample_bilinear2d() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // `h != w` as well as `out_w != out_h`, so a swap of two adjacent
+    // same-typed params fields is observable in the output.
+    let (b, c, h, w) = (1usize, 2usize, 5usize, 3usize);
+    let (out_w, out_h) = (7usize, 4usize);
+    let shape = vec![b, c, h, w];
+    let strides = vec![c * h * w, h * w, w, 1];
+    let dst_el = out_w * out_h * b * c;
+
+    let src: Vec<f32> = (0..b * c * h * w)
+        .map(|i| ((i * 17 % 61) as f32 - 30.0) / 9.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_upsample_bilinear_2d_with(
+            &device,
+            &encoder,
+            &kernels,
+            "upsample_bilinear2d_f32",
+            &shape,
+            &strides,
+            out_w,
+            out_h,
+            false,
+            Some(1.25),
+            None,
+            BufferOffset::zero_offset(&src_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "upsample_bilinear2d_f32 and its packed form disagree"
+    );
+}
+
+/// `upsample_nearest2d` — two `size_t` then two `float`, the other mixed-width
+/// struct, and the simpler one.
+#[test]
+fn conv_packed_matches_split_for_upsample_nearest2d() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // `h != w` as well as `out_w != out_h`, so a swap of two adjacent
+    // same-typed params fields is observable in the output.
+    let (b, c, h, w) = (1usize, 2usize, 5usize, 3usize);
+    let (out_w, out_h) = (7usize, 4usize);
+    let shape = vec![b, c, h, w];
+    let strides = vec![c * h * w, h * w, w, 1];
+    let dst_el = out_w * out_h * b * c;
+
+    let src: Vec<f16> = (0..b * c * h * w)
+        .map(|i| f16::from_f32(((i * 17 % 61) as f32 - 30.0) / 9.0))
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_upsample_nearest_2d_with(
+            &device,
+            &encoder,
+            &kernels,
+            "upsample_nearest2d_f16",
+            &shape,
+            &strides,
+            out_w,
+            out_h,
+            BufferOffset::zero_offset(&src_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "upsample_nearest2d_f16 and its packed form disagree"
+    );
+}
+
+/// `avg_pool2d_u8` — the accumulator case.
+///
+/// `DESIGN.md` §8.1c: the integer `avg_pool2d` instantiations accumulate in
+/// their **own type** rather than widening, so their averaging truncates where
+/// it always did. The accumulator is a template parameter and not part of the
+/// binding, so a binding change must not move it — this is what proves it did
+/// not, on the dtype where truncation is observable.
+#[test]
+fn conv_packed_matches_split_for_avg_pool2d_u8() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // Asymmetric deliberately: `w_in != h_in`, `w_k != h_k` and
+    // `w_stride != h_stride`, so swapping two adjacent same-typed fields of
+    // `Pool2dParams` changes the output. Square windows at equal strides make
+    // such a swap a no-op, and the test then cannot fail.
+    let (b, c, w_in, h_in) = (1usize, 2usize, 9usize, 7usize);
+    let (w_k, h_k, w_stride, h_stride) = (3usize, 2usize, 2usize, 1usize);
+    let shape = vec![b, c, w_in, h_in];
+    let strides = vec![c * w_in * h_in, w_in * h_in, h_in, 1];
+    let out_w = (w_in - w_k) / w_stride + 1;
+    let out_h = (h_in - h_k) / h_stride + 1;
+    let dst_el = out_w * out_h * b * c;
+
+    // Values chosen so the u8 sum of a 3x3 window does not wrap, and so the
+    // integer division truncates rather than dividing evenly -- if the
+    // accumulator had silently widened, these are the outputs that would move.
+    let src: Vec<u8> = (0..b * c * w_in * h_in)
+        .map(|i| ((i * 7 % 23) + 1) as u8)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<u8>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_pool2d_with(
+            &device,
+            &encoder,
+            &kernels,
+            "avg_pool2d_u8",
+            &shape,
+            &strides,
+            out_w,
+            out_h,
+            w_k,
+            h_k,
+            w_stride,
+            h_stride,
+            &src_buf,
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<u8>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0], outs[1],
+        "avg_pool2d_u8 and its packed form disagree"
+    );
+}
+
+/// `max_pool2d_f32` — shares `Pool2dParams` with `avg_pool2d`, and has no
+/// accumulator of its own.
+#[test]
+fn conv_packed_matches_split_for_max_pool2d() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // Asymmetric deliberately: `w_in != h_in`, `w_k != h_k` and
+    // `w_stride != h_stride`, so swapping two adjacent same-typed fields of
+    // `Pool2dParams` changes the output. Square windows at equal strides make
+    // such a swap a no-op, and the test then cannot fail.
+    let (b, c, w_in, h_in) = (1usize, 2usize, 9usize, 7usize);
+    let (w_k, h_k, w_stride, h_stride) = (3usize, 2usize, 2usize, 1usize);
+    let shape = vec![b, c, w_in, h_in];
+    let strides = vec![c * w_in * h_in, w_in * h_in, h_in, 1];
+    let out_w = (w_in - w_k) / w_stride + 1;
+    let out_h = (h_in - h_k) / h_stride + 1;
+    let dst_el = out_w * out_h * b * c;
+
+    let src: Vec<f32> = (0..b * c * w_in * h_in)
+        .map(|i| ((i * 53 % 79) as f32 - 39.0) / 6.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_pool2d_with(
+            &device,
+            &encoder,
+            &kernels,
+            "max_pool2d_f32",
+            &shape,
+            &strides,
+            out_w,
+            out_h,
+            w_k,
+            h_k,
+            w_stride,
+            h_stride,
+            &src_buf,
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "max_pool2d_f32 and its packed form disagree"
+    );
+}
+
+/// `conv_transpose1d_u32` — four arrays promoted at once, and the second
+/// accumulator case.
+///
+/// Two things here that no other conv test covers: **four** `setBytes` arrays
+/// (`src_dims`, `src_strides`, `k_dims`, `k_strides`) all take the promoted
+/// path, so the buffer renumbering has the most to get wrong; and the integer
+/// instantiation accumulates in `uint32_t` rather than widening to float
+/// (`DESIGN.md` §8.1c).
+#[test]
+fn conv_packed_matches_split_for_conv_transpose1d_u32() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (b, c_in, l_in, c_out, l_k) = (1usize, 2usize, 5usize, 3usize, 3usize);
+    let (stride, padding, out_padding, dilation) = (1usize, 1usize, 0usize, 1usize);
+    let src_shape = vec![b, c_in, l_in];
+    let src_strides = vec![c_in * l_in, l_in, 1];
+    let k_shape = vec![c_in, c_out, l_k];
+    let k_strides = vec![c_out * l_k, l_k, 1];
+    let l_out = (l_in - 1) * stride + dilation * (l_k - 1) + out_padding + 1 - 2 * padding;
+    let dst_el = b * c_out * l_out;
+
+    let src: Vec<u32> = (0..b * c_in * l_in).map(|i| (i * 3 % 11) as u32).collect();
+    let kernel_w: Vec<u32> = (0..c_in * c_out * l_k)
+        .map(|i| (i * 5 % 7) as u32)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let k_buf = new_buffer(&device, &kernel_w);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<u32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_conv_transpose1d_with(
+            &device,
+            &encoder,
+            &kernels,
+            "conv_transpose1d_u32",
+            dilation,
+            stride,
+            padding,
+            out_padding,
+            c_out,
+            l_out,
+            b,
+            &src_shape,
+            &src_strides,
+            &k_shape,
+            &k_strides,
+            &src_buf,
+            0,
+            &k_buf,
+            0,
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<u32>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0], outs[1],
+        "conv_transpose1d_u32 and its packed form disagree"
+    );
+}
+
+/// `conv_transpose2d_f32` — six scalars and four arrays, the largest argument
+/// list in the file.
+#[test]
+fn conv_packed_matches_split_for_conv_transpose2d() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // `h_in != w_in` and `h_k != w_k`, so a swap of two adjacent same-typed
+    // `ConvTranspose2dParams` fields is observable.
+    let (b, c_in, h_in, w_in, c_out, h_k, w_k) = (1usize, 2usize, 5usize, 4usize, 2usize, 3, 2);
+    let (stride, padding, output_padding, dilation) = (1usize, 1usize, 0usize, 1usize);
+    let input_dims = vec![b, c_in, h_in, w_in];
+    let input_stride = vec![c_in * h_in * w_in, h_in * w_in, w_in, 1];
+    let kernel_dims = vec![c_in, c_out, h_k, w_k];
+    let kernel_stride = vec![c_out * h_k * w_k, h_k * w_k, w_k, 1];
+    let out_h = (h_in - 1) * stride + dilation * (h_k - 1) + output_padding + 1 - 2 * padding;
+    let out_w = (w_in - 1) * stride + dilation * (w_k - 1) + output_padding + 1 - 2 * padding;
+    let dst_el = b * c_out * out_h * out_w;
+
+    let src: Vec<f32> = (0..b * c_in * h_in * w_in)
+        .map(|i| ((i * 23 % 67) as f32 - 33.0) / 8.0)
+        .collect();
+    let kernel_w: Vec<f32> = (0..c_in * c_out * h_k * w_k)
+        .map(|i| ((i * 31 % 59) as f32 - 29.0) / 12.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let k_buf = new_buffer(&device, &kernel_w);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        let cfg = CallConvTranspose2dCfg {
+            dilation,
+            stride,
+            padding,
+            output_padding,
+            c_out,
+            out_w,
+            out_h,
+            b_size: b,
+            input_dims: &input_dims,
+            input_stride: &input_stride,
+            kernel_dims: &kernel_dims,
+            kernel_stride: &kernel_stride,
+            input_offset: 0,
+            kernel_offset: 0,
+        };
+        call_conv_transpose2d_with(
+            &device,
+            &encoder,
+            &kernels,
+            "conv_transpose2d_f32",
+            cfg,
+            &src_buf,
+            &k_buf,
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "conv_transpose2d_f32 and its packed form disagree"
+    );
+}
