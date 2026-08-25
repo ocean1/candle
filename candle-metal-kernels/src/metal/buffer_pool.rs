@@ -1193,6 +1193,52 @@ mod tests {
         assert_eq!(c.hits, 255);
     }
 
+    /// Fixed-shape work converges: the working set stops growing.
+    ///
+    /// This is the property the device-level
+    /// `repeated_identical_work_converges_to_bounded_reuse` is after, pinned
+    /// here where the pool is owned exclusively and the numbers are exact. At
+    /// device level several tests share one process-wide pool and trim each
+    /// other's free lists, so the same assertion can only be made qualitatively
+    /// there.
+    ///
+    /// The in-flight window is modelled directly: `depth` iterations are in
+    /// flight before any of them completes, which is what a command buffer
+    /// batching many dispatches does. So the pool must allocate `depth` buffers
+    /// and then **never allocate again**, however long the workload runs -- the
+    /// working set is a function of the window, not of the iteration count.
+    #[test]
+    fn fixed_shape_work_allocates_the_window_then_stops() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        const DEPTH: usize = 8;
+
+        // Steady state: `DEPTH` iterations in flight at any moment.
+        let mut in_flight: std::collections::VecDeque<Arc<PooledBuffer>> =
+            std::collections::VecDeque::new();
+        for _ in 0..DEPTH {
+            in_flight.push_back(alloc(&pool, &dev, 4096));
+        }
+
+        for _ in 0..1000 {
+            // Oldest completes and is released.
+            drop(in_flight.pop_front().expect("window is full"));
+            gpu_completes(&pool, &clock);
+            // A new iteration starts, which must reuse what just came back.
+            in_flight.push_back(alloc(&pool, &dev, 4096));
+        }
+
+        let c = pool.counters();
+        assert_eq!(
+            c.allocations, DEPTH as u64,
+            "allocated {} buffers for a window {DEPTH} deep; the working set is \
+             growing with the iteration count rather than with the window",
+            c.allocations
+        );
+        assert_eq!(c.hits, 1000, "every steady-state iteration should be a hit");
+    }
+
     /// Eviction must take the oldest free buffer, not whichever is convenient.
     /// The oldest is the one whose size has gone longest without being asked
     /// for, which in the growing case is the one that will never be asked for
