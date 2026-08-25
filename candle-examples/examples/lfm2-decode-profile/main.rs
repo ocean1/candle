@@ -640,5 +640,38 @@ fn main() -> Result<()> {
         profiling,
     );
 
+    // Pool footprint at the end of decode. Issue #8 took the pool from 7731 MB
+    // to 5509 MB and that bar has to hold; issue #23 holds buffers longer, so
+    // this is the number it has to be checked against.
+    if let Device::Metal(m) = &device {
+        let (s, p) = m.pool_occupancy();
+        println!(
+            "POOL shared_mb={:.1} shared_live={} shared_free={} \
+             private_mb={:.1} private_live={} private_free={} total_mb={:.1} total_buffers={}",
+            s.total_bytes() as f64 / (1024.0 * 1024.0),
+            s.live_buffers,
+            s.free_buffers,
+            p.total_bytes() as f64 / (1024.0 * 1024.0),
+            p.live_buffers,
+            p.free_buffers,
+            (s.total_bytes() + p.total_bytes()) as f64 / (1024.0 * 1024.0),
+            s.total_buffers() + p.total_buffers(),
+        );
+        let (sc, pc) = m.pool_counters();
+        println!(
+            "POOLC hits={} lookups={} allocations={} deferred={} drained={} evicted={} \
+             pending={} shared_pending_mb={:.1} private_pending_mb={:.1}",
+            sc.hits + pc.hits,
+            sc.lookups + pc.lookups,
+            sc.allocations + pc.allocations,
+            sc.deferred + pc.deferred,
+            sc.drained + pc.drained,
+            sc.evicted + pc.evicted,
+            sc.pending + pc.pending,
+            s.pending_bytes as f64 / (1024.0 * 1024.0),
+            p.pending_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+
     Ok(())
 }
