@@ -1,4 +1,5 @@
 use super::*;
+use crate::kernels::params::ParamStyle;
 use crate::metal::{Commands, ResidencySet};
 use core::ffi::c_void;
 use half::{bf16, f16};
@@ -3200,5 +3201,713 @@ fn packed_matches_split_for_sum_f32_strided() {
         outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
         outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
         "fast_sum_f32_strided and its packed form disagree"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #40 — unary, binary, cast and affine carry both binding styles.
+//
+// The same three checks issue #38 established for `reduce.metal`, applied to
+// the four elementwise families: every `_packed` name resolves against the
+// compiled library, the two styles agree bit for bit, and the packed structs'
+// layout is compared across the language boundary rather than asserted on each
+// side.
+// ---------------------------------------------------------------------------
+
+/// Run a layout kernel and return every disagreement against the Rust mirrors.
+///
+/// Shared by the four `*_params_layout_matches_metal` tests and by their
+/// mutation counterparts, so the mutation tests exercise the same comparison
+/// the real ones do rather than a re-implementation of it.
+fn layout_disagreements(
+    pipeline: &ComputePipeline,
+    expected: &[(&'static str, u32)],
+) -> Vec<String> {
+    let device = device();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let out = device
+        .new_buffer(
+            expected.len() * core::mem::size_of::<u32>(),
+            RESOURCE_OPTIONS,
+        )
+        .unwrap();
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_output_buffer(0, Some(&out), 0);
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let device_side: Vec<u32> = read_to_vec(&out, expected.len());
+    expected
+        .iter()
+        .enumerate()
+        .filter(|(slot, (_, rust))| device_side[*slot] != *rust)
+        .map(|(slot, (what, rust))| format!("{what}: metal {} vs rust {rust}", device_side[slot]))
+        .collect()
+}
+
+fn layout_pipeline(source: Source, name: &'static str) -> ComputePipeline {
+    let device = device();
+    let kernels = Kernels::new();
+    kernels.load_pipeline(&device, source, name).unwrap()
+}
+
+/// Compile a mutated copy of a `.metal` source and return its layout pipeline.
+///
+/// The real source is untouched: the mutation is applied to the `include_str!`ed
+/// text and compiled at runtime, which is available precisely because candle
+/// compiles `.metal` at runtime (`DESIGN.md` §8.1b).
+fn mutated_layout_pipeline(
+    source_text: &str,
+    original: &str,
+    mutated: &str,
+    kernel: &str,
+) -> ComputePipeline {
+    assert!(
+        source_text.contains(original),
+        "the struct this test mutates has been reworded; update the mutation"
+    );
+    let mutant = source_text.replace(original, mutated);
+    let device = device();
+    let library = device.new_library_with_source(&mutant, None).unwrap();
+    let function = library.get_function(kernel, None).unwrap();
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .unwrap()
+}
+
+#[test]
+fn unary_params_layout_matches_metal() {
+    let d = layout_disagreements(
+        &layout_pipeline(Source::Unary, crate::kernels::params::UNARY_LAYOUT_KERNEL),
+        &crate::kernels::params::expected_unary_layout(),
+    );
+    assert!(
+        d.is_empty(),
+        "packed parameter layout differs between unary.metal and params.rs.\n\
+         A field at the wrong offset is silent corruption, not a crash:\n  {}",
+        d.join("\n  ")
+    );
+}
+
+#[test]
+fn binary_params_layout_matches_metal() {
+    let d = layout_disagreements(
+        &layout_pipeline(Source::Binary, crate::kernels::params::BINARY_LAYOUT_KERNEL),
+        &crate::kernels::params::expected_binary_layout(),
+    );
+    assert!(
+        d.is_empty(),
+        "binary.metal vs params.rs:\n  {}",
+        d.join("\n  ")
+    );
+}
+
+#[test]
+fn cast_params_layout_matches_metal() {
+    let d = layout_disagreements(
+        &layout_pipeline(Source::Cast, crate::kernels::params::CAST_LAYOUT_KERNEL),
+        &crate::kernels::params::expected_cast_layout(),
+    );
+    assert!(
+        d.is_empty(),
+        "cast.metal vs params.rs:\n  {}",
+        d.join("\n  ")
+    );
+}
+
+#[test]
+fn affine_params_layout_matches_metal() {
+    let d = layout_disagreements(
+        &layout_pipeline(Source::Affine, crate::kernels::params::AFFINE_LAYOUT_KERNEL),
+        &crate::kernels::params::expected_affine_layout(),
+    );
+    assert!(
+        d.is_empty(),
+        "affine.metal vs params.rs:\n  {}",
+        d.join("\n  ")
+    );
+}
+
+/// The layout check must be able to fail, and must fail on *the silent case*.
+///
+/// `DESIGN.md` §15.1 #1 and `CONTRIBUTING.md` §3.1 #2: a test that cannot fail
+/// is not a test. The mutation **swaps two adjacent same-typed fields** --
+/// `Copy2dParams.d1` and `.d2`, both `int64_t`. That case is chosen over
+/// inserting or removing a field because it is the one nothing else catches:
+///
+/// * `sizeof` is unchanged, so the `static_assert` in `unary.metal` still passes;
+/// * both fields are `int64_t`, so nothing type-checks differently -- inserting
+///   a field of a *different* type is rejected by C++11 narrowing on the brace
+///   initializer before it ever reaches a GPU;
+/// * the kernel runs and copies a plausible but wrong rectangle.
+///
+/// It is `copy2d` deliberately: 140 of the 674 dispatches in a decode token
+/// (`DESIGN.md` §11.2), and `d1`/`d2` are exactly the pair whose swap would
+/// transpose a copy without changing its size.
+#[test]
+fn unary_params_layout_check_detects_a_moved_field() {
+    let pipeline = mutated_layout_pipeline(
+        crate::source::UNARY,
+        "struct Copy2dParams {\n    int64_t d1;\n    int64_t d2;",
+        "struct Copy2dParams {\n    int64_t d2;\n    int64_t d1;",
+        crate::kernels::params::UNARY_LAYOUT_KERNEL,
+    );
+    let d = layout_disagreements(&pipeline, &crate::kernels::params::expected_unary_layout());
+    assert!(
+        d.iter().any(|x| x.starts_with("Copy2dParams.d1")),
+        "swapping d1 must be reported; got {d:?}"
+    );
+    assert!(
+        d.iter().any(|x| x.starts_with("Copy2dParams.d2")),
+        "swapping d2 must be reported; got {d:?}"
+    );
+    assert!(
+        !d.iter().any(|x| x.starts_with("sizeof(Copy2dParams)")),
+        "the swap must not change sizeof, or it is not the silent case; got {d:?}"
+    );
+}
+
+/// The same, for `affine.metal` -- the file where the structs actually pad.
+///
+/// `AffineParams.mul` and `.add` are adjacent `float`s inside a struct whose
+/// alignment is set by a `size_t`, so swapping them changes neither `sizeof`
+/// (16) nor any type. An affine with `mul` and `add` transposed computes
+/// `x*add + mul` and produces entirely plausible numbers.
+#[test]
+fn affine_params_layout_check_detects_a_moved_field() {
+    let pipeline = mutated_layout_pipeline(
+        crate::source::AFFINE,
+        "struct AffineParams {\n    size_t dim;\n    float mul;\n    float add;\n};",
+        "struct AffineParams {\n    size_t dim;\n    float add;\n    float mul;\n};",
+        crate::kernels::params::AFFINE_LAYOUT_KERNEL,
+    );
+    let d = layout_disagreements(&pipeline, &crate::kernels::params::expected_affine_layout());
+    assert!(
+        d.iter().any(|x| x.starts_with("AffineParams.mul")),
+        "swapping mul must be reported; got {d:?}"
+    );
+    assert!(
+        d.iter().any(|x| x.starts_with("AffineParams.add")),
+        "swapping add must be reported; got {d:?}"
+    );
+    assert!(
+        !d.iter().any(|x| x.starts_with("sizeof(AffineParams)")),
+        "the swap must not change sizeof, or it is not the silent case; got {d:?}"
+    );
+}
+
+/// Every classical name in the four elementwise families has a `_packed`
+/// counterpart in the compiled library.
+///
+/// `DESIGN.md` §8.1b's argument applied to the new axis: an absent
+/// instantiation is not a compile error on either side, and the first symptom
+/// would be a `LoadFunctionError` inside a forward pass. #26 shipped precisely
+/// that for 48 variants, caught only by loading against the library.
+///
+/// Conditional dtypes (`bf16` behind `__HAVE_BFLOAT__`, `i64` behind
+/// `__METAL_VERSION__ >= 220`) are checked *relative to the classical name*: if
+/// the classical one resolves, the packed one must. That reads the guards off
+/// the compiled library rather than predicting which ones this machine's
+/// runtime compiler took.
+#[test]
+fn elementwise_packed_names_resolve() {
+    use crate::kernels::elementwise_names::{
+        affine_names, binary_names, cast_names, unary_names, Presence,
+    };
+    use crate::kernels::params::packed_name;
+
+    let device = device();
+    let kernels = Kernels::new();
+
+    /// One family's declared variants, with the source file named so a
+    /// failure says which `.metal` to look in.
+    type Family = (Source, Vec<(String, Presence)>, &'static str);
+
+    let families: [Family; 4] = [
+        (Source::Unary, unary_names(), "unary.metal"),
+        (Source::Binary, binary_names(), "binary.metal"),
+        (Source::Cast, cast_names(), "cast.metal"),
+        (Source::Affine, affine_names(), "affine.metal"),
+    ];
+
+    let mut required = 0usize;
+    let mut conditional_present = 0usize;
+    let mut conditional_absent = 0usize;
+
+    for (source, names, file) in families {
+        for (classical, presence) in names {
+            let classical_ok = kernels
+                .load_pipeline(&device, source, classical.clone())
+                .is_ok();
+            match presence {
+                Presence::Unconditional => assert!(
+                    classical_ok,
+                    "{file} has no kernel named {classical:?}; the declared axes in \
+                     elementwise_names.rs disagree with the file's instantiation list"
+                ),
+                Presence::Conditional => {
+                    if !classical_ok {
+                        conditional_absent += 1;
+                        continue;
+                    }
+                    conditional_present += 1;
+                }
+            }
+            let packed = packed_name(&classical);
+            kernels
+                .load_pipeline(&device, source, packed.clone())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{file} has no kernel named {packed:?} (the packed form of \
+                         {classical:?}), so this variant exists in only one binding \
+                         style: {e:?}"
+                    )
+                });
+            required += 1;
+        }
+    }
+
+    // A floor rather than an exact count: the conditional dtypes legitimately
+    // vary with the runtime compiler, so pinning a total would make this test
+    // fail on a different machine for a reason that is not a defect. The floor
+    // still catches a family silently dropping out of the loop.
+    assert!(
+        required >= 700,
+        "expected at least 700 packed variants to resolve, got {required} \
+         ({conditional_present} conditional present, {conditional_absent} absent)"
+    );
+    println!(
+        "resolved {required} packed variants \
+         ({conditional_present} conditional present, {conditional_absent} absent)"
+    );
+}
+
+// --- Bit-identical parity, per family -------------------------------------
+//
+// Bit-identical rather than approximately equal, deliberately. The two variants
+// are instantiated from one body, so anything but an exact match means the
+// binding style changed what the kernel computed, which is the question this
+// issue asks. `DESIGN.md` §2.3 makes the same argument for the engine as a
+// whole, and issue #38 established it for `reduce.metal`.
+//
+// The arms cover the decode-path kernels by name: `copy2d_f16` (140 dispatches
+// per token), `bmul_f16` (96), `badd_f16` (60), `silu_f16` (30),
+// `cast_f16_f32` (25), `cast_f32_f16` (8) and `affine_f32` (8) -- 367 of 674
+// (`DESIGN.md` §11.2), which is what this issue exists to convert.
+
+/// `silu_f16` -- 30 dispatches per decode token.
+#[test]
+fn packed_matches_split_for_unary_silu_f16() {
+    let device = device();
+    let kernels = Kernels::new();
+    let v: Vec<f16> = (0..1024)
+        .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 25.0))
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &v);
+        call_unary_contiguous_with(
+            &device,
+            &encoder,
+            &kernels,
+            unary::contiguous::silu::HALF,
+            core::mem::size_of::<f16>(),
+            v.len(),
+            BufferOffset::zero_offset(&input),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, v.len()));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "silu_f16 and silu_f16_packed disagree"
+    );
+}
+
+/// The strided unary path, which additionally exercises `dims` and `strides`
+/// being promoted out of `setBytes` into a device buffer -- the binding whose
+/// renumbering is the silent-corruption case issue #38 records.
+#[test]
+fn packed_matches_split_for_unary_strided_f32() {
+    let device = device();
+    let kernels = Kernels::new();
+    let shape = [4usize, 8, 16];
+    let n: usize = shape.iter().product();
+    let strides = [1usize, 4, 32];
+    let v: Vec<f32> = (0..n)
+        .map(|i| ((i * 29 % 83) as f32 - 41.0) / 13.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &v);
+        call_unary_strided_with(
+            &device,
+            &encoder,
+            &kernels,
+            unary::strided::cos::FLOAT,
+            &shape,
+            BufferOffset::zero_offset(&input),
+            &strides,
+            BufferOffset::zero_offset(&output),
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, n));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "cos_f32_strided and its packed form disagree"
+    );
+}
+
+/// `copy2d_f16` -- **140 dispatches per decode token, the largest single kernel
+/// in the trace** (`DESIGN.md` §11.2). Its four `int64_t` scalars are the
+/// widest packed block in this change.
+#[test]
+fn packed_matches_split_for_copy2d_f16() {
+    let device = device();
+    let kernels = Kernels::new();
+    let (d1, d2, src_s, dst_s) = (12usize, 20usize, 32usize, 24usize);
+    let src: Vec<f16> = (0..d1 * src_s)
+        .map(|i| f16::from_f32((i % 251) as f32 - 125.0))
+        .collect();
+    let dst_init: Vec<f16> = vec![f16::from_f32(0.0); d1 * dst_s];
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &src);
+        let output = new_buffer(&device, &dst_init);
+        call_copy2d_with(
+            &device,
+            &encoder,
+            &kernels,
+            unary::copy2d::HALF,
+            &input,
+            &output,
+            d1,
+            d2,
+            src_s,
+            dst_s,
+            0,
+            0,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, d1 * dst_s));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "copy2d_f16 and copy2d_f16_packed disagree"
+    );
+    // Guard against both arms being trivially zero, which would make the
+    // comparison vacuous: a kernel that does nothing agrees with itself.
+    assert!(
+        outs[0].iter().any(|x| x.to_f32() != 0.0),
+        "copy2d wrote nothing; the parity comparison would be vacuous"
+    );
+}
+
+/// `bmul_f16` -- 96 dispatches per decode token, the largest binary.
+#[test]
+fn packed_matches_split_for_binary_bmul_f16() {
+    let device = device();
+    let kernels = Kernels::new();
+    let n = 1024usize;
+    let l: Vec<f16> = (0..n)
+        .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 25.0))
+        .collect();
+    let r: Vec<f16> = (0..n)
+        .map(|i| f16::from_f32(((i * 61 % 97) as f32 - 48.0) / 7.0))
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let left = new_buffer(&device, &l);
+        let right = new_buffer(&device, &r);
+        let output = new_buffer(&device, &l);
+        call_binary_contiguous_with(
+            &device,
+            &encoder,
+            &kernels,
+            "bmul_f16",
+            core::mem::size_of::<f16>(),
+            n,
+            BufferOffset::zero_offset(&left),
+            BufferOffset::zero_offset(&right),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, n));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "bmul_f16 and bmul_f16_packed disagree"
+    );
+}
+
+/// `badd_f16` strided -- 60 dispatches per decode token, and this arm binds
+/// **three** arrays (`dims`, `left_strides`, `right_strides`) where the other
+/// families bind two. That is the widest renumbering case in the change.
+#[test]
+fn packed_matches_split_for_binary_badd_f16_strided() {
+    let device = device();
+    let kernels = Kernels::new();
+    let shape = [4usize, 8, 16];
+    let n: usize = shape.iter().product();
+    let ls = [1usize, 4, 32];
+    let rs = [128usize, 16, 1];
+    let l: Vec<f16> = (0..n)
+        .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 25.0))
+        .collect();
+    let r: Vec<f16> = (0..n)
+        .map(|i| f16::from_f32(((i * 61 % 97) as f32 - 48.0) / 7.0))
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let left = new_buffer(&device, &l);
+        let right = new_buffer(&device, &r);
+        let output = new_buffer(&device, &l);
+        call_binary_strided_with(
+            &device,
+            &encoder,
+            &kernels,
+            "badd_f16_strided",
+            core::mem::size_of::<f16>(),
+            &shape,
+            BufferOffset::zero_offset(&left),
+            &ls,
+            BufferOffset::zero_offset(&right),
+            &rs,
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, n));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "badd_f16_strided and its packed form disagree"
+    );
+}
+
+/// `cast_f16_f32` -- 25 dispatches per decode token, the F32 upcast of K and V.
+#[test]
+fn packed_matches_split_for_cast_f16_f32() {
+    let device = device();
+    let kernels = Kernels::new();
+    let n = 1024usize;
+    let v: Vec<f16> = (0..n)
+        .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 25.0))
+        .collect();
+    let zero: Vec<f32> = vec![0.0; n];
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &zero);
+        call_cast_contiguous_with(
+            &device,
+            &encoder,
+            &kernels,
+            "cast_f16_f32",
+            core::mem::size_of::<f16>(),
+            n,
+            BufferOffset::zero_offset(&input),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, n));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "cast_f16_f32 and its packed form disagree"
+    );
+}
+
+/// `affine_f32` -- 8 dispatches per decode token, the softmax scale.
+///
+/// This is the arm that exercises the padded struct: `AffineParams` is
+/// `{size_t, float, float}`, 16 bytes rather than the 12 its fields sum to. If
+/// the trailing pad were omitted the kernel would read `add` from beyond the
+/// block, and `mul`/`add` transposed would compute `x*add + mul`.
+#[test]
+fn packed_matches_split_for_affine_f32() {
+    let device = device();
+    let kernels = Kernels::new();
+    let n = 1024usize;
+    let v: Vec<f32> = (0..n)
+        .map(|i| ((i * 29 % 83) as f32 - 41.0) / 13.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &v);
+        call_affine_with(
+            &device,
+            &encoder,
+            &kernels,
+            "affine_f32",
+            core::mem::size_of::<f32>(),
+            n,
+            BufferOffset::zero_offset(&input),
+            &output,
+            // Deliberately distinct and non-commutative under a swap, so a
+            // mul/add transposition cannot pass by coincidence.
+            2.5,
+            -0.75,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, n));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "affine_f32 and affine_f32_packed disagree"
+    );
+}
+
+/// `powf` uses the one-float `ScaleParams` block rather than `AffineParams`.
+///
+/// Worth its own arm because sharing a struct between the two-float and
+/// one-float families is the mistake that would compile, resolve, and read a
+/// fourth field that the capture never wrote.
+#[test]
+fn packed_matches_split_for_powf_f32() {
+    let device = device();
+    let kernels = Kernels::new();
+    let n = 512usize;
+    let v: Vec<f32> = (0..n).map(|i| 1.0 + (i % 17) as f32 / 4.0).collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &v);
+        call_powf_with(
+            &device,
+            &encoder,
+            &kernels,
+            "powf_f32",
+            core::mem::size_of::<f32>(),
+            n,
+            BufferOffset::zero_offset(&input),
+            &output,
+            1.75,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, n));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "powf_f32 and its packed form disagree"
+    );
+}
+
+/// The strided affine, whose block is `{size_t, size_t, float, float}` -- 24
+/// bytes, the largest interior-padding case here -- and which also promotes
+/// `dims` and `strides` to buffers.
+#[test]
+fn packed_matches_split_for_affine_f32_strided() {
+    let device = device();
+    let kernels = Kernels::new();
+    let shape = [4usize, 8, 16];
+    let n: usize = shape.iter().product();
+    let strides = [1usize, 4, 32];
+    let v: Vec<f32> = (0..n)
+        .map(|i| ((i * 29 % 83) as f32 - 41.0) / 13.0)
+        .collect();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &v);
+        let output = new_buffer(&device, &v);
+        call_affine_strided_with(
+            &device,
+            &encoder,
+            &kernels,
+            "affine_f32_strided",
+            &shape,
+            BufferOffset::zero_offset(&input),
+            &strides,
+            &output,
+            2.5,
+            -0.75,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, n));
+    }
+    assert_eq!(
+        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "affine_f32_strided and its packed form disagree"
     );
 }

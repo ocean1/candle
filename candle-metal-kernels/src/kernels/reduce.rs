@@ -2,12 +2,13 @@ use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
 use crate::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
-    Output, Source, RESOURCE_OPTIONS,
+    Output, Source,
 };
 use objc2_metal::MTLSize;
 
 use crate::kernels::params::{
-    NormParams, ReduceParams, RopeIParams, RopeParams, RopeThdParams, SoftmaxParams,
+    begin_packed_params, finish_packed_params, NormParams, ParamStyle, ReduceParams, RopeIParams,
+    RopeParams, RopeThdParams, SoftmaxParams,
 };
 
 /// Trailing alignment of each packed block, so its length matches the `sizeof`
@@ -40,105 +41,6 @@ const ROPE_THD_PARAMS_ALIGN: usize = core::mem::align_of::<RopeThdParams>();
 // reduce and arg-reduce families already did. That is a no-op for the classical
 // path (the same low four bytes reach the same slot), and it is why the LFM2
 // digests are unchanged.
-
-/// How a kernel's scalars reach it.
-///
-/// `Split` is what candle has always done: one `setBytes` per scalar. `Packed`
-/// puts them in a device buffer instead, which is the only form an ICB command
-/// can express (`DESIGN.md` §3.7b, issue #38).
-///
-/// Both are compiled into the same metallib from the same kernel body, so this
-/// selects a `[[host_name]]` and nothing more -- a compile-tier variant axis in
-/// the sense of `DESIGN.md` §7.1, alongside dtype. Keeping both is what makes
-/// the A/B free: same inputs, two pipelines, compare outputs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ParamStyle {
-    /// Inline constants via `setBytes`. The default and the correctness bar.
-    #[default]
-    Split,
-    /// One `device const Params*`, bindable by `setKernelBuffer`.
-    Packed,
-}
-
-impl ParamStyle {
-    /// The `[[host_name]]` to load for this style.
-    ///
-    /// `_packed` is appended after the dtype and any `_strided`, matching the
-    /// `init_*` macros in `reduce.metal`. The resolution test in `tests.rs`
-    /// checks both spellings against the compiled library rather than against
-    /// each other, which is `DESIGN.md` §8.1b's argument and what caught a
-    /// whole family of absent names during #26.
-    ///
-    /// Returns `KernelName` rather than a string so the classical path keeps
-    /// its `&'static str` and allocates nothing: the pipeline cache is keyed on
-    /// this, and it is what the per-token path hits (§15.2 #10).
-    fn kernel_name(self, classical: &'static str) -> crate::kernel::KernelName {
-        match self {
-            ParamStyle::Split => crate::kernel::KernelName::from(classical),
-            ParamStyle::Packed => {
-                crate::kernel::KernelName::from(crate::kernels::params::packed_name(classical))
-            }
-        }
-    }
-}
-
-/// Bind the scalars `f` sets, either inline or as one packed buffer.
-///
-/// The packed block is built by letting `f` run exactly as it does on the
-/// classical path -- `EncoderParam::set_param` diverts each scalar into the
-/// capture instead of calling `setBytes` -- so the two styles cannot disagree
-/// about which values are bound or in what order. That is the property worth
-/// having: a hand-written packing struct beside a `set_params!` call is two
-/// declarations of one thing, and `DESIGN.md` §8.1b is about not having those.
-///
-/// The staging buffers are per-call, which is deliberate for this change and is
-/// *not* what a decode path should do. This exists to prove the mechanism and
-/// make the A/B free; a real ICB path wants a plan-owned constants buffer
-/// (`DESIGN.md` §4.4, §15.2 #8) written once and re-pointed per step, which is
-/// the same object `KvDescriptor` is in §10.5. Recorded here rather than hidden,
-/// because an allocation per dispatch would violate §15.2 #10 if it ever became
-/// the default -- and it is why no performance claim is made for `Packed`.
-///
-/// The returned buffers must outlive the dispatch, so the caller holds them
-/// until after `dispatch_thread_groups` rather than dropping them here.
-#[must_use = "the staging buffers must outlive the dispatch"]
-fn begin_packed_params(
-    encoder: &ComputeCommandEncoder,
-    style: ParamStyle,
-) -> Option<&ComputeCommandEncoder> {
-    match style {
-        ParamStyle::Split => None,
-        ParamStyle::Packed => {
-            encoder.begin_param_capture();
-            Some(encoder)
-        }
-    }
-}
-
-/// Close a capture, upload the packed block, and bind it at slot 0.
-///
-/// Returns every buffer that has to stay alive until the dispatch completes:
-/// the params block itself, plus any array promoted out of `setBytes`.
-fn finish_packed_params(
-    device: &Device,
-    encoder: &ComputeCommandEncoder,
-    style: ParamStyle,
-    align: usize,
-) -> Result<Vec<Buffer>, MetalKernelError> {
-    if style == ParamStyle::Split {
-        return Ok(Vec::new());
-    }
-    let (bytes, mut staged) = encoder.end_param_capture(align);
-    let params = device.new_buffer_with_data(
-        bytes.as_ptr() as *const std::ffi::c_void,
-        bytes.len(),
-        RESOURCE_OPTIONS,
-    )?;
-    // Slot 0, after the capture has closed, so this is not renumbered.
-    encoder.set_input_buffer(0, Some(&params), 0);
-    staged.push(params);
-    Ok(staged)
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_reduce_contiguous(

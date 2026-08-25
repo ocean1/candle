@@ -3,6 +3,7 @@ pub mod binary;
 pub mod cast;
 pub mod conv_names;
 pub mod convolution;
+pub mod elementwise_names;
 pub mod fill;
 pub mod indexing;
 mod macros;
@@ -18,14 +19,23 @@ pub mod ternary;
 pub mod unary;
 
 pub use affine::*;
-pub use binary::{call_binary_contiguous, call_binary_strided};
-pub use cast::{call_cast_contiguous, call_cast_strided};
+pub use binary::{
+    call_binary_contiguous, call_binary_contiguous_with, call_binary_strided,
+    call_binary_strided_with,
+};
+pub use cast::{
+    call_cast_contiguous, call_cast_contiguous_with, call_cast_strided, call_cast_strided_with,
+};
 pub use conv_names::ConvKernel;
 pub use convolution::*;
 pub use fill::*;
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
-pub use params::{NormParams, ReduceParams, RopeIParams, RopeParams, RopeThdParams, SoftmaxParams};
+pub use params::{
+    AffineParams, AffineStridedParams, BinaryParams, BinaryStridedParams, CastParams,
+    CastStridedParams, Copy2dParams, NormParams, ParamStyle, ReduceParams, RopeIParams, RopeParams,
+    RopeThdParams, ScaleParams, ScaleStridedParams, SoftmaxParams, UnaryParams, UnaryStridedParams,
+};
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,
 };

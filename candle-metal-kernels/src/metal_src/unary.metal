@@ -3,11 +3,20 @@
 using namespace metal;
 
 // Utils
+//
+// Templated on the pointer *type* rather than written once per address space.
+// The classical entry points pass `constant size_t *`; the packed ones pass
+// `device const size_t *`, because an ICB command can bind a buffer but has no
+// `setBytes` at all (`DESIGN.md` §3.7c). Deducing the address space from the
+// pointer type is what lets one body serve both -- the same move issue #38 made
+// for `reduce.metal`'s `strided_indexer`, and it is why no arithmetic is
+// duplicated here.
+template <typename PtrT>
 METAL_FUNC uint get_strided_index(
     uint idx,
-    constant size_t &num_dims,
-    constant size_t *dims,
-    constant size_t *strides
+    size_t num_dims,
+    PtrT dims,
+    PtrT strides
 ) {
     uint strided_i = 0;
     for (uint d = 0; d < num_dims; d++) {
@@ -33,13 +42,61 @@ constexpr uint work_per_thread() {
     return div_ceil<8, sizeof(T)>();
 }
 
+// Packed parameter blocks.
+//
+// An ICB command cannot carry an inline constant -- `MTLIndirectComputeCommand`
+// has no `setBytes` in any form (`DESIGN.md` §3.7c) -- so every scalar a kernel
+// takes as `constant size_t &n` has to arrive in a buffer instead. These are the
+// structs the `_packed` entry points read, mirrored by `#[repr(C)]` types in
+// `kernels/params.rs` and checked against them by `unary_params_layout`.
+//
+// `size_t` and `int64_t` are both 8 bytes in MSL, so these are 8-aligned --
+// unlike `reduce.metal`'s `uint` structs, which are 4-aligned. That difference
+// is why the layout check ships the numbers across the boundary rather than
+// trusting either side to be right about padding.
+//
+// `dims` and `strides` are deliberately not fields: their length comes from the
+// tensor's layout, not from the struct. They stay separate bindings, which an
+// ICB can express -- `setKernelBuffer` binds a buffer of any length.
+struct UnaryParams {
+    size_t dim;
+};
+
+struct UnaryStridedParams {
+    size_t dim;
+    size_t num_dims;
+};
+
+// `copy2d` is the largest single kernel in a decode token -- 140 of 674
+// dispatches (`DESIGN.md` §11.2), the KV `Tensor::cat` and the conv-state
+// shuffle. Its four scalars are `int64_t`, not `size_t`, which is a real
+// distinction: they are signed, and narrowing them here would be a numeric
+// change smuggled in beside a binding change.
+struct Copy2dParams {
+    int64_t d1;
+    int64_t d2;
+    int64_t src_s;
+    int64_t dst_s;
+};
+
 // Kernels
-template <typename T, typename U, typename unary, int W = work_per_thread<T>()>
-[[kernel]] void unary_kernel(
-    constant size_t &dim,
+//
+// One body per kernel, two entry points around it. The classical wrapper binds
+// its scalars with `setBytes` exactly as before; the `_packed` one reads them
+// from a single `device const Params*`. Neither the arithmetic nor the loop
+// structure is duplicated, so the two styles cannot compute different things --
+// which is what makes the bit-identical parity test meaningful rather than
+// merely reassuring.
+//
+// Unlike `reduce.metal`, nothing here declares threadgroup memory, so the
+// whole-body-plus-two-thin-wrappers factoring that #38 could not use does work
+// in this file.
+template <typename T, typename U, typename unary, int W>
+METAL_FUNC void unary_body(
+    size_t dim,
     device const T* input,
     device U* output,
-    uint tid [[thread_position_in_grid]]
+    uint tid
 ) {
     unary op;
     const uint step = div_ceil<W>(dim);
@@ -47,6 +104,46 @@ template <typename T, typename U, typename unary, int W = work_per_thread<T>()>
     for (uint i = tid; i < dim; i += step) {
         output[i] = static_cast<U>(op(input[i]));
     }
+}
+
+template <typename T, typename U, typename unary, int W = work_per_thread<T>()>
+[[kernel]] void unary_kernel(
+    constant size_t &dim,
+    device const T* input,
+    device U* output,
+    uint tid [[thread_position_in_grid]]
+) {
+    unary_body<T, U, unary, W>(dim, input, output, tid);
+}
+
+template <typename T, typename U, typename unary, int W = work_per_thread<T>()>
+[[kernel]] void unary_kernel_packed(
+    device const UnaryParams *pp,
+    device const T* input,
+    device U* output,
+    uint tid [[thread_position_in_grid]]
+) {
+    unary_body<T, U, unary, W>(pp->dim, input, output, tid);
+}
+
+// `InPtrT` is templated alongside `PtrT` so the classical wrapper keeps its
+// `constant const T *input` exactly as it was. That address space is not
+// incidental -- changing it would be a behaviour change to the classical path
+// smuggled in beside a binding change.
+template <typename T, typename U, typename unary, typename PtrT, typename InPtrT>
+METAL_FUNC void unary_strided_body(
+    size_t dim,
+    size_t num_dims,
+    PtrT dims,
+    PtrT strides,
+    InPtrT input,
+    device U *output,
+    uint tid
+) {
+    unary op;
+    if (tid >= dim) return;
+    uint idx = get_strided_index(tid, num_dims, dims, strides);
+    output[tid] = static_cast<U>(op(input[idx]));
 }
 
 template <typename T, typename U, typename unary>
@@ -59,10 +156,35 @@ template <typename T, typename U, typename unary>
     device U *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    unary op;
-    if (tid >= dim) return;
-    uint idx = get_strided_index(tid, num_dims, dims, strides);
-    output[tid] = static_cast<U>(op(input[idx]));
+    unary_strided_body<T, U, unary, constant size_t *, constant const T *>(
+        dim, num_dims, dims, strides, input, output, tid);
+}
+
+template <typename T, typename U, typename unary>
+[[kernel]] void unary_kernel_strided_packed(
+    device const UnaryStridedParams *pp,
+    device const size_t *dims,
+    device const size_t *strides,
+    constant const T *input,
+    device U *output,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    unary_strided_body<T, U, unary, device const size_t *, constant const T *>(
+        pp->dim, pp->num_dims, dims, strides, input, output, tid);
+}
+
+template <typename T, int W>
+METAL_FUNC void const_set_body(
+    size_t dim,
+    device const T &input,
+    device T *output,
+    uint tid
+) {
+    const uint step = div_ceil<W>(dim);
+    #pragma clang loop unroll(full)
+    for (uint i = tid; i < dim; i += step) {
+        output[i] = input;
+    }
 }
 
 template <typename T, int W = work_per_thread<T>()>
@@ -72,11 +194,32 @@ template <typename T, int W = work_per_thread<T>()>
     device T *output,
     uint tid [[thread_position_in_grid]]
 ) {
-    const uint step = div_ceil<W>(dim);
-    #pragma clang loop unroll(full)
-    for (uint i = tid; i < dim; i += step) {
-        output[i] = input;
-    }
+    const_set_body<T, W>(dim, input, output, tid);
+}
+
+template <typename T, int W = work_per_thread<T>()>
+[[kernel]] void const_set_packed(
+    device const UnaryParams *pp,
+    device const T &input,
+    device T *output,
+    uint tid [[thread_position_in_grid]]
+) {
+    const_set_body<T, W>(pp->dim, input, output, tid);
+}
+
+template <typename T, typename PtrT>
+METAL_FUNC void const_set_strided_body(
+    size_t dim,
+    size_t num_dims,
+    PtrT dims,
+    PtrT strides,
+    device const T &input,
+    device T *output,
+    uint tid
+) {
+    if (tid >= dim) return;
+    uint idx = get_strided_index(tid, num_dims, dims, strides);
+    output[idx] = input;
 }
 
 template <typename T>
@@ -89,9 +232,37 @@ template <typename T>
     device T *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    if (tid >= dim) return;
-    uint idx = get_strided_index(tid, num_dims, dims, strides);
-    output[idx] = input;
+    const_set_strided_body<T, constant size_t *>(
+        dim, num_dims, dims, strides, input, output, tid);
+}
+
+template <typename T>
+[[kernel]] void const_set_strided_packed(
+    device const UnaryStridedParams *pp,
+    device const size_t *dims,
+    device const size_t *strides,
+    device const T &input,
+    device T *output,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    const_set_strided_body<T, device const size_t *>(
+        pp->dim, pp->num_dims, dims, strides, input, output, tid);
+}
+
+template <typename T>
+METAL_FUNC void copy2d_body(
+    int64_t d1,
+    int64_t d2,
+    int64_t src_s,
+    int64_t dst_s,
+    device const T *input,
+    device T *output,
+    uint2 idx
+) {
+    if (idx.x >= d1 || idx.y >= d2) return;
+    int64_t src_idx = idx.x * src_s + idx.y;
+    int64_t dst_idx = idx.x * dst_s + idx.y;
+    output[dst_idx] = input[src_idx];
 }
 
 template <typename T>
@@ -104,10 +275,17 @@ template <typename T>
     device T *output,
     uint2 idx [[thread_position_in_grid]]
 ) {
-    if (idx.x >= d1 || idx.y >= d2) return;
-    int64_t src_idx = idx.x * src_s + idx.y;
-    int64_t dst_idx = idx.x * dst_s + idx.y;
-    output[dst_idx] = input[src_idx];
+    copy2d_body<T>(d1, d2, src_s, dst_s, input, output, idx);
+}
+
+template <typename T>
+[[kernel]] void copy2d_packed(
+    device const Copy2dParams *pp,
+    device const T *input,
+    device T *output,
+    uint2 idx [[thread_position_in_grid]]
+) {
+    copy2d_body<T>(pp->d1, pp->d2, pp->src_s, pp->dst_s, input, output, idx);
 }
 
 // Unary functions
@@ -198,13 +376,70 @@ define_unary_op(usigmoid, sigmoid(x));
 // This has been an issue for the encodec example.
 define_unary_op(utanh, precise::tanh(x));
 
+// Layout, asserted rather than hoped.
+//
+// A field at the wrong offset does not crash: the kernel reads a well-formed
+// number from the wrong place and computes a plausible wrong answer, which
+// under `HazardTrackingModeUntracked` is the failure mode `DESIGN.md` §3.5 and
+// §15.1 both single out.
+//
+// Only sizes and alignments are `static_assert`ed. Offsets cannot be: MSL has
+// no `<cstddef>` and the null-pointer-member form of `offsetof` is not a
+// constant expression. They are reported by `unary_params_layout` below and
+// compared against Rust's `offset_of!`, which is the stronger check regardless
+// -- a `static_assert` on either side proves only that side agrees with itself.
+static_assert(sizeof(UnaryParams) == 8, "UnaryParams layout");
+static_assert(alignof(UnaryParams) == 8, "UnaryParams alignment");
+
+static_assert(sizeof(UnaryStridedParams) == 16, "UnaryStridedParams layout");
+static_assert(alignof(UnaryStridedParams) == 8, "UnaryStridedParams alignment");
+
+static_assert(sizeof(Copy2dParams) == 32, "Copy2dParams layout");
+static_assert(alignof(Copy2dParams) == 8, "Copy2dParams alignment");
+
+// The offset is taken from a real `thread` instance rather than the usual
+// null-pointer form, which MSL rejects in constant evaluation. Measuring it at
+// runtime is what this kernel is for.
+#define offsetof_rt(S, F) \
+    ((uint)((thread const char *)&(probe_##S.F) - (thread const char *)&probe_##S))
+
+[[kernel]] void unary_params_layout(
+    device uint *out,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    if (tid != 0) { return; }
+    UnaryParams        probe_UnaryParams;
+    UnaryStridedParams probe_UnaryStridedParams;
+    Copy2dParams       probe_Copy2dParams;
+    out[0] = sizeof(UnaryParams);
+    out[1] = offsetof_rt(UnaryParams, dim);
+
+    out[2] = sizeof(UnaryStridedParams);
+    out[3] = offsetof_rt(UnaryStridedParams, dim);
+    out[4] = offsetof_rt(UnaryStridedParams, num_dims);
+
+    out[5] = sizeof(Copy2dParams);
+    out[6] = offsetof_rt(Copy2dParams, d1);
+    out[7] = offsetof_rt(Copy2dParams, d2);
+    out[8] = offsetof_rt(Copy2dParams, src_s);
+    out[9] = offsetof_rt(Copy2dParams, dst_s);
+}
+
 // Macros to help initialize kernels
 #define init_kernel(name, func, ...) \
   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
 
-#define init_unary(op_name, unary_op, tname, t)                                         \
-    init_kernel(#op_name "_" #tname, unary_kernel, t, t, unary_op)                      \
-    init_kernel(#op_name "_" #tname "_strided", unary_kernel_strided, t, t, unary_op)
+// Both binding styles from one instantiation row, so a variant cannot exist in
+// one style and not the other. `_packed` is a name segment appended after the
+// dtype and any `_strided`, and `packed_names_resolve` checks every result
+// against the compiled library rather than against this macro -- which is
+// `DESIGN.md` §8.1b's argument, and #26 shipped 48 names absent from a metallib
+// that compiled cleanly.
+#define init_unary(op_name, unary_op, tname, t)                                                        \
+    init_kernel(#op_name "_" #tname, unary_kernel, t, t, unary_op)                                     \
+    init_kernel(#op_name "_" #tname "_packed", unary_kernel_packed, t, t, unary_op)                    \
+    init_kernel(#op_name "_" #tname "_strided", unary_kernel_strided, t, t, unary_op)                  \
+    init_kernel(#op_name "_" #tname "_strided_packed", unary_kernel_strided_packed, t, t, unary_op)
 
 #if defined(__HAVE_BFLOAT__)
 #define init_unary_float(op_name, unary_op)   \
@@ -217,12 +452,15 @@ define_unary_op(utanh, precise::tanh(x));
     init_unary(op_name, unary_op, f16, half)
 #endif
 
-#define init_copy2d(tname, t)  \
-    init_kernel("copy2d_" #tname, copy2d, t)
+#define init_copy2d(tname, t)                                       \
+    init_kernel("copy2d_" #tname, copy2d, t)                        \
+    init_kernel("copy2d_" #tname "_packed", copy2d_packed, t)
 
-#define init_const_set(tname, t)                    \
-    init_kernel("const_set_" #tname, const_set, t)  \
-    init_kernel("const_set_" #tname "_strided", const_set_strided, t)
+#define init_const_set(tname, t)                                                        \
+    init_kernel("const_set_" #tname, const_set, t)                                      \
+    init_kernel("const_set_" #tname "_packed", const_set_packed, t)                     \
+    init_kernel("const_set_" #tname "_strided", const_set_strided, t)                   \
+    init_kernel("const_set_" #tname "_strided_packed", const_set_strided_packed, t)
 
 // Initialize all unary kernels for floating point types
 init_unary_float(gelu_erf, ugelu_erf);

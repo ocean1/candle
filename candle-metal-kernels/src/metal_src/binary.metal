@@ -5,11 +5,25 @@ using namespace metal;
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
+// Templated on the pointer *type* rather than written once per address space.
+// The classical entry points pass `constant size_t *`; the packed ones pass
+// `device const size_t *`, because an ICB command can bind a buffer but has no
+// `setBytes` at all (`DESIGN.md` §3.7c). Deducing the address space from the
+// pointer type is what lets one body serve both -- the same move issue #38 made
+// for `reduce.metal`'s `strided_indexer`, and it is why no arithmetic is
+// duplicated here.
+//
+// The indexers are member templates for the same reason: the functor type is a
+// kernel template parameter (`l_indexer`, `r_indexer`), so it must not itself
+// be parameterised on the address space, or every instantiation row would
+// double. Templating `operator()` instead keeps `strided_indexer` one type that
+// works with either pointer.
+template <typename PtrT>
 METAL_FUNC uint get_strided_index(
     uint idx,
-    constant size_t &num_dims,
-    constant size_t *dims,
-    constant size_t *strides
+    size_t num_dims,
+    PtrT dims,
+    PtrT strides
 ) {
     uint strided_i = 0;
     for (uint d = 0; d < num_dims; d++) {
@@ -21,33 +35,36 @@ METAL_FUNC uint get_strided_index(
 }
 
 struct cont_indexer {
+    template <typename PtrT>
     METAL_FUNC uint operator()(
         uint idx,
-        constant size_t &num_dims,
-        constant size_t *dims,
-        constant size_t *strides
+        size_t num_dims,
+        PtrT dims,
+        PtrT strides
     ) {
         return idx;
     }
 };
 
 struct strided_indexer {
+    template <typename PtrT>
     METAL_FUNC uint operator()(
         uint idx,
-        constant size_t &num_dims,
-        constant size_t *dims,
-        constant size_t *strides
+        size_t num_dims,
+        PtrT dims,
+        PtrT strides
     ) {
         return get_strided_index(idx, num_dims, dims, strides);
     }
 };
 
 struct scalar_indexer {
+    template <typename PtrT>
     METAL_FUNC uint operator()(
         uint idx,
-        constant size_t &num_dims,
-        constant size_t *dims,
-        constant size_t *strides
+        size_t num_dims,
+        PtrT dims,
+        PtrT strides
     ) {
         return 0;
     }
@@ -68,7 +85,62 @@ constexpr uint work_per_thread() {
     return div_ceil<8, sizeof(T)>();
 }
 
+// Packed parameter blocks.
+//
+// An ICB command cannot carry an inline constant -- `MTLIndirectComputeCommand`
+// has no `setBytes` in any form (`DESIGN.md` §3.7c) -- so every scalar a kernel
+// takes as `constant size_t &n` has to arrive in a buffer instead. These are the
+// structs the `_packed` entry points read, mirrored by `#[repr(C)]` types in
+// `kernels/params.rs` and checked against them by `binary_params_layout`.
+//
+// `size_t` is 8 bytes in MSL, so these are 8-aligned -- unlike `reduce.metal`'s
+// `uint` structs, which are 4-aligned.
+//
+// `dims` and the two stride arrays are deliberately not fields: their length
+// comes from the tensor's layout, not from the struct. They stay separate
+// bindings, which an ICB can express -- `setKernelBuffer` binds a buffer of any
+// length. Note this family binds *three* such arrays, one more than the others.
+struct BinaryParams {
+    size_t dim;
+};
+
+struct BinaryStridedParams {
+    size_t dim;
+    size_t num_dims;
+};
+
 // Kernels
+//
+// One body per kernel, two entry points around it. The classical wrapper binds
+// its scalars with `setBytes` exactly as before; the `_packed` one reads them
+// from a single `device const Params*`. Neither the arithmetic nor the loop
+// structure is duplicated, so the two styles cannot compute different things.
+//
+// Unlike `reduce.metal`, nothing here declares threadgroup memory, so the
+// whole-body-plus-two-thin-wrappers factoring that #38 could not use does work
+// in this file.
+//
+// Note `U` is `bool` for the comparison families (`eq`, `ne`, `le`, `lt`, `ge`,
+// `gt`). That is the *output element* type -- a `device U*` binding -- not a
+// scalar parameter, so MSL's 1-byte `bool` never reaches a packed struct here.
+// The `bool` hazard #38 flags is about `primitive!(bool)` in `EncoderParam`,
+// and no kernel in these four files takes a `bool` scalar.
+template <typename T, typename U, typename binary, uint W>
+METAL_FUNC void binary_body(
+    size_t dim,
+    device const T *left,
+    device const T *right,
+    device U *output,
+    uint tid
+) {
+    binary op;
+    const uint step = div_ceil<W>(dim);
+    #pragma clang loop unroll(full)
+    for (uint i = tid; i < dim; i += step) {
+        output[i] = static_cast<U>(op(left[i], right[i]));
+    }
+}
+
 template <typename T, typename U, typename binary, uint W = work_per_thread<T>()>
 [[kernel]] void binary_kernel(
     constant size_t &dim,
@@ -77,11 +149,48 @@ template <typename T, typename U, typename binary, uint W = work_per_thread<T>()
     device U *output,
     uint tid [[thread_position_in_grid]]
 ) {
+    binary_body<T, U, binary, W>(dim, left, right, output, tid);
+}
+
+template <typename T, typename U, typename binary, uint W = work_per_thread<T>()>
+[[kernel]] void binary_kernel_packed(
+    device const BinaryParams *pp,
+    device const T *left,
+    device const T *right,
+    device U *output,
+    uint tid [[thread_position_in_grid]]
+) {
+    binary_body<T, U, binary, W>(pp->dim, left, right, output, tid);
+}
+
+template <
+    typename T,
+    typename U,
+    typename binary,
+    typename l_indexer,
+    typename r_indexer,
+    uint W,
+    typename PtrT>
+METAL_FUNC void binary_strided_body(
+    size_t dim,
+    size_t num_dims,
+    PtrT dims,
+    PtrT left_strides,
+    PtrT right_strides,
+    device const T *left,
+    device const T *right,
+    device U *output,
+    uint tid
+) {
     binary op;
+    l_indexer l_index;
+    r_indexer r_index;
     const uint step = div_ceil<W>(dim);
     #pragma clang loop unroll(full)
     for (uint i = tid; i < dim; i += step) {
-        output[i] = static_cast<U>(op(left[i], right[i]));
+        uint l_idx = l_index(i, num_dims, dims, left_strides);
+        uint r_idx = r_index(i, num_dims, dims, right_strides);
+        output[i] = static_cast<U>(op(left[l_idx], right[r_idx]));
     }
 }
 
@@ -103,32 +212,102 @@ template <
     device U *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    binary op;
-    l_indexer l_index;
-    r_indexer r_index;
-    const uint step = div_ceil<W>(dim);
-    #pragma clang loop unroll(full)
-    for (uint i = tid; i < dim; i += step) {
-        uint l_idx = l_index(i, num_dims, dims, left_strides);
-        uint r_idx = r_index(i, num_dims, dims, right_strides);
-        output[i] = static_cast<U>(op(left[l_idx], right[r_idx]));
-    }
+    binary_strided_body<T, U, binary, l_indexer, r_indexer, W, constant size_t *>(
+        dim, num_dims, dims, left_strides, right_strides, left, right, output, tid);
+}
+
+template <
+    typename T,
+    typename U,
+    typename binary,
+    typename l_indexer = strided_indexer,
+    typename r_indexer = strided_indexer,
+    uint W = work_per_thread<T>()>
+[[kernel]] void binary_kernel_strided_packed(
+    device const BinaryStridedParams *pp,
+    device const size_t *dims,
+    device const size_t *left_strides,
+    device const size_t *right_strides,
+    device const T *left,
+    device const T *right,
+    device U *output,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    binary_strided_body<T, U, binary, l_indexer, r_indexer, W, device const size_t *>(
+        pp->dim, pp->num_dims, dims, left_strides, right_strides, left, right, output, tid);
+}
+
+// Layout, asserted rather than hoped.
+//
+// A field at the wrong offset does not crash: the kernel reads a well-formed
+// number from the wrong place and computes a plausible wrong answer, which
+// under `HazardTrackingModeUntracked` is the failure mode `DESIGN.md` §3.5 and
+// §15.1 both single out.
+//
+// Only sizes and alignments are `static_assert`ed. Offsets cannot be: MSL has
+// no `<cstddef>` and the null-pointer-member form of `offsetof` is not a
+// constant expression. They are reported by `binary_params_layout` below and
+// compared against Rust's `offset_of!`, which is the stronger check regardless
+// -- a `static_assert` on either side proves only that side agrees with itself.
+static_assert(sizeof(BinaryParams) == 8, "BinaryParams layout");
+static_assert(alignof(BinaryParams) == 8, "BinaryParams alignment");
+
+static_assert(sizeof(BinaryStridedParams) == 16, "BinaryStridedParams layout");
+static_assert(alignof(BinaryStridedParams) == 8, "BinaryStridedParams alignment");
+
+// The offset is taken from a real `thread` instance rather than the usual
+// null-pointer form, which MSL rejects in constant evaluation. Measuring it at
+// runtime is what this kernel is for.
+#define offsetof_rt(S, F) \
+    ((uint)((thread const char *)&(probe_##S.F) - (thread const char *)&probe_##S))
+
+[[kernel]] void binary_params_layout(
+    device uint *out,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    if (tid != 0) { return; }
+    BinaryParams        probe_BinaryParams;
+    BinaryStridedParams probe_BinaryStridedParams;
+    out[0] = sizeof(BinaryParams);
+    out[1] = offsetof_rt(BinaryParams, dim);
+
+    out[2] = sizeof(BinaryStridedParams);
+    out[3] = offsetof_rt(BinaryStridedParams, dim);
+    out[4] = offsetof_rt(BinaryStridedParams, num_dims);
 }
 
 // Macros to help initialize kernels
 #define init_kernel(name, func, ...) \
   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
 
-#define init_binary_k(op_name, binary_op, tname, t, u)                                                                      \
-    init_kernel(#op_name "_" #tname, binary_kernel, t, u, binary_op)                                                        \
-    init_kernel(#op_name "_" #tname "_strided", binary_kernel_strided, t, u, binary_op)                                     \
-    init_kernel(#op_name "_" #tname "_lstrided", binary_kernel_strided, t, u, binary_op, strided_indexer, cont_indexer)     \
-    init_kernel(#op_name "_" #tname "_rstrided", binary_kernel_strided, t, u, binary_op, cont_indexer, strided_indexer)     \
-    init_kernel(#op_name "_" #tname "_scalar", binary_kernel_strided, t, u, binary_op, scalar_indexer, scalar_indexer)      \
-    init_kernel(#op_name "_" #tname "_cs", binary_kernel_strided, t, u, binary_op, cont_indexer, scalar_indexer)            \
-    init_kernel(#op_name "_" #tname "_sc", binary_kernel_strided, t, u, binary_op, scalar_indexer, cont_indexer)            \
-    init_kernel(#op_name "_" #tname "_rss", binary_kernel_strided, t, u, binary_op, scalar_indexer, strided_indexer)        \
-    init_kernel(#op_name "_" #tname "_lss", binary_kernel_strided, t, u, binary_op, strided_indexer, scalar_indexer)
+// Both binding styles from one instantiation row, so a variant cannot exist in
+// one style and not the other. `_packed` is a name segment appended after the
+// dtype and any indexer suffix, and `packed_names_resolve` checks every result
+// against the compiled library rather than against this macro -- which is
+// `DESIGN.md` §8.1b's argument, and #26 shipped 48 names absent from a metallib
+// that compiled cleanly.
+//
+// This family is the widest of the four: nine indexer combinations per dtype,
+// each now in two styles.
+#define init_binary_k(op_name, binary_op, tname, t, u)                                                                                    \
+    init_kernel(#op_name "_" #tname, binary_kernel, t, u, binary_op)                                                                      \
+    init_kernel(#op_name "_" #tname "_packed", binary_kernel_packed, t, u, binary_op)                                                     \
+    init_kernel(#op_name "_" #tname "_strided", binary_kernel_strided, t, u, binary_op)                                                   \
+    init_kernel(#op_name "_" #tname "_strided_packed", binary_kernel_strided_packed, t, u, binary_op)                                     \
+    init_kernel(#op_name "_" #tname "_lstrided", binary_kernel_strided, t, u, binary_op, strided_indexer, cont_indexer)                   \
+    init_kernel(#op_name "_" #tname "_lstrided_packed", binary_kernel_strided_packed, t, u, binary_op, strided_indexer, cont_indexer)     \
+    init_kernel(#op_name "_" #tname "_rstrided", binary_kernel_strided, t, u, binary_op, cont_indexer, strided_indexer)                   \
+    init_kernel(#op_name "_" #tname "_rstrided_packed", binary_kernel_strided_packed, t, u, binary_op, cont_indexer, strided_indexer)     \
+    init_kernel(#op_name "_" #tname "_scalar", binary_kernel_strided, t, u, binary_op, scalar_indexer, scalar_indexer)                    \
+    init_kernel(#op_name "_" #tname "_scalar_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_indexer, scalar_indexer)      \
+    init_kernel(#op_name "_" #tname "_cs", binary_kernel_strided, t, u, binary_op, cont_indexer, scalar_indexer)                          \
+    init_kernel(#op_name "_" #tname "_cs_packed", binary_kernel_strided_packed, t, u, binary_op, cont_indexer, scalar_indexer)            \
+    init_kernel(#op_name "_" #tname "_sc", binary_kernel_strided, t, u, binary_op, scalar_indexer, cont_indexer)                          \
+    init_kernel(#op_name "_" #tname "_sc_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_indexer, cont_indexer)            \
+    init_kernel(#op_name "_" #tname "_rss", binary_kernel_strided, t, u, binary_op, scalar_indexer, strided_indexer)                      \
+    init_kernel(#op_name "_" #tname "_rss_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_indexer, strided_indexer)        \
+    init_kernel(#op_name "_" #tname "_lss", binary_kernel_strided, t, u, binary_op, strided_indexer, scalar_indexer)                      \
+    init_kernel(#op_name "_" #tname "_lss_packed", binary_kernel_strided_packed, t, u, binary_op, strided_indexer, scalar_indexer)
 
 #if defined(__HAVE_BFLOAT__)
 #define init_binary(bop)                            \
