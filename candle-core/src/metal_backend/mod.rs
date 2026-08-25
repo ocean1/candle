@@ -20,6 +20,20 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 mod device;
 pub use device::{DeviceId, MetalDevice};
 
+/// The activation arena's public vocabulary (`DESIGN.md` §9.2).
+///
+/// Re-exported for the same reason `trace` is below: a harness selecting a
+/// layout should not need a direct dependency on `candle-metal-kernels`.
+pub use candle_metal_kernels::metal::{
+    hazard_key, set_hazard_key, ArenaCounters, ArenaLayout, HazardKey, Slot, StepPlan,
+};
+
+/// Per-dispatch recording of the Metal command stream.
+///
+/// Re-exported so a measurement harness can drive it without taking a direct
+/// dependency on `candle-metal-kernels`. Inert unless `CANDLE_METAL_TRACE=1`.
+pub use candle_metal_kernels::metal::trace;
+
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {
         buffer,
@@ -2096,6 +2110,11 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
             residency_set,
+            // No arena until one is installed: the classical path is the
+            // default, and the cost of the seam is one `Option` test per
+            // allocation (`DESIGN.md` §9.2a, §11.1).
+            arena: Arc::new(RwLock::new(None)),
+            arena_recorder: Arc::new(Mutex::new(None)),
         })
     }
 

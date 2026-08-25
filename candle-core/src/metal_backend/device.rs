@@ -4,8 +4,9 @@ use crate::{DType, Result};
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
-        PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet,
+        Arena, ArenaCounters, ArenaLayout, ArenaRecorder, BlitCommandsGuard, Buffer, BufferPool,
+        Commands, CommandsGuard, Device, MTLResourceOptions, PoolCounters, PoolOccupancySnapshot,
+        PooledBuffer, ResidencySet, StepPlan,
     },
     Kernels,
 };
@@ -69,6 +70,29 @@ pub struct MetalDevice {
     pub(crate) seed_value: Arc<RwLock<u64>>,
     /// Residency set registered on the command queue.
     pub(crate) residency_set: Arc<ResidencySet>,
+
+    /// The activation arena, when one is installed.
+    ///
+    /// `None` is the default and is the classical path: every allocation goes
+    /// to the pool exactly as before, and the added cost is one `Option` test
+    /// per allocation. Installing an arena changes **where an activation buffer
+    /// comes from**, not how the pool decides a buffer is free (`DESIGN.md`
+    /// §9.2a) -- the pool's `acquire`, `release`, free list and epoch gate are
+    /// untouched.
+    ///
+    /// `RwLock` rather than `OnceLock` because the layout is selectable at run
+    /// time: §9.3's parity check needs to run the same model under the packed
+    /// layout and under the non-aliasing reference, and keeping both installable
+    /// is the same discipline `ParamStyle` follows for binding styles (§11.3b).
+    pub(crate) arena: Arc<RwLock<Option<Arena>>>,
+
+    /// Observes one decode step's allocations so a plan can be derived from it.
+    ///
+    /// `None` except while recording. Candle is eager, so nothing declares the
+    /// activation set up front -- but the dispatch sequence is stable
+    /// (§11.1a.1), so one observed step describes the rest. This is §11.1a's
+    /// record-then-replay, applied to allocation.
+    pub(crate) arena_recorder: Arc<Mutex<Option<Arc<Mutex<ArenaRecorder>>>>>,
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
@@ -240,6 +264,169 @@ impl MetalDevice {
         BufferBuilder::new(self)
     }
 
+    /// The installed arena, if any. Cheap: one lock and an `Option` clone.
+    fn arena_slot(&self) -> Option<Arena> {
+        self.arena.read().ok().and_then(|a| a.clone())
+    }
+
+    /// Install an activation arena built from `plan`, replacing any previous
+    /// one.
+    ///
+    /// Allocates one `MTLBuffer` of the plan's size and registers it in the
+    /// residency set -- §9.2's "residency is a CPU-side fact established once":
+    /// one buffer in the set rather than 674.
+    ///
+    /// The arena is *additive* (§9.2a). Nothing about the pool changes, no
+    /// caller is asked to release anything, and removing the arena with
+    /// [`Self::clear_arena`] returns the device to the classical path exactly.
+    pub fn install_arena(&self, plan: StepPlan, layout: ArenaLayout) -> Result<()> {
+        let bytes = plan.arena_bytes().max(1);
+        let base = self
+            .device
+            .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&base);
+        let arena = Arena::new(&self.private_buffers, base, plan, layout)
+            .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
+        if let Ok(mut slot) = self.arena.write() {
+            *slot = Some(arena);
+        }
+        Ok(())
+    }
+
+    /// Remove the arena. Subsequent allocations all take the pool path.
+    pub fn clear_arena(&self) {
+        if let Ok(mut slot) = self.arena.write() {
+            *slot = None;
+        }
+    }
+
+    pub fn arena(&self) -> Option<Arena> {
+        self.arena_slot()
+    }
+
+    /// Mark the start of a decode step, resetting the arena's allocation
+    /// ordinal.
+    ///
+    /// The ordinal is what ties an allocation to a slot, so it has to restart at
+    /// the same point every token. No-op when no arena is installed.
+    pub fn begin_decode_step(&self) {
+        if let Some(a) = self.arena_slot() {
+            a.begin_step();
+        }
+    }
+
+    /// Mark the end of a decode step. Allocations outside a step take the pool
+    /// path, which is what keeps prefill and setup on the classical route.
+    pub fn end_decode_step(&self) {
+        if let Some(a) = self.arena_slot() {
+            a.end_step();
+        }
+    }
+
+    pub fn arena_counters(&self) -> Option<ArenaCounters> {
+        self.arena_slot().map(|a| a.counters())
+    }
+
+    /// Begin observing allocations so a plan can be derived from one step.
+    ///
+    /// Record over a *steady-state* decode step, not the first one: the first
+    /// token after prefill allocates a different set, and #68 plans from
+    /// `decode[1]` for the same reason.
+    pub fn begin_arena_recording(&self) {
+        let rec = Arc::new(Mutex::new(ArenaRecorder::new()));
+        // The encoder observes binds, which is where an interval ends, so it
+        // needs the same recorder this device is filling.
+        candle_metal_kernels::metal::arena::set_bind_observer(Some(Arc::clone(&rec)));
+        if let Ok(mut g) = self.arena_recorder.lock() {
+            *g = Some(rec);
+        }
+    }
+
+    /// Close the decode step being recorded and begin recording another.
+    ///
+    /// **Two steps are the minimum a plan can be built from**, because comparing
+    /// them is what separates an activation from session state: an allocation
+    /// whose size moved between them is sized by `kv_len` and must not enter the
+    /// arena (`DESIGN.md` §9.1, #68 finding 4). #68's planner likewise requires
+    /// two decode steps and refuses rather than silently returning nothing.
+    pub fn next_arena_recording_step(&self) {
+        if let Ok(g) = self.arena_recorder.lock() {
+            if let Some(rec) = g.as_ref() {
+                if let Ok(mut r) = rec.lock() {
+                    r.next_step();
+                }
+            }
+        }
+    }
+
+    /// How many recorded ordinals were excluded as session state, of the total.
+    pub fn arena_recording_excluded(&self) -> Option<(usize, usize)> {
+        let g = self.arena_recorder.lock().ok()?;
+        let rec = g.as_ref()?;
+        let r = rec.lock().ok()?;
+        Some(r.excluded())
+    }
+
+    /// Exclusions split by which test caught them: `(size_grew, outlived_step)`.
+    ///
+    /// Reported separately because the two detectors see different populations
+    /// and neither subsumes the other -- size growth finds the KV cache, and
+    /// cross-step liveness finds the conv state, which is fixed at
+    /// `[B, 2048, 3]` and invisible to a size comparison (`DESIGN.md` §5.7,
+    /// §9.2c). A run where the second number is zero would mean it is not
+    /// earning its place; a run where it is nonzero names values the size test
+    /// admitted.
+    ///
+    /// The two counts overlap where both tests fire, so they do not sum to the
+    /// total exclusion count.
+    pub fn arena_recording_excluded_by_test(&self) -> Option<(usize, usize)> {
+        let g = self.arena_recorder.lock().ok()?;
+        let rec = g.as_ref()?;
+        let r = rec.lock().ok()?;
+        Some(r.excluded_by_test())
+    }
+
+    /// Stop observing and build a plan from what was seen.
+    ///
+    /// Returns `None` if nothing was recorded, which is a real outcome worth
+    /// distinguishing from an empty plan -- it means recording was never begun
+    /// or the step allocated nothing.
+    pub fn finish_arena_recording(&self, layout: ArenaLayout) -> Option<StepPlan> {
+        candle_metal_kernels::metal::arena::set_bind_observer(None);
+        let mut g = self.arena_recorder.lock().ok()?;
+        let rec = g.take()?;
+        let r = rec.lock().ok()?;
+        if r.is_empty() {
+            return None;
+        }
+        Some(r.plan(layout))
+    }
+
+    /// Record one decode step and install the resulting arena.
+    ///
+    /// The whole sequence a caller needs: observe a steady-state step, derive
+    /// the plan, allocate the arena, and switch to it. `step` runs the model for
+    /// exactly one token.
+    pub fn record_and_install_arena<F>(&self, layout: ArenaLayout, step: F) -> Result<bool>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.begin_arena_recording();
+        let outcome = step();
+        // Stop recording whether or not the step succeeded, so a failure cannot
+        // leave the recorder attached and quietly accumulating.
+        let plan = self.finish_arena_recording(layout);
+        outcome?;
+        match plan {
+            Some(plan) => {
+                self.install_arena(plan, layout)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Creates a new buffer (not necessarily zeroed).
     ///
     /// Uses StorageModePrivate on macOS for faster GPU access (no CPU coherency overhead).
@@ -251,16 +438,57 @@ impl MetalDevice {
         _name: &str,
     ) -> Result<Arc<PooledBuffer>> {
         let size = element_count * dtype.size_in_bytes();
-        if let Some(b) = self.private_buffers.acquire(size) {
-            return Ok(b);
+        // Layer 3 (`DESIGN.md` §9.2a). The arena is offered the allocation
+        // first; it serves it only inside a decode step, only while the plan
+        // still has an ordinal, and only when the size matches what that ordinal
+        // was planned for. Everything else -- prefill, model setup, and every
+        // session-state allocation whose size grows with `kv_len` -- falls
+        // through to the pool below, unchanged.
+        if let Some(arena) = self.arena_slot() {
+            if let Some(b) = arena.acquire(size) {
+                return Ok(b);
+            }
         }
-        let size = buf_size(size);
-        let new_buffer = self
-            .device
-            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
-            .map_err(MetalError::from)?;
-        self.residency_set.insert(&new_buffer);
-        Ok(self.private_buffers.adopt(new_buffer, size))
+        let buffer = match self.private_buffers.acquire(size) {
+            Some(b) => b,
+            None => {
+                let alloc = buf_size(size);
+                let new_buffer = self
+                    .device
+                    .new_buffer(alloc, PRIVATE_RESOURCE_OPTIONS)
+                    .map_err(MetalError::from)?;
+                self.residency_set.insert(&new_buffer);
+                self.private_buffers.adopt(new_buffer, alloc)
+            }
+        };
+        Ok(self.note_for_recording(buffer, size))
+    }
+
+    /// While a plan is being recorded, note this allocation.
+    ///
+    /// Records the allocation's *size* and the *address* of the buffer serving
+    /// it. The address is only how later binds are attributed back to this
+    /// value; the value itself is the **allocation event**, never the buffer
+    /// (`DESIGN.md` §9.2c). When a later allocation is handed the same address
+    /// it takes the address over, and the earlier value keeps the interval it
+    /// accumulated while it held it -- so one pooled buffer serving 60 values
+    /// yields 60 intervals rather than one merged one. That merge is the mistake
+    /// that made #68's first planner report 3.55 MB against the true 68 KB.
+    ///
+    /// The interval **ends at the last bind**, not here and not when the handle
+    /// drops -- see `ArenaRecorder::record_bind` for why the CPU's clock is the
+    /// wrong one.
+    fn note_for_recording(&self, buffer: Arc<PooledBuffer>, size: usize) -> Arc<PooledBuffer> {
+        let Ok(guard) = self.arena_recorder.lock() else {
+            return buffer;
+        };
+        let Some(rec) = guard.as_ref() else {
+            return buffer;
+        };
+        if let Ok(mut r) = rec.lock() {
+            r.record_alloc(buffer.raw_addr(), size);
+        }
+        buffer
     }
 
     /// Creates a new private buffer (not necessarily zeroed).

@@ -261,6 +261,9 @@ impl Commands {
                 &self.prev_ce_outputs,
                 &self.executor(),
             );
+            // Hazard state is per encoder, so a barrier count is only
+            // interpretable against the session boundaries (`DESIGN.md` §9.2e).
+            crate::metal::trace::record_encoder_begin();
             state_guard.current_encoder = Some(enc);
         }
 
