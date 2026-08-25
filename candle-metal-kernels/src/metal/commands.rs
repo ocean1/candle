@@ -1,6 +1,6 @@
 use crate::metal::{
-    BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
-    Fence, GpuClock, PrevCeOutputs, ResidencySet,
+    executor::ExecutorSlot, BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder,
+    ComputePipeline, Device, Fence, GpuClock, PrevCeOutputs, ResidencySet,
 };
 use crate::MetalKernelError;
 use block2::RcBlock;
@@ -148,6 +148,14 @@ pub struct Commands {
     /// pools so that `Commands` does not need to know they exist -- it owns the
     /// clock, not the things that read it.
     on_complete: CompletionSubscribers,
+    /// How dispatches reach the GPU (`DESIGN.md` §11.1). Handed to every
+    /// compute encoder this creates.
+    ///
+    /// `Mutex` rather than a plain field because installing an executor is a
+    /// setup-time action on a `&Commands` that is already shared; it is never
+    /// touched per dispatch, because the encoder holds its own `Arc` to the
+    /// slot from creation.
+    executor: Mutex<Arc<ExecutorSlot>>,
 }
 
 /// A fence still referenced by `prev_ce_outputs`, with its buffer count.
@@ -190,7 +198,28 @@ impl Commands {
             live_fences: Arc::new(Mutex::new(Vec::new())),
             clock: Arc::new(GpuClock::new()),
             on_complete: Arc::new(Mutex::new(Vec::new())),
+            executor: Mutex::new(Arc::new(ExecutorSlot::Classical)),
         })
+    }
+
+    /// Install the executor that subsequent compute encoders will submit
+    /// through (`DESIGN.md` §11.1).
+    ///
+    /// Takes effect on the next encoder created, not on one already open: an
+    /// encoder holds its slot from creation so that the per-dispatch path never
+    /// has to take this lock. Call before encoding the work being measured.
+    pub fn set_executor(&self, executor: Arc<ExecutorSlot>) {
+        if let Ok(mut slot) = self.executor.lock() {
+            *slot = executor;
+        }
+    }
+
+    /// The executor currently installed.
+    pub fn executor(&self) -> Arc<ExecutorSlot> {
+        self.executor
+            .lock()
+            .map(|e| Arc::clone(&e))
+            .unwrap_or_else(|_| Arc::new(ExecutorSlot::Classical))
     }
 
     /// The clock the buffer pools decide reuse against.
@@ -227,9 +256,11 @@ impl Commands {
             // so it waits per buffer in set_input_buffer / set_output_buffer
             // instead. Waiting on every live fence would order this encoder
             // after work it never touches.
-            let enc = state_guard
-                .current
-                .compute_command_encoder(&fence, &self.prev_ce_outputs);
+            let enc = state_guard.current.compute_command_encoder_with_executor(
+                &fence,
+                &self.prev_ce_outputs,
+                &self.executor(),
+            );
             state_guard.current_encoder = Some(enc);
         }
 

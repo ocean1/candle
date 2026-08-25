@@ -1,4 +1,7 @@
-use crate::metal::{Buffer, ComputePipeline, Fence};
+use crate::metal::{
+    executor::{DispatchRecord, ExecutorSlot, Grid},
+    Buffer, ComputePipeline, Fence,
+};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
@@ -33,6 +36,11 @@ pub struct EncoderState {
     /// Fences already waited on this session, so a buffer bound repeatedly does
     /// not re-emit the same wait.
     pub waited_fences: HashSet<usize>,
+    /// Name of the pipeline most recently set, so a dispatch can be attributed
+    /// to a kernel. Only maintained when an executor is installed -- Metal has
+    /// no way to read the bound pipeline back, and doing so per dispatch on the
+    /// classical path would be cost for nobody.
+    pub current_pipeline: Option<Arc<str>>,
 }
 
 impl EncoderState {
@@ -46,6 +54,7 @@ impl EncoderState {
             all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
             waited_fences: HashSet::new(),
+            current_pipeline: None,
         }
     }
 }
@@ -64,6 +73,12 @@ pub struct ComputeCommandEncoder {
     /// Buffer -> fence of its last writer, so a bind can wait on just that
     /// buffer instead of on every live fence.
     pub(crate) prev_ce_outputs: PrevCeOutputs,
+    /// How dispatches reach the GPU (`DESIGN.md` §11.1).
+    ///
+    /// `ExecutorSlot::Classical` is the default and forwards to `self.raw`
+    /// exactly as before this field existed, so the default path is unchanged
+    /// rather than merely equivalent.
+    pub(crate) executor: Arc<ExecutorSlot>,
 }
 
 impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
@@ -79,12 +94,30 @@ impl ComputeCommandEncoder {
         fence: Arc<Fence>,
         prev_ce_outputs: PrevCeOutputs,
     ) -> ComputeCommandEncoder {
+        Self::with_executor(
+            raw,
+            command_buffer,
+            fence,
+            prev_ce_outputs,
+            Arc::new(ExecutorSlot::Classical),
+        )
+    }
+
+    /// As [`Self::new`], but submitting dispatches through `executor`.
+    pub fn with_executor(
+        raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+        command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        fence: Arc<Fence>,
+        prev_ce_outputs: PrevCeOutputs,
+        executor: Arc<ExecutorSlot>,
+    ) -> ComputeCommandEncoder {
         ComputeCommandEncoder {
             raw,
             command_buffer,
             fence,
             state: Arc::new(Mutex::new(EncoderState::new())),
             prev_ce_outputs,
+            executor,
         }
     }
 
@@ -113,6 +146,12 @@ impl ComputeCommandEncoder {
 
     pub fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
         self.auto_barrier();
+        if !self.offer_to_executor(
+            Grid::Threads(threads_per_grid.into()),
+            threads_per_threadgroup,
+        ) {
+            return;
+        }
         self.raw
             .dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup)
     }
@@ -123,10 +162,35 @@ impl ComputeCommandEncoder {
         threads_per_threadgroup: MTLSize,
     ) {
         self.auto_barrier();
+        if !self.offer_to_executor(
+            Grid::Threadgroups(threadgroups_per_grid.into()),
+            threads_per_threadgroup,
+        ) {
+            return;
+        }
         self.raw.dispatchThreadgroups_threadsPerThreadgroup(
             threadgroups_per_grid,
             threads_per_threadgroup,
         )
+    }
+
+    /// Offer this dispatch to the executor; `true` means encode it normally.
+    ///
+    /// The early return on the classical path is what keeps `DESIGN.md` §11.1's
+    /// "must not regress" structural: with no executor installed this is one
+    /// predictable branch, and the `DispatchRecord` -- which costs an `Arc<str>`
+    /// clone and a lock acquisition -- is never built.
+    #[inline(always)]
+    fn offer_to_executor(&self, grid: Grid, threads_per_threadgroup: MTLSize) -> bool {
+        if self.executor.is_classical() {
+            return true;
+        }
+        let kernel = self.state.lock().unwrap().current_pipeline.clone();
+        self.executor.dispatch(&DispatchRecord {
+            kernel,
+            grid,
+            threads_per_threadgroup: threads_per_threadgroup.into(),
+        })
     }
 
     fn auto_barrier(&self) {
@@ -156,6 +220,10 @@ impl ComputeCommandEncoder {
             }
             s.next_inputs.insert(ptr);
             s.all_inputs.insert(ptr);
+            drop(s);
+            if !self.executor.is_classical() {
+                self.executor.will_bind_buffer(index, buf, offset, false);
+            }
         }
         unsafe {
             self.raw
@@ -174,6 +242,10 @@ impl ComputeCommandEncoder {
             }
             s.next_outputs.insert(ptr);
             s.all_outputs.insert(ptr);
+            drop(s);
+            if !self.executor.is_classical() {
+                self.executor.will_bind_buffer(index, buf, offset, true);
+            }
         }
         unsafe {
             self.raw
@@ -193,7 +265,18 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_compute_pipeline_state(&self, pipeline: &ComputePipeline) {
+        self.note_pipeline(pipeline);
         self.raw.setComputePipelineState(pipeline.as_ref());
+    }
+
+    /// Record the pipeline for dispatch attribution, when anyone is listening.
+    #[inline(always)]
+    fn note_pipeline(&self, pipeline: &ComputePipeline) {
+        if self.executor.is_classical() {
+            return;
+        }
+        self.executor.will_set_pipeline(pipeline);
+        self.state.lock().unwrap().current_pipeline = pipeline.name().map(Arc::from);
     }
 
     /// Insert a memory barrier at buffers scope.
@@ -219,6 +302,7 @@ impl ComputeCommandEncoder {
 
     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
         use MTLComputeCommandEncoder as _;
+        self.note_pipeline(pipeline);
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
 

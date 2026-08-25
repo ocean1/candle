@@ -1,4 +1,6 @@
-use super::{BlitCommandEncoder, ComputeCommandEncoder, Device, Fence, PrevCeOutputs};
+use super::{
+    executor::ExecutorSlot, BlitCommandEncoder, ComputeCommandEncoder, Device, Fence, PrevCeOutputs,
+};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
@@ -24,14 +26,30 @@ impl CommandBuffer {
         fence: &Arc<Fence>,
         prev_ce_outputs: &PrevCeOutputs,
     ) -> ComputeCommandEncoder {
+        self.compute_command_encoder_with_executor(
+            fence,
+            prev_ce_outputs,
+            &Arc::new(ExecutorSlot::Classical),
+        )
+    }
+
+    /// As [`Self::compute_command_encoder`], but submitting dispatches through
+    /// `executor` (`DESIGN.md` §11.1).
+    pub fn compute_command_encoder_with_executor(
+        &self,
+        fence: &Arc<Fence>,
+        prev_ce_outputs: &PrevCeOutputs,
+        executor: &Arc<ExecutorSlot>,
+    ) -> ComputeCommandEncoder {
         self.as_ref()
             .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
             .map(|raw| {
-                ComputeCommandEncoder::new(
+                ComputeCommandEncoder::with_executor(
                     raw,
                     self.raw.clone(),
                     Arc::clone(fence),
                     Arc::clone(prev_ce_outputs),
+                    Arc::clone(executor),
                 )
             })
             .unwrap()
