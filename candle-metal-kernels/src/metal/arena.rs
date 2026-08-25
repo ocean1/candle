@@ -79,7 +79,69 @@
 
 use super::{Buffer, BufferPool, PooledBuffer};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// The recorder currently observing binds, if any.
+///
+/// A process-global slot rather than a field, because binds are observed in the
+/// encoder (`candle-metal-kernels`) while the recorder is driven from the device
+/// (`candle-core`), and threading a handle from one to the other would mean a
+/// parameter on `set_input_buffer`/`set_output_buffer` -- the two functions
+/// `DESIGN.md` §6.4a measures as the hottest per-bind path in the backend.
+///
+/// The cost when nothing is recording is one relaxed atomic load, the same shape
+/// the dispatch trace uses for the same reason. Recording happens once, over two
+/// decode steps, before the arena exists; it is not a steady-state path.
+static BIND_OBSERVER: OnceLock<Mutex<Option<Arc<Mutex<ArenaRecorder>>>>> = OnceLock::new();
+static OBSERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn observer_slot() -> &'static Mutex<Option<Arc<Mutex<ArenaRecorder>>>> {
+    BIND_OBSERVER.get_or_init(|| Mutex::new(None))
+}
+
+/// Install `recorder` as the bind observer, or clear it with `None`.
+pub fn set_bind_observer(recorder: Option<Arc<Mutex<ArenaRecorder>>>) {
+    if let Ok(mut slot) = observer_slot().lock() {
+        OBSERVING.store(recorder.is_some(), Ordering::Relaxed);
+        *slot = recorder;
+    }
+}
+
+/// Whether anything is observing binds. One relaxed load.
+#[inline(always)]
+pub fn observing_binds() -> bool {
+    OBSERVING.load(Ordering::Relaxed)
+}
+
+/// Report that a dispatch bound the buffer at `addr`.
+#[inline]
+pub fn note_bind(addr: usize) {
+    if !observing_binds() {
+        return;
+    }
+    if let Ok(slot) = observer_slot().lock() {
+        if let Some(rec) = slot.as_ref() {
+            if let Ok(mut r) = rec.lock() {
+                r.record_bind(addr);
+            }
+        }
+    }
+}
+
+/// Report that a dispatch was encoded, advancing the position intervals live in.
+#[inline]
+pub fn note_dispatch() {
+    if !observing_binds() {
+        return;
+    }
+    if let Ok(slot) = observer_slot().lock() {
+        if let Some(rec) = slot.as_ref() {
+            if let Ok(mut r) = rec.lock() {
+                r.record_dispatch();
+            }
+        }
+    }
+}
 
 /// Alignment of every slot, in bytes.
 ///
@@ -142,16 +204,37 @@ pub struct StepPlan {
     slots: Vec<Slot>,
     /// Slot index per allocation ordinal, and the size that ordinal expects.
     ///
-    /// The size is carried so a request that does not match can be declined
-    /// rather than silently served a slot of the wrong extent -- which is how
-    /// session state is kept out (see the module docs).
-    by_ordinal: Vec<(usize, usize)>,
+    /// `None` means the ordinal is **not the arena's** -- session state, whose
+    /// size grows with `kv_len` (§9.1, #68 finding 4). It keeps its place in the
+    /// sequence so excluding it does not renumber later ordinals, and it is
+    /// declined at `acquire` so it allocates from the pool as before.
+    ///
+    /// The size is carried so a request that does not match can also be
+    /// declined, rather than silently served a slot of the wrong extent.
+    by_ordinal: Vec<Option<(usize, usize)>>,
 }
 
 impl StepPlan {
     /// Build a plan from the per-ordinal `(slot, size)` assignment.
-    pub fn new(slots: Vec<Slot>, by_ordinal: Vec<(usize, usize)>) -> Self {
+    pub fn new(slots: Vec<Slot>, by_ordinal: Vec<Option<(usize, usize)>>) -> Self {
         Self { slots, by_ordinal }
+    }
+
+    /// Ordinals the arena serves, against the total recorded.
+    pub fn covered(&self) -> (usize, usize) {
+        (
+            self.by_ordinal.iter().filter(|e| e.is_some()).count(),
+            self.by_ordinal.len(),
+        )
+    }
+
+    /// Slot serving each ordinal, `None` where the ordinal is not the arena's.
+    pub fn slot_of(&self, ordinal: usize) -> Option<usize> {
+        self.by_ordinal
+            .get(ordinal)
+            .copied()
+            .flatten()
+            .map(|(s, _)| s)
     }
 
     /// Total bytes the arena must reserve.
@@ -213,12 +296,21 @@ pub struct ArenaCounters {
     pub offers: u64,
     /// Requests served from a slot.
     pub hits: u64,
+    /// Requests declined because the ordinal is session state.
+    ///
+    /// Excluded when the plan was built, because the allocation's size moved
+    /// between the two recorded steps -- the KV cache and its `Tensor::cat`
+    /// copies, which grow 128 B per token (§9.1, #68 finding 4). A zero here on
+    /// a real LFM2 decode would mean the exclusion never engaged, and the drift
+    /// it prevents would be reachable.
+    pub declined_session: u64,
+
     /// Requests declined because the size did not match the ordinal's slot.
     ///
-    /// In LFM2 decode this is the session-state population -- the KV cache and
-    /// its `Tensor::cat` copies, which grow 128 B per token and so never match
-    /// (#68 finding 4). A zero here on a real decode would mean the size gate is
-    /// not doing anything, and the drift it prevents would be reachable.
+    /// The second line of defence, behind the exclusion above: it catches an
+    /// allocation whose size moved in a way two recorded steps did not reveal.
+    /// Serving it would either overrun the slot or pin a growing value at a
+    /// fixed offset.
     pub declined_size: u64,
     /// Requests past the end of the plan.
     pub declined_exhausted: u64,
@@ -379,8 +471,17 @@ impl Arena {
         let mut state = self.inner.state.lock().ok()?;
         state.counters.offers += 1;
 
-        let Some(&(slot, want)) = state.plan.by_ordinal.get(ordinal) else {
-            state.counters.declined_exhausted += 1;
+        let entry = match state.plan.by_ordinal.get(ordinal) {
+            Some(e) => *e,
+            None => {
+                state.counters.declined_exhausted += 1;
+                return None;
+            }
+        };
+        // Not the arena's: session state, excluded when the plan was built
+        // because its size moved between the two recorded steps (§9.1).
+        let Some((slot, want)) = entry else {
+            state.counters.declined_session += 1;
             return None;
         };
         // Size must match what was planned for this ordinal. A larger request
@@ -455,10 +556,48 @@ impl std::fmt::Debug for Arena {
 /// slots; LFM2 decode has 5 slots and two size classes, which bounds the damage
 /// at about one extra wide slot.
 pub fn plan_from_sizes(sizes: &[usize], last_use: &[usize], layout: ArenaLayout) -> StepPlan {
+    let first_use: Vec<usize> = (0..sizes.len()).collect();
+    plan_from_intervals(
+        sizes,
+        &first_use,
+        last_use,
+        &vec![false; sizes.len()],
+        layout,
+    )
+}
+
+/// As [`plan_from_sizes`], but with explicit liveness intervals and exclusions.
+///
+/// An interval is `first_use[i] ..= last_use[i]`, in **dispatch positions**.
+/// That coordinate matters: liveness has to be measured on the clock that orders
+/// execution, and for the GPU that is the dispatch stream, not the order in
+/// which the CPU happened to drop handles (see [`ArenaRecorder::record_bind`]).
+///
+/// An excluded ordinal keeps its position in the sequence and is marked so that
+/// [`Arena::acquire`] declines it, which is how session state stays out (§9.1).
+/// Removing it from the sequence instead would renumber every later allocation
+/// and break the positional keying the whole plan rests on.
+pub fn plan_from_intervals(
+    sizes: &[usize],
+    first_use: &[usize],
+    last_use: &[usize],
+    excluded: &[bool],
+    layout: ArenaLayout,
+) -> StepPlan {
     assert_eq!(
         sizes.len(),
         last_use.len(),
-        "every allocation needs a last-use ordinal"
+        "every allocation needs a last-use position"
+    );
+    assert_eq!(
+        sizes.len(),
+        first_use.len(),
+        "every allocation needs a first-use position"
+    );
+    assert_eq!(
+        sizes.len(),
+        excluded.len(),
+        "every allocation needs an exclusion flag"
     );
 
     if layout == ArenaLayout::NonAliasing {
@@ -469,24 +608,34 @@ pub fn plan_from_sizes(sizes: &[usize], last_use: &[usize], layout: ArenaLayout)
         let mut by_ordinal = Vec::with_capacity(sizes.len());
         let mut cursor = 0usize;
         for (i, &size) in sizes.iter().enumerate() {
+            if excluded[i] {
+                // Session state is out of the arena under either layout, so the
+                // two layouts differ *only* in whether activations share bytes.
+                // That is what makes the comparison between them a test of the
+                // offset arithmetic rather than of two different populations.
+                by_ordinal.push(None);
+                continue;
+            }
             slots.push(Slot {
                 offset: cursor,
                 size,
             });
-            by_ordinal.push((i, size));
+            by_ordinal.push(Some((slots.len() - 1, size)));
             cursor = align_up(cursor + size, ARENA_ALIGNMENT);
         }
         return StepPlan::new(slots, by_ordinal);
     }
 
     // Size-major first-fit. Each slot holds values whose intervals are pairwise
-    // disjoint; a slot widens to its largest occupant.
-    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    // disjoint; a slot widens to its largest occupant. Excluded ordinals are not
+    // placed at all -- they take the pool path.
+    let mut order: Vec<usize> = (0..sizes.len()).filter(|&i| !excluded[i]).collect();
     order.sort_by_key(|&i| {
         (
             std::cmp::Reverse(sizes[i]),
+            first_use[i],
+            std::cmp::Reverse(last_use[i].saturating_sub(first_use[i])),
             i,
-            std::cmp::Reverse(last_use[i].saturating_sub(i)),
         )
     });
 
@@ -496,7 +645,7 @@ pub fn plan_from_sizes(sizes: &[usize], last_use: &[usize], layout: ArenaLayout)
     let mut assigned = vec![usize::MAX; sizes.len()];
 
     for &i in &order {
-        let (start, end) = (i, last_use[i]);
+        let (start, end) = (first_use[i], last_use[i]);
         let mut placed = None;
         for (si, intervals) in slot_intervals.iter_mut().enumerate() {
             // Overlap is half-open in the direction this problem needs: a value
@@ -538,7 +687,16 @@ pub fn plan_from_sizes(sizes: &[usize], last_use: &[usize], layout: ArenaLayout)
     let by_ordinal = assigned
         .iter()
         .enumerate()
-        .map(|(i, &slot)| (slot, sizes[i]))
+        .map(|(i, &slot)| {
+            if slot == usize::MAX {
+                // Excluded: session state, or an ordinal the plan does not
+                // cover. `None` makes `acquire` decline it, so it allocates
+                // from the pool exactly as it did before.
+                None
+            } else {
+                Some((slot, sizes[i]))
+            }
+        })
         .collect();
 
     StepPlan::new(slots, by_ordinal)
@@ -577,13 +735,27 @@ fn align_up(x: usize, a: usize) -> usize {
 pub struct ArenaRecorder {
     /// Size of each allocation, in ordinal order.
     sizes: Vec<usize>,
-    /// Ordinal at which each allocation was released. `None` while still live.
-    freed_at: Vec<Option<usize>>,
-    /// Allocation ordinals of values still live, keyed by the identity the
-    /// caller uses to report a free.
-    live: Vec<(u64, usize)>,
+    /// Dispatch position each value was allocated at.
+    first_bind: Vec<usize>,
+    /// Dispatch position each value was last bound at -- **where its interval
+    /// ends**, because binding is the clock the GPU orders execution by.
+    last_bind: Vec<usize>,
+    /// Which value currently owns each buffer address.
+    ///
+    /// Reassigned when a buffer is handed to a later value, which is how one
+    /// pooled buffer serving many values yields many intervals rather than one
+    /// merged one (§9.2c).
+    by_addr: std::collections::HashMap<usize, usize>,
+    /// Dispatches encoded so far this step -- the coordinate intervals live in.
+    dispatch: usize,
     /// Allocations seen so far this step.
     ordinal: usize,
+    /// Sizes seen at each ordinal on a *previous* step, when one was recorded.
+    ///
+    /// Empty until [`Self::next_step`] is called. Comparing two steps is what
+    /// separates an activation from session state, and it has to be measured
+    /// rather than assumed -- see [`Self::kv_dependent`].
+    previous: Vec<usize>,
 }
 
 impl ArenaRecorder {
@@ -591,41 +763,88 @@ impl ArenaRecorder {
         Self::default()
     }
 
-    /// Record an allocation of `size` bytes, tagged with a caller-chosen
-    /// `token` that [`Self::record_free`] will use to close it.
+    /// Close the step just recorded and begin another, keeping the first step's
+    /// sizes for comparison.
     ///
-    /// The token identifies *this allocation event*, not the buffer: reusing a
-    /// buffer produces a new event with a new token, which is exactly the
-    /// value-not-buffer distinction §9.2c requires.
-    pub fn record_alloc(&mut self, token: u64, size: usize) {
+    /// Two steps are the minimum that can distinguish an activation from session
+    /// state, which is why this exists rather than the recorder planning from
+    /// one step. #68's planner needs `>= 2` decode steps for the same reason and
+    /// raises rather than silently returning an empty set.
+    pub fn next_step(&mut self) {
+        self.previous = std::mem::take(&mut self.sizes);
+        self.first_bind.clear();
+        self.last_bind.clear();
+        self.by_addr.clear();
+        self.dispatch = 0;
+        self.ordinal = 0;
+    }
+
+    /// Ordinals whose allocation size differs between the two recorded steps.
+    ///
+    /// **This is how session state is kept out of the arena** (`DESIGN.md` §9.1,
+    /// #68 finding 4), and it is detected empirically rather than by kernel
+    /// name, because `copy2d_f16` serves both the KV reallocation and ordinary
+    /// activation movement -- the name does not separate them, and the size
+    /// growing with `kv_len` does.
+    ///
+    /// Measured on LFM2 decode, the excluded population is the KV cache and the
+    /// `Tensor::cat` copies it moves through, whose values grow by exactly 128 B
+    /// per token. A slot whose occupant grows cannot hold a fixed offset, so
+    /// everything packed after it drifts: with them left in, 969 bindings fail
+    /// the 674-position stability check.
+    ///
+    /// An ordinal present in one step and not the other counts as differing --
+    /// the sequence itself moved there, so nothing about it is fixed.
+    pub fn kv_dependent(&self) -> Vec<bool> {
+        let n = self.sizes.len();
+        (0..n)
+            .map(|i| match self.previous.get(i) {
+                Some(&prev) => prev != self.sizes[i],
+                // No previous step to compare against: treated as varying, so
+                // an unpaired recording excludes everything rather than
+                // admitting session state by default. Failing toward the pool is
+                // the safe direction -- it costs arena coverage, never
+                // correctness.
+                None => true,
+            })
+            .collect()
+    }
+
+    /// Record an allocation of `size` bytes served by the buffer at `addr`.
+    ///
+    /// `addr` identifies the *buffer*, and the ordinal identifies the *value*.
+    /// Both are needed and they are not the same thing (§9.2c): the pool hands
+    /// one buffer to many unrelated values within a token, so binding is
+    /// observed by address while liveness is keyed by allocation event. A later
+    /// allocation reusing the same address opens a new value and takes the
+    /// address over from the old one, which is what stops the two from merging.
+    pub fn record_alloc(&mut self, addr: usize, size: usize) {
         let ordinal = self.ordinal;
         self.ordinal += 1;
         self.sizes.push(size);
-        self.freed_at.push(None);
-        self.live.push((token, ordinal));
+        // A value is born at the dispatch about to be encoded and, until a bind
+        // says otherwise, dies there too.
+        self.first_bind.push(self.dispatch);
+        self.last_bind.push(self.dispatch);
+        // The address now names this value. Any earlier value that had it has
+        // been reused, and its own binds were recorded while it held it.
+        self.by_addr.insert(addr, ordinal);
     }
 
-    /// Record that the value tagged `token` has been released.
+    /// Record that a dispatch bound the buffer at `addr`.
     ///
-    /// Its interval ends at the **last ordinal already issued**, not at the next
-    /// one. The distinction is an off-by-one that decides whether the packing
-    /// does anything at all: stamping the next ordinal would make every value
-    /// collide with its immediate successor, so nothing would ever share a slot
-    /// and the arena would degenerate into the non-aliasing reference.
-    ///
-    /// This matches #68's convention, where `last_use` is the position of the
-    /// last dispatch that reads the value, and it pairs with an overlap test
-    /// that is half-open in the same direction: a value allocated at exactly
-    /// another's last use *may* take its bytes, because the earlier one is done
-    /// being read by then.
-    pub fn record_free(&mut self, token: u64) {
-        let at = self.ordinal.saturating_sub(1);
-        if let Some(pos) = self.live.iter().rposition(|&(t, _)| t == token) {
-            let (_, ordinal) = self.live.remove(pos);
-            // Never before its own allocation: a value freed immediately is
-            // live for exactly the instant it was created.
-            self.freed_at[ordinal] = Some(at.max(ordinal));
+    /// Called once per binding, in encode order, and it is what closes an
+    /// interval -- see the type docs. The dispatch counter is the recorder's
+    /// own, so it advances with [`Self::record_dispatch`].
+    pub fn record_bind(&mut self, addr: usize) {
+        if let Some(&ordinal) = self.by_addr.get(&addr) {
+            self.last_bind[ordinal] = self.dispatch;
         }
+    }
+
+    /// Advance the dispatch counter. Called once per dispatch, in encode order.
+    pub fn record_dispatch(&mut self) {
+        self.dispatch += 1;
     }
 
     /// Allocations recorded so far.
@@ -643,22 +862,36 @@ impl ArenaRecorder {
     /// the conservative direction: it can then share bytes with nothing, so the
     /// plan is larger but never aliases two live values. #68 records 39 such
     /// values -- dead stores and the final logits, which leave the arena.
+    /// Build a plan from what was observed, excluding session state.
+    ///
+    /// Ordinals whose size moved between the two recorded steps are left out of
+    /// the arena entirely and take the pool path -- see [`Self::kv_dependent`].
+    /// They keep their place in the ordinal sequence, so excluding one does not
+    /// shift the slot every later allocation resolves to.
     pub fn plan(&self, layout: ArenaLayout) -> StepPlan {
-        let end = self.ordinal.saturating_sub(1);
-        let last_use: Vec<usize> = self
-            .freed_at
-            .iter()
-            .enumerate()
-            .map(|(i, f)| f.unwrap_or(end).max(i))
-            .collect();
-        plan_from_sizes(&self.sizes, &last_use, layout)
+        plan_from_intervals(
+            &self.sizes,
+            &self.first_bind,
+            &self.last_bind,
+            &self.kv_dependent(),
+            layout,
+        )
     }
 
-    /// Forget everything, to record a fresh step.
+    /// How many ordinals were excluded as session state, and how many recorded.
+    pub fn excluded(&self) -> (usize, usize) {
+        let kv = self.kv_dependent();
+        (kv.iter().filter(|&&x| x).count(), kv.len())
+    }
+
+    /// Forget everything, including the previous step.
     pub fn reset(&mut self) {
         self.sizes.clear();
-        self.freed_at.clear();
-        self.live.clear();
+        self.first_bind.clear();
+        self.last_bind.clear();
+        self.by_addr.clear();
+        self.previous.clear();
+        self.dispatch = 0;
         self.ordinal = 0;
     }
 }
@@ -691,7 +924,9 @@ mod tests {
         let sizes = [4096, 4096, 4096];
         let last_use = [1, 2, 2];
         let plan = plan_from_sizes(&sizes, &last_use, ArenaLayout::Packed);
-        let s: Vec<usize> = plan.by_ordinal.iter().map(|&(slot, _)| slot).collect();
+        let s: Vec<usize> = (0..plan.allocations())
+            .map(|i| plan.slot_of(i).expect("ordinal is served"))
+            .collect();
         assert_ne!(s[0], s[1], "overlapping values shared a slot");
         assert_ne!(s[1], s[2], "overlapping values shared a slot");
         assert_eq!(s[0], s[2], "disjoint values did not share a slot");
@@ -710,7 +945,9 @@ mod tests {
         let reference = plan_from_sizes(&sizes, &last_use, ArenaLayout::NonAliasing);
 
         assert_eq!(reference.slots().len(), 3, "a value shared a slot");
-        let s: Vec<usize> = reference.by_ordinal.iter().map(|&(slot, _)| slot).collect();
+        let s: Vec<usize> = (0..reference.allocations())
+            .map(|i| reference.slot_of(i).expect("ordinal is served"))
+            .collect();
         assert_eq!(s, vec![0, 1, 2]);
         assert!(
             reference.arena_bytes() > packed.arena_bytes(),
@@ -787,7 +1024,7 @@ mod tests {
                     size: 128,
                 },
             ],
-            vec![(0, 128), (1, 128)],
+            vec![Some((0, 128)), Some((1, 128))],
         );
         good.check_disjoint().expect("disjoint slots rejected");
 
@@ -803,7 +1040,7 @@ mod tests {
                     size: 128,
                 },
             ],
-            vec![(0, 256), (1, 128)],
+            vec![Some((0, 256)), Some((1, 128))],
         );
         let err = bad
             .check_disjoint()
@@ -816,7 +1053,7 @@ mod tests {
                 offset: 64,
                 size: 128,
             }],
-            vec![(0, 128)],
+            vec![Some((0, 128))],
         );
         let err = misaligned
             .check_disjoint()
@@ -986,17 +1223,39 @@ mod tests {
     /// The recorder cannot make the mistake because it never sees a buffer: the
     /// token identifies the allocation event. This test states that as a
     /// property rather than trusting the absence.
+    /// Record `f` as two consecutive decode steps.
+    ///
+    /// Two steps are what the recorder needs to tell an activation from session
+    /// state, and replaying identical steps is the fixed-shape case: nothing
+    /// grows, so nothing is excluded. A test that recorded one step would get an
+    /// empty plan, because an unpaired recording excludes everything rather than
+    /// admitting session state by default.
+    fn record_twice(f: impl Fn(&mut ArenaRecorder)) -> ArenaRecorder {
+        let mut rec = ArenaRecorder::new();
+        f(&mut rec);
+        rec.next_step();
+        f(&mut rec);
+        rec
+    }
+
     #[test]
     fn liveness_keys_on_the_value_not_on_the_recycled_buffer() {
-        let mut rec = ArenaRecorder::new();
-
         // Three values that happen to land in the same pooled buffer, each
         // fully consumed before the next is allocated -- the `buf#328` pattern,
         // which #68 observed 13 times per token.
-        for token in 0..3u64 {
-            rec.record_alloc(token, 21504);
-            rec.record_free(token);
-        }
+        // Each is allocated, bound by the dispatch that produces it and the one
+        // that consumes it, and then the buffer is handed to the next value --
+        // the same address, a new allocation event.
+        const ADDR: usize = 0x328;
+        let rec = record_twice(|rec| {
+            for _ in 0..3 {
+                rec.record_alloc(ADDR, 21504);
+                rec.record_bind(ADDR); // produced
+                rec.record_dispatch();
+                rec.record_bind(ADDR); // consumed
+                rec.record_dispatch();
+            }
+        });
 
         let plan = rec.plan(ArenaLayout::Packed);
         assert_eq!(
@@ -1013,7 +1272,9 @@ mod tests {
         );
         // All three ordinals resolve to the same slot, which is the positional
         // stability the arena exists for.
-        let slots: Vec<usize> = plan.by_ordinal.iter().map(|&(s, _)| s).collect();
+        let slots: Vec<usize> = (0..plan.allocations())
+            .map(|i| plan.slot_of(i).expect("ordinal is served"))
+            .collect();
         assert_eq!(slots, vec![0, 0, 0]);
     }
 
@@ -1022,15 +1283,19 @@ mod tests {
     /// trivially if the recorder simply gave everything its own slot.
     #[test]
     fn simultaneously_live_values_do_not_share() {
-        let mut rec = ArenaRecorder::new();
-        rec.record_alloc(0, 21504);
-        rec.record_alloc(1, 21504);
-        rec.record_alloc(2, 21504);
-        // All three live together -- the SwiGLU moment #68 identifies as the
-        // peak: silu(gate), up, and their product.
-        rec.record_free(0);
-        rec.record_free(1);
-        rec.record_free(2);
+        let rec = record_twice(|rec| {
+            for addr in [0xa0, 0xb0, 0xc0] {
+                rec.record_alloc(addr, 21504);
+                rec.record_bind(addr);
+                rec.record_dispatch();
+            }
+            // All three read together -- the SwiGLU moment #68 identifies as the
+            // peak: silu(gate), up, and their product.
+            for addr in [0xa0, 0xb0, 0xc0] {
+                rec.record_bind(addr);
+            }
+            rec.record_dispatch();
+        });
 
         let plan = rec.plan(ArenaLayout::Packed);
         assert_eq!(plan.slots().len(), 3, "live values shared a slot");
@@ -1042,19 +1307,113 @@ mod tests {
     /// live values on one slot. #68 counts 39 of these.
     #[test]
     fn a_value_never_freed_shares_with_nothing() {
-        let mut rec = ArenaRecorder::new();
-        rec.record_alloc(0, 4096); // never freed
-        rec.record_alloc(1, 4096);
-        rec.record_free(1);
-        rec.record_alloc(2, 4096);
-        rec.record_free(2);
+        let rec = record_twice(|rec| {
+            rec.record_alloc(0xa0, 4096); // bound throughout
+            rec.record_bind(0xa0);
+            rec.record_dispatch();
+            rec.record_alloc(0xb0, 4096);
+            rec.record_bind(0xb0);
+            rec.record_dispatch();
+            rec.record_alloc(0xc0, 4096);
+            rec.record_bind(0xc0);
+            rec.record_dispatch();
+            // The long-lived value is read once more at the end, so it spans
+            // both of the others.
+            rec.record_bind(0xa0);
+            rec.record_dispatch();
+        });
 
         let plan = rec.plan(ArenaLayout::Packed);
-        let slots: Vec<usize> = plan.by_ordinal.iter().map(|&(s, _)| s).collect();
+        let slots: Vec<usize> = (0..plan.allocations())
+            .map(|i| plan.slot_of(i).expect("ordinal is served"))
+            .collect();
         assert_ne!(slots[0], slots[1], "a live value shared with a later one");
         assert_ne!(slots[0], slots[2], "a live value shared with a later one");
         assert_eq!(slots[1], slots[2], "two dead values did not share");
         assert_eq!(plan.slots().len(), 2);
+    }
+
+    /// **Session state is excluded because its size moves between two recorded
+    /// steps** (§9.1, #68 finding 4), and this is the check that makes the
+    /// exclusion empirical rather than a guess about kernel names.
+    ///
+    /// The modelling error it prevents is not an overflow but a *drift*: a slot
+    /// whose occupant grows cannot hold a fixed offset, so every value packed
+    /// after it moves. With KV left in, 969 bindings fail #68's 674-position
+    /// stability check.
+    #[test]
+    fn a_value_that_grows_between_steps_is_kept_out_of_the_arena() {
+        let mut step = |kv: usize, rec: &mut ArenaRecorder| {
+            rec.record_alloc(0xa0, 4096);
+            rec.record_bind(0xa0);
+            rec.record_dispatch();
+            rec.record_alloc(0xb0, kv * 1024);
+            rec.record_bind(0xb0);
+            rec.record_dispatch();
+        };
+        let mut rec = ArenaRecorder::new();
+        step(35, &mut rec); // step one
+        rec.next_step();
+        step(36, &mut rec); // step two: the kv value is one token larger
+
+        let (excluded, total) = rec.excluded();
+        assert_eq!(total, 2);
+        assert_eq!(excluded, 1, "the growing value was not excluded");
+
+        let plan = rec.plan(ArenaLayout::Packed);
+        assert!(
+            plan.slot_of(0).is_some(),
+            "the fixed activation was excluded"
+        );
+        assert_eq!(
+            plan.slot_of(1),
+            None,
+            "the growing value was given a fixed slot"
+        );
+        // And the arena is sized for the activation alone, not for the kv value.
+        assert_eq!(plan.arena_bytes(), 4096);
+    }
+
+    /// The mutation for the test above: if the two steps are *identical*, the
+    /// same value is an ordinary activation and must be served.
+    ///
+    /// Without this, `a_value_that_grows_between_steps_is_kept_out_of_the_arena`
+    /// would also pass if the recorder excluded everything unconditionally --
+    /// which it does, deliberately, when there is only one step to look at.
+    #[test]
+    fn a_value_that_does_not_grow_is_served() {
+        let rec = record_twice(|rec| {
+            rec.record_alloc(0xa0, 4096);
+            rec.record_bind(0xa0);
+            rec.record_dispatch();
+            rec.record_alloc(0xb0, 35 * 1024);
+            rec.record_bind(0xb0);
+            rec.record_dispatch();
+        });
+
+        let (excluded, total) = rec.excluded();
+        assert_eq!((excluded, total), (0, 2), "a fixed value was excluded");
+        let plan = rec.plan(ArenaLayout::Packed);
+        assert!(plan.slot_of(0).is_some());
+        assert!(plan.slot_of(1).is_some());
+    }
+
+    /// An unpaired recording excludes everything rather than admitting session
+    /// state by default.
+    ///
+    /// Failing toward the pool costs arena coverage and never correctness, which
+    /// is the right direction for a mechanism whose failure mode under
+    /// `HazardTrackingModeUntracked` is silent corruption (§9.3).
+    #[test]
+    fn a_single_recorded_step_plans_nothing() {
+        let mut rec = ArenaRecorder::new();
+        rec.record_alloc(0xa0, 4096);
+        rec.record_bind(0xa0);
+        rec.record_dispatch();
+
+        let (excluded, total) = rec.excluded();
+        assert_eq!((excluded, total), (1, 1));
+        assert_eq!(rec.plan(ArenaLayout::Packed).arena_bytes(), 0);
     }
 
     /// The plan's byte total is the peak, and it is what the arena allocates.

@@ -118,6 +118,16 @@ impl Buffer {
         Retained::as_ptr(&self.raw)
     }
 
+    /// Address of the underlying `MTLBuffer`, as the encoder sees it.
+    ///
+    /// The same value the hazard tracking and the dispatch trace key on, so an
+    /// arena recording can attribute a bind back to the allocation that produced
+    /// the buffer. It identifies the *buffer*, which is deliberately not the
+    /// same thing as the value occupying it (§9.2c).
+    pub fn raw_addr(&self) -> usize {
+        self.raw_ptr() as usize
+    }
+
     /// Bytes this handle addresses.
     ///
     /// A view reports its slot's extent, not the arena's. `fill_buffer` and

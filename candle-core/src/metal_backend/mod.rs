@@ -20,6 +20,12 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 mod device;
 pub use device::{DeviceId, MetalDevice};
 
+/// The activation arena's public vocabulary (`DESIGN.md` §9.2).
+///
+/// Re-exported for the same reason `trace` is below: a harness selecting a
+/// layout should not need a direct dependency on `candle-metal-kernels`.
+pub use candle_metal_kernels::metal::{ArenaCounters, ArenaLayout, Slot, StepPlan};
+
 /// Per-dispatch recording of the Metal command stream.
 ///
 /// Re-exported so a measurement harness can drive it without taking a direct

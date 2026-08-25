@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-use candle::metal_backend::trace;
+use candle::metal_backend::{trace, ArenaLayout};
 
 #[derive(Parser, Debug)]
 #[command(about = "LFM2 decode dispatch-sequence probe")]
@@ -100,6 +100,24 @@ struct Args {
     /// that says nothing about replayability across decode tokens.
     #[arg(long)]
     include_prefill: bool,
+
+    /// Serve decode activations from an activation arena (`DESIGN.md` §9.2).
+    ///
+    /// One steady-state decode step is recorded to derive the plan, the arena is
+    /// installed, and the remaining steps run against it. This is the arm whose
+    /// "buffer identity varies" count should read 0.
+    #[arg(long)]
+    arena: bool,
+
+    /// Arena layout: `packed` (§9.2's plan) or `non-aliasing` (§9.3's reference,
+    /// every value in its own slot so aliasing is impossible by construction).
+    ///
+    /// The two must produce identical output. That comparison is the parity
+    /// check §9.3 requires, and it is an execution comparison rather than a size
+    /// one -- the whole point being that offset arithmetic has no other detector
+    /// under `HazardTrackingModeUntracked`.
+    #[arg(long, default_value = "packed")]
+    arena_layout: String,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -434,6 +452,30 @@ fn main() -> Result<()> {
     }
     kv_len += prompt_ids.len();
 
+    let metal_device = match &device {
+        Device::Metal(d) => Some(d.clone()),
+        _ => None,
+    };
+    let layout = match args.arena_layout.as_str() {
+        "packed" => ArenaLayout::Packed,
+        "non-aliasing" | "nonaliasing" | "reference" => ArenaLayout::NonAliasing,
+        other => anyhow::bail!("unknown --arena-layout {other:?}; want packed or non-aliasing"),
+    };
+    // Decode steps 0..record_steps are recorded, and the arena is installed
+    // after them.
+    //
+    // **Two, not one.** Comparing two steps is what separates an activation from
+    // session state: an allocation whose size moved between them is sized by
+    // `kv_len` and must not enter the arena (`DESIGN.md` §9.1, #68 finding 4).
+    // With one step there is no growth to observe, and the KV cache and its
+    // `Tensor::cat` copies would be packed as though they were fixed -- which is
+    // exactly the modelling error that makes 969 bindings unstable.
+    //
+    // They are the *first* steps so that every step the stability analysis
+    // compares is served by the arena; the recording steps necessarily run on
+    // the pool, since the arena does not exist until its plan does.
+    let record_steps = 2usize;
+
     let mut tokens: Vec<u32> = Vec::new();
     for step in 0..args.n {
         let next = logits_processor.sample(&logits).context("sampling")?;
@@ -455,6 +497,17 @@ fn main() -> Result<()> {
         // it belongs to rather than to the window opened next.
         trace_window(&device)?;
 
+        if let (true, Some(dev)) = (args.arena, metal_device.as_ref()) {
+            if step == 0 {
+                dev.begin_arena_recording();
+            } else if step < record_steps {
+                // Close the previous recorded step and open another, keeping the
+                // first step's sizes so the two can be compared.
+                dev.next_arena_recording_step();
+            }
+            dev.begin_decode_step();
+        }
+
         let label = format!("decode[{step}] kv_len={kv_len}");
         trace::set_region(Some(label.clone()));
         trace::set_recording(true);
@@ -465,9 +518,51 @@ fn main() -> Result<()> {
         trace_window(&device)?;
         trace::set_recording(false);
 
+        if let (true, Some(dev)) = (args.arena, metal_device.as_ref()) {
+            dev.end_decode_step();
+            if step == record_steps - 1 {
+                let excluded = dev.arena_recording_excluded();
+                let plan = dev
+                    .finish_arena_recording(layout)
+                    .context("arena recording produced no allocations")?;
+                let (covered, total) = plan.covered();
+                if let Some((n_excl, n_all)) = excluded {
+                    eprintln!(
+                        "arena: {n_all} allocations recorded over {record_steps} steps, \
+                         {n_excl} excluded as session state (size moved with kv_len)"
+                    );
+                }
+                eprintln!(
+                    "arena: {covered} of {total} ordinals served -> {} slots, {} B ({:?})",
+                    plan.slots().len(),
+                    plan.arena_bytes(),
+                    layout,
+                );
+                for (i, s) in plan.slots().iter().enumerate() {
+                    eprintln!("  slot {i:>2}  offset {:>7}  size {:>7}", s.offset, s.size);
+                }
+                dev.install_arena(plan, layout)
+                    .context("installing the arena")?;
+            }
+        }
+
         let dispatches = trace::take_dispatches();
         steps.push(Step { label, dispatches });
         kv_len += 1;
+    }
+
+    if let (true, Some(dev)) = (args.arena, metal_device.as_ref()) {
+        if let Some(c) = dev.arena_counters() {
+            println!(
+                "\n== arena ==\nsteps {}  offers {}  hits {}  declined(session) {}  declined(size) {}  declined(past plan) {}",
+                c.steps, c.offers, c.hits, c.declined_session, c.declined_size, c.declined_exhausted
+            );
+            let (_, private) = dev.pool_counters();
+            println!(
+                "private pool: lookups {}  hits {}  allocations {}",
+                private.lookups, private.hits, private.allocations
+            );
+        }
     }
 
     trace::set_region(None);
@@ -530,16 +625,44 @@ fn main() -> Result<()> {
     // difference is whichever position happens to come earliest, which says
     // nothing about how much of the sequence is unstable or why.
     println!("\n== what varies across steady-state decode steps ==");
-    let n = decode_steps[1].dispatches.len();
-    let uniform_len = decode_steps.iter().skip(1).all(|s| s.dispatches.len() == n);
+    // Index of the step the comparison baselines on.
+    //
+    // 1 normally: `decode[0]` follows prefill and is not steady state. With an
+    // arena, the steps the plan was recorded from ran on the pool -- the arena
+    // does not exist until its plan does -- so the baseline moves past them.
+    // Comparing an arena-served step against a pool-served one would report
+    // variance that is an artefact of when the arena was installed rather than a
+    // property of the arena.
+    let base_idx = if args.arena { record_steps + 1 } else { 1 };
+    anyhow::ensure!(
+        decode_steps.len() > base_idx + 1,
+        "need at least {} decode steps to compare; got {}",
+        base_idx + 2,
+        decode_steps.len()
+    );
+    println!(
+        "baseline: {} (comparing {} steps)",
+        decode_steps[base_idx].label,
+        decode_steps.len() - base_idx
+    );
+    let n = decode_steps[base_idx].dispatches.len();
+    let uniform_len = decode_steps
+        .iter()
+        .skip(base_idx)
+        .all(|s| s.dispatches.len() == n);
     if uniform_len {
         let mut grid_varies: Vec<usize> = Vec::new();
         let mut offset_varies: Vec<usize> = Vec::new();
         let mut buffer_varies: Vec<usize> = Vec::new();
         let mut kernel_varies: Vec<usize> = Vec::new();
         for i in 0..n {
-            let base = &decode_steps[1].dispatches[i];
-            let rest = || decode_steps.iter().skip(2).map(|s| &s.dispatches[i]);
+            let base = &decode_steps[base_idx].dispatches[i];
+            let rest = || {
+                decode_steps
+                    .iter()
+                    .skip(base_idx + 1)
+                    .map(|s| &s.dispatches[i])
+            };
             if rest().any(|d| d.pipeline != base.pipeline) {
                 kernel_varies.push(i);
             }
@@ -574,7 +697,7 @@ fn main() -> Result<()> {
                 let mut by_kernel: BTreeMap<&str, usize> = BTreeMap::new();
                 for &i in idx {
                     *by_kernel
-                        .entry(decode_steps[1].dispatches[i].pipeline.as_str())
+                        .entry(decode_steps[base_idx].dispatches[i].pipeline.as_str())
                         .or_default() += 1;
                 }
                 let mut v: Vec<_> = by_kernel.into_iter().collect();
@@ -600,7 +723,7 @@ fn main() -> Result<()> {
             let deltas: Vec<i64> = seq.windows(2).map(|w| w[1] as i64 - w[0] as i64).collect();
             println!(
                 "\nexample growing dispatch: #{i} {} grid.height {:?}",
-                decode_steps[1].dispatches[i].pipeline,
+                decode_steps[base_idx].dispatches[i].pipeline,
                 &seq[..seq.len().min(8)]
             );
             println!("  per-token delta: {:?}", &deltas[..deltas.len().min(7)]);
@@ -667,6 +790,23 @@ fn main() -> Result<()> {
         println!("full trace written to {}", path.display());
     }
 
+    // The token stream, so two runs can be compared by *what they computed*
+    // rather than only by what they dispatched.
+    //
+    // This is what makes §9.3's parity check an execution comparison: the packed
+    // layout aliases values that the non-aliasing reference keeps apart, so if
+    // the offset arithmetic is wrong the two runs compute different things.
+    // Under `HazardTrackingModeUntracked` there is no other detector -- a bad
+    // offset is a silent wrong answer, not an error. Sampling is deterministic
+    // given the seed (§2.3.8), so a difference here is the arena's.
     println!("\ngenerated {} tokens", tokens.len());
+    println!(
+        "tokens: {}",
+        tokens
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     Ok(())
 }

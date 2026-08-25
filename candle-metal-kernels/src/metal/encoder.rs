@@ -1,4 +1,5 @@
 use crate::metal::{
+    arena,
     executor::{DispatchRecord, ExecutorSlot, Grid},
     trace, Buffer, ComputePipeline, Fence,
 };
@@ -197,6 +198,7 @@ impl ComputeCommandEncoder {
             size_tuple(threads_per_threadgroup),
             false,
         );
+        arena::note_dispatch();
         if !self.offer_to_executor(
             Grid::Threads(threads_per_grid.into()),
             threads_per_threadgroup,
@@ -218,6 +220,7 @@ impl ComputeCommandEncoder {
             size_tuple(threads_per_threadgroup),
             true,
         );
+        arena::note_dispatch();
         if !self.offer_to_executor(
             Grid::Threadgroups(threadgroups_per_grid.into()),
             threads_per_threadgroup,
@@ -276,6 +279,9 @@ impl ComputeCommandEncoder {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
             trace::record_binding(index, ptr, offset, false);
+            // The clock a liveness recording must use: a value is live until the
+            // last dispatch that binds it (`DESIGN.md` §6.7 L4).
+            arena::note_bind(ptr);
             // Read-after-write against an earlier encoder: order against that
             // buffer's last writer only.
             self.wait_for_buffer(ptr);
@@ -304,6 +310,7 @@ impl ComputeCommandEncoder {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
             trace::record_binding(index, ptr, offset, true);
+            arena::note_bind(ptr);
             // Write-after-write or write-after-read against an earlier encoder.
             self.wait_for_buffer(ptr);
             let mut s = self.state.lock().unwrap();

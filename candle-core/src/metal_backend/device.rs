@@ -92,7 +92,7 @@ pub struct MetalDevice {
     /// activation set up front -- but the dispatch sequence is stable
     /// (§11.1a.1), so one observed step describes the rest. This is §11.1a's
     /// record-then-replay, applied to allocation.
-    pub(crate) arena_recorder: Arc<Mutex<Option<ArenaRecorder>>>,
+    pub(crate) arena_recorder: Arc<Mutex<Option<Arc<Mutex<ArenaRecorder>>>>>,
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
@@ -334,9 +334,38 @@ impl MetalDevice {
     /// token after prefill allocates a different set, and #68 plans from
     /// `decode[1]` for the same reason.
     pub fn begin_arena_recording(&self) {
+        let rec = Arc::new(Mutex::new(ArenaRecorder::new()));
+        // The encoder observes binds, which is where an interval ends, so it
+        // needs the same recorder this device is filling.
+        candle_metal_kernels::metal::arena::set_bind_observer(Some(Arc::clone(&rec)));
         if let Ok(mut g) = self.arena_recorder.lock() {
-            *g = Some(ArenaRecorder::new());
+            *g = Some(rec);
         }
+    }
+
+    /// Close the decode step being recorded and begin recording another.
+    ///
+    /// **Two steps are the minimum a plan can be built from**, because comparing
+    /// them is what separates an activation from session state: an allocation
+    /// whose size moved between them is sized by `kv_len` and must not enter the
+    /// arena (`DESIGN.md` §9.1, #68 finding 4). #68's planner likewise requires
+    /// two decode steps and refuses rather than silently returning nothing.
+    pub fn next_arena_recording_step(&self) {
+        if let Ok(g) = self.arena_recorder.lock() {
+            if let Some(rec) = g.as_ref() {
+                if let Ok(mut r) = rec.lock() {
+                    r.next_step();
+                }
+            }
+        }
+    }
+
+    /// How many recorded ordinals were excluded as session state, of the total.
+    pub fn arena_recording_excluded(&self) -> Option<(usize, usize)> {
+        let g = self.arena_recorder.lock().ok()?;
+        let rec = g.as_ref()?;
+        let r = rec.lock().ok()?;
+        Some(r.excluded())
     }
 
     /// Stop observing and build a plan from what was seen.
@@ -345,12 +374,14 @@ impl MetalDevice {
     /// distinguishing from an empty plan -- it means recording was never begun
     /// or the step allocated nothing.
     pub fn finish_arena_recording(&self, layout: ArenaLayout) -> Option<StepPlan> {
+        candle_metal_kernels::metal::arena::set_bind_observer(None);
         let mut g = self.arena_recorder.lock().ok()?;
         let rec = g.take()?;
-        if rec.is_empty() {
+        let r = rec.lock().ok()?;
+        if r.is_empty() {
             return None;
         }
-        Some(rec.plan(layout))
+        Some(r.plan(layout))
     }
 
     /// Record one decode step and install the resulting arena.
@@ -414,44 +445,31 @@ impl MetalDevice {
         Ok(self.note_for_recording(buffer, size))
     }
 
-    /// While a plan is being recorded, note this allocation and arrange to be
-    /// told when it dies.
+    /// While a plan is being recorded, note this allocation.
     ///
-    /// The pair is the value's liveness interval, and the *value* is one
-    /// allocation event -- never a buffer. `DESIGN.md` §9.2c: candle's pool puts
-    /// 60 unrelated values in one buffer within a single token, so a recorder
-    /// that keyed on buffer identity would merge them and invent lifetimes;
-    /// #68's first planner did that and overstated the arena 52-fold. Nothing
-    /// here consults which buffer was handed out.
+    /// Records the allocation's *size* and the *address* of the buffer serving
+    /// it. The address is only how later binds are attributed back to this
+    /// value; the value itself is the **allocation event**, never the buffer
+    /// (`DESIGN.md` §9.2c). When a later allocation is handed the same address
+    /// it takes the address over, and the earlier value keeps the interval it
+    /// accumulated while it held it -- so one pooled buffer serving 60 values
+    /// yields 60 intervals rather than one merged one. That merge is the mistake
+    /// that made #68's first planner report 3.55 MB against the true 68 KB.
+    ///
+    /// The interval **ends at the last bind**, not here and not when the handle
+    /// drops -- see `ArenaRecorder::record_bind` for why the CPU's clock is the
+    /// wrong one.
     fn note_for_recording(&self, buffer: Arc<PooledBuffer>, size: usize) -> Arc<PooledBuffer> {
-        let Ok(mut guard) = self.arena_recorder.lock() else {
+        let Ok(guard) = self.arena_recorder.lock() else {
             return buffer;
         };
-        let Some(rec) = guard.as_mut() else {
+        let Some(rec) = guard.as_ref() else {
             return buffer;
         };
-        // The token names this allocation event. A fresh one every time, so two
-        // values that share a buffer still get separate intervals.
-        let token = rec.len() as u64;
-        rec.record_alloc(token, size);
-        drop(guard);
-
-        // A death hook can only be attached to a handle nobody else holds yet.
-        // A pool hit hands back an `Arc` that is uniquely owned at this instant,
-        // so unwrapping it is sound; if it ever were not, recording simply skips
-        // this value rather than failing, and the value is then treated as live
-        // to the end of the step -- the conservative direction.
-        let recorder = Arc::clone(&self.arena_recorder);
-        match Arc::try_unwrap(buffer) {
-            Ok(b) => Arc::new(b.on_death(move |_| {
-                if let Ok(mut g) = recorder.lock() {
-                    if let Some(rec) = g.as_mut() {
-                        rec.record_free(token);
-                    }
-                }
-            })),
-            Err(shared) => shared,
+        if let Ok(mut r) = rec.lock() {
+            r.record_alloc(buffer.raw_addr(), size);
         }
+        buffer
     }
 
     /// Creates a new private buffer (not necessarily zeroed).
