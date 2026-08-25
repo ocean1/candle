@@ -146,79 +146,162 @@ fn index_select_every_dtype_pair_matches_cpu() -> Result<()> {
     Ok(())
 }
 
-/// `index_select` on a non-contiguous source computes the wrong values.
+/// `index_select` on a **non-contiguous source** must agree with the CPU.
 ///
-/// **This documents a pre-existing defect rather than asserting correctness**,
-/// and it is deliberately written to pass *while the bug is present* so that it
-/// records the behaviour without failing a suite that has nothing to do with
-/// it. Found while adding the parity tests above; not fixed here, because this
-/// PR's scope is templating plus the name registry and a kernel signature
-/// change is a different concern with a different failure mode.
+/// This replaces `index_select_strided_source_is_known_wrong`, which asserted
+/// the *inequality* that the defect below produced. The defect is fixed, so the
+/// assertion is now the equality it always ought to have been. The old test is
+/// referenced by name here deliberately: it is the record that this was known,
+/// pinned, and then corrected rather than silently changed.
 ///
-/// The defect, in `indexing.metal`'s `index`:
+/// **The defect it pinned**, in `indexing.metal`'s `index`:
 ///
 /// ```text
 /// get_strided_index(src_i, src_dim_size, src_dims, src_strides)
-/// //                       ^^^^^^^^^^^^ num_dims is expected here
+/// //                       ^^^^^^^^^^^^ num_dims (the tensor's rank) belongs here
 /// ```
 ///
 /// `src_dim_size` is the extent of the *indexed dimension*; `get_strided_index`
-/// wants the tensor's *rank*. The CUDA kernel for the same op passes `num_dims`
-/// (`candle-kernels/src/indexing.cu:65`), so this is a Metal-only divergence
-/// from the reference implementation, not a shared convention.
+/// walks one iteration per *axis* and so wants the **rank**. Unrelated
+/// quantities sharing a type, which is why it compiled and read wrong elements
+/// in silence. The CUDA kernel for the same op passes the rank
+/// (`candle-kernels/src/indexing.cu:65`), so this was a **Metal-only divergence
+/// from the reference**, established by reading that source rather than
+/// inferred from the symptom.
 ///
-/// It is latent exactly when `rank != dims[dim]`, which is why no existing test
-/// caught it: at rank 2 with a 2-long indexed dimension the two coincide. It is
-/// reachable — `index_select` is the only op in `metal_backend/mod.rs` that
-/// passes `is_contiguous()` through to the kernel instead of rejecting a
-/// non-contiguous source, so the strided path is live.
+/// **Which arm this exercises: the strided one.** `contiguous` is false here,
+/// so the kernel takes `get_strided_index` rather than the `contiguous ? src_i`
+/// fast arm. That distinction is the whole point of this test — LFM2's decode
+/// path uses `is_u32_f16` on a *contiguous* embedding table, so it takes the
+/// other arm and unchanged LFM2 digests say nothing about this fix. The tests
+/// above (`index_select_every_dtype_pair_matches_cpu`,
+/// `embedding_lookup_shape_matches_cpu`) exercise the contiguous arm.
 ///
-/// LFM2 is unaffected: the embedding lookup is contiguous, so it takes the
-/// `contiguous ? src_i : ...` fast arm and never reaches `get_strided_index`.
+/// **Why the reference is `contiguous()` on the CPU rather than the CPU's own
+/// strided path.** The CPU backend *rejects* a non-contiguous source outright
+/// (`cpu_backend/mod.rs`'s `IndexSelect::f` bails with `RequiresContiguous`), so
+/// there is no CPU strided arm to compare against. The reference is therefore
+/// the same *logical* operation — materialize the transpose, then index-select —
+/// computed entirely on the CPU. That is a stronger anchor than comparing
+/// Metal's two arms against each other, which would only prove they agree.
+///
+/// The case set spans ranks 2 and 3 and both `dim` values, including shapes
+/// where `rank == dims[dim]`. Those coincidence cases pass even with the defect
+/// present; they are kept so the test does not merely encode one lucky shape,
+/// and the mutation test below identifies which cases discriminate.
 #[test]
-fn index_select_strided_source_is_known_wrong() -> Result<()> {
+fn index_select_strided_source_matches_cpu() -> Result<()> {
     let Some((cpu, metal)) = cpu_and_metal() else {
         return Ok(());
     };
 
-    let ids_v: Vec<u32> = vec![2, 0, 1, 1];
-    let ids = Tensor::from_vec(ids_v.clone(), ids_v.len(), &metal)?;
+    // (shape, dim, n_ids). Chosen so `rank` and `dims[dim]` differ in most
+    // cases -- that inequality is the condition under which the old argument
+    // and the correct one diverge.
+    let cases: &[(&[usize], usize, usize)] = &[
+        (&[3, 5], 0, 4),
+        (&[3, 5], 1, 3),
+        (&[4, 7], 0, 5),
+        (&[7, 4], 1, 6),
+        (&[2, 3, 4], 0, 3),
+        (&[2, 3, 4], 1, 4),
+        (&[2, 3, 4], 2, 2),
+        // rank == dims[dim]: the coincidence cases, which the defect did not
+        // affect. Kept so a future change that breaks only these is still seen.
+        (&[3, 2], 0, 3),
+        (&[5, 2], 1, 4),
+    ];
 
-    // Rank 2, indexed dimension 5 long: `num_dims` and `src_dim_size` differ,
-    // which is the condition that exposes the confusion.
-    let t = Tensor::from_vec(values(3 * 5), (3, 5), &metal)?.to_dtype(DType::F32)?;
-    let strided = t.t()?;
+    let mut checked = 0usize;
+    let mut discriminating = 0usize;
+
+    for &(shape, dim, n_ids) in cases {
+        let n: usize = shape.iter().product();
+        let raw = values(n);
+
+        // Transposing the last two axes makes the source non-contiguous while
+        // leaving every axis extent reachable, so `dim` still selects a real
+        // dimension of the transposed view.
+        let build = |dev: &Device| -> Result<(Tensor, Tensor)> {
+            let t = Tensor::from_vec(raw.clone(), shape, dev)?.to_dtype(DType::F32)?;
+            let rank = shape.len();
+            let strided = t.transpose(rank - 2, rank - 1)?;
+            let extent = strided.dims()[dim];
+            let ids_v: Vec<u32> = (0..n_ids).map(|i| ((i * 3 + 1) % extent) as u32).collect();
+            let ids = Tensor::from_vec(ids_v, n_ids, dev)?;
+            Ok((strided, ids))
+        };
+
+        let (m_strided, m_ids) = build(&metal)?;
+        assert!(
+            !m_strided.is_contiguous(),
+            "shape={shape:?} dim={dim}: the source must be non-contiguous, or this tests nothing"
+        );
+
+        let got = m_strided
+            .index_select(&m_ids, dim)
+            .unwrap_or_else(|e| panic!("strided index_select shape={shape:?} dim={dim}: {e}"));
+
+        // The CPU reference: same logical op, but materialized first, because
+        // the CPU backend declines a strided source.
+        let (c_strided, c_ids) = build(&cpu)?;
+        let want = c_strided.contiguous()?.index_select(&c_ids, dim)?;
+
+        assert_same(
+            &got,
+            &want,
+            &format!("strided index_select shape={shape:?} dim={dim}"),
+        );
+
+        if m_strided.dims().len() != m_strided.dims()[dim] {
+            discriminating += 1;
+        }
+        checked += 1;
+    }
+
+    // Non-vacuity, per the guard the other tests in this file carry: a loop that
+    // ran zero iterations would otherwise be green.
+    assert_eq!(checked, 9, "expected 9 strided cases, ran {checked}");
+    // And a sharper one specific to this test: at least one case must actually
+    // have `rank != dims[dim]`, or every case is a coincidence shape and the
+    // suite would pass with the defect reinstated.
     assert!(
-        !strided.is_contiguous(),
-        "the transposed source must be non-contiguous, or this tests nothing"
+        discriminating >= 5,
+        "only {discriminating} cases have rank != dims[dim]; this test would not \
+         discriminate the defect it exists to catch"
+    );
+    Ok(())
+}
+
+/// The CPU backend declines a strided `index_select` source; Metal accepts one.
+///
+/// Recorded as a test rather than a comment because it is the premise the test
+/// above rests on — its reference is `contiguous()` *because* of this — and
+/// because it is a second, larger CPU/Metal divergence than the argument bug,
+/// found while building that reference. It is **not** fixed here: making the two
+/// backends agree means either teaching the CPU the strided path or having Metal
+/// decline one, and both are behaviour changes well outside a one-argument
+/// numerics fix. CUDA, like Metal, supports the strided path
+/// (`candle-kernels/src/indexing.cu:65`), so the CPU is the odd one out and
+/// removing Metal's capability would be a divergence in the other direction.
+#[test]
+fn cpu_declines_strided_index_select_source() -> Result<()> {
+    let cpu = Device::Cpu;
+    let t = Tensor::from_vec(values(3 * 5), (3, 5), &cpu)?.to_dtype(DType::F32)?;
+    let strided = t.t()?;
+    assert!(!strided.is_contiguous());
+    let ids = Tensor::from_vec(vec![2u32, 0, 1, 1], 4, &cpu)?;
+
+    let err = strided
+        .index_select(&ids, 0)
+        .expect_err("the CPU backend is expected to decline a strided source");
+    assert!(
+        err.to_string().contains("contiguous"),
+        "expected a contiguity complaint, got: {err}"
     );
 
-    let via_strided = strided.index_select(&ids, 0)?;
-    let via_contiguous = strided.contiguous()?.index_select(&ids, 0)?;
-
-    // The contiguous arm is correct -- pinned against the CPU, so the
-    // comparison below is anchored outside Metal rather than to itself.
-    let cpu_t = Tensor::from_vec(values(3 * 5), (3, 5), &cpu)?
-        .to_dtype(DType::F32)?
-        .t()?
-        .contiguous()?;
-    let cpu_ids = Tensor::from_vec(ids_v, 4, &cpu)?;
-    assert_same(
-        &via_contiguous,
-        &cpu_t.index_select(&cpu_ids, 0)?,
-        "index_select contiguous arm vs cpu",
-    );
-
-    // And the strided arm disagrees with it. Asserted as *inequality* so this
-    // test turns red the moment the kernel is fixed -- at which point it should
-    // be rewritten as the equality it ought to be, which is the reminder.
-    let s = via_strided.flatten_all()?.to_vec1::<f32>()?;
-    let c = via_contiguous.flatten_all()?.to_vec1::<f32>()?;
-    assert_ne!(
-        s, c,
-        "the strided index_select defect appears to be fixed -- if so, replace \
-         this test with an equality assertion against the CPU backend"
-    );
+    // The same op succeeds once materialized, which is what the parity test uses.
+    strided.contiguous()?.index_select(&ids, 0)?;
     Ok(())
 }
 
@@ -427,5 +510,92 @@ fn embedding_lookup_shape_matches_cpu() -> Result<()> {
     let row = got.i(0)?.to_vec1::<f32>()?;
     let want: Vec<f32> = table[37 * hidden..38 * hidden].to_vec();
     assert_eq!(row, want, "embedding lookup returned the wrong row");
+    Ok(())
+}
+
+/// `gather` accepts a non-contiguous **source** and reads it as if contiguous.
+///
+/// **This documents a pre-existing defect rather than asserting correctness**,
+/// in the same shape and for the same reason `index_select_strided_source_is_\
+/// known_wrong` did before this change replaced it: written to pass *while the
+/// bug is present*, so the behaviour is on the record and turns red the moment
+/// it is corrected.
+///
+/// Found while building the CPU reference for
+/// `index_select_strided_source_matches_cpu`, and **it is a different defect
+/// from the one this change fixes**. That one passed the wrong *argument* to
+/// `get_strided_index`; this one has no strided path at all —
+/// `indexing.metal`'s `gather` computes
+///
+/// ```text
+/// src_i = (left_rank_i * src_dim_size + input_i) * right_size + right_rank_i
+/// ```
+///
+/// which is a flat contiguous offset, and the kernel receives neither
+/// `src_dims` nor `src_strides` to do anything else with.
+///
+/// **It is reachable because the guard is on the wrong operand.**
+/// `MetalStorage::gather` checks `ids_l.is_contiguous()` and never checks
+/// `src_l`, where `scatter_set`, `scatter_add_set` and `index_add` all check
+/// every operand they take. The CPU backend rejects it
+/// (`gather only supports contiguous tensors`), so this is a second Metal-only
+/// divergence in this file, of the same class and a larger kind.
+///
+/// **Not fixed here, deliberately.** This change is a one-argument numerics fix
+/// to `index_select` with a bisectable footprint; `gather` needs either a
+/// contiguity guard (a behaviour change — it would turn silently-wrong results
+/// into errors for any caller relying on the current path) or a strided arm
+/// with the parameters to support it (a signature change to a second family).
+/// Both are a separate concern with a separate failure mode, which is the same
+/// reasoning #64 applied when it left the `index_select` defect to this change.
+#[test]
+fn gather_strided_source_is_known_wrong() -> Result<()> {
+    let Some((cpu, metal)) = cpu_and_metal() else {
+        return Ok(());
+    };
+
+    let base: Vec<f32> = (0..12).map(|i| i as f32).collect();
+    let idx: Vec<u32> = (0..12).map(|i| (i % 3) as u32).collect();
+
+    // (3,4) transposed to a non-contiguous (4,3).
+    let t = Tensor::from_vec(base.clone(), (3, 4), &metal)?;
+    let strided = t.t()?;
+    assert!(
+        !strided.is_contiguous(),
+        "the transposed source must be non-contiguous, or this tests nothing"
+    );
+    let ids = Tensor::from_vec(idx.clone(), (4, 3), &metal)?;
+
+    let via_strided = strided.gather(&ids, 1)?;
+    let via_contiguous = strided.contiguous()?.gather(&ids, 1)?;
+
+    // The contiguous arm is correct, anchored on the CPU rather than on itself.
+    let cpu_t = Tensor::from_vec(base, (3, 4), &cpu)?.t()?.contiguous()?;
+    let cpu_ids = Tensor::from_vec(idx, (4, 3), &cpu)?;
+    assert_same(
+        &via_contiguous,
+        &cpu_t.gather(&cpu_ids, 1)?,
+        "gather contiguous arm vs cpu",
+    );
+
+    // The CPU declines the strided source outright, which is the divergence.
+    let cpu_strided =
+        Tensor::from_vec((0..12).map(|i| i as f32).collect::<Vec<_>>(), (3, 4), &cpu)?.t()?;
+    assert!(
+        cpu_strided.gather(&cpu_ids, 1).is_err(),
+        "the CPU backend is expected to decline a strided gather source"
+    );
+
+    // And Metal's strided arm disagrees with the correct answer. Asserted as
+    // inequality so this turns red when `gather` is fixed, at which point it
+    // should become an equality against the CPU -- the same reminder mechanism
+    // that brought the `index_select` defect to this change.
+    let s = via_strided.flatten_all()?.to_vec1::<f32>()?;
+    let c = via_contiguous.flatten_all()?.to_vec1::<f32>()?;
+    assert_ne!(
+        s, c,
+        "the strided gather defect appears to be fixed -- if so, replace this \
+         test with an equality assertion against the CPU backend"
+    );
     Ok(())
 }

@@ -42,6 +42,7 @@ template<typename TYPENAME, typename INDEX_TYPENAME>
     constant size_t &right_size,
     constant size_t &ids_size,
     constant bool &contiguous,
+    constant size_t &src_num_dims,
     constant size_t *src_dims,
     constant size_t *src_strides,
     const device TYPENAME *input,
@@ -65,7 +66,26 @@ template<typename TYPENAME, typename INDEX_TYPENAME>
       // No need to check for zero we're only allowing unsized.
       */
       const size_t src_i = left_rank_i * src_dim_size * right_size + input_i * right_size + right_rank_i;
-      const size_t strided_src_i = contiguous ? src_i : get_strided_index(src_i, src_dim_size, src_dims, src_strides);
+      // `src_num_dims` is the source tensor's **rank**, which is what
+      // `get_strided_index` walks: it decomposes a logical index into per-axis
+      // coordinates by dividing through `dims` from the last axis inward, so it
+      // needs one iteration per axis.
+      //
+      // This argument used to be `src_dim_size` -- the *extent of the indexed
+      // dimension*. The two are unrelated quantities that share a type, so it
+      // compiled and silently read the wrong elements whenever they differed.
+      // The CUDA kernel for this same op passes the rank
+      // (`candle-kernels/src/indexing.cu:65`: `get_strided_index(src_i,
+      // num_dims, dims, strides)`), so the old form was a Metal-only divergence
+      // from the reference rather than a shared convention -- and every other
+      // `get_strided_index` call site in this crate's `.metal` sources passes
+      // `num_dims` too.
+      //
+      // Latent exactly when `rank != dims[dim]`; at rank 2 with a 2-long
+      // indexed dimension the two coincide, which is why no existing test
+      // caught it. LFM2's embedding lookup is contiguous and takes the fast
+      // arm, so it never reached this line.
+      const size_t strided_src_i = contiguous ? src_i : get_strided_index(src_i, src_num_dims, src_dims, src_strides);
       output[tid] = input[strided_src_i];
     }
 }

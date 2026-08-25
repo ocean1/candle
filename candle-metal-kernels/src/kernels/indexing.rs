@@ -25,6 +25,18 @@ pub fn call_index_select(
     let right_size: usize = shape[dim + 1..].iter().product();
     let src_dim_size = shape[dim];
     let dst_el = ids_size * left_size * right_size;
+    // The source tensor's rank, which is what the kernel's `get_strided_index`
+    // walks. Derived from the slice rather than taken as a parameter so the
+    // public signature is unchanged and the two cannot disagree: `src_dims` and
+    // `src_strides` are the same layout's arrays, so their common length *is*
+    // the rank. The kernel previously received `src_dim_size` here -- see the
+    // comment at the call site in `indexing.metal`.
+    let src_num_dims = src_dims.len();
+    debug_assert_eq!(
+        src_dims.len(),
+        src_strides.len(),
+        "index_select: dims and strides describe one layout and must agree in length"
+    );
 
     let pipeline = kernels.load_pipeline(device, Source::Indexing, name)?;
 
@@ -43,6 +55,7 @@ pub fn call_index_select(
             right_size,
             ids_size,
             contiguous,
+            src_num_dims,
             src_dims,
             src_strides,
             &input,
