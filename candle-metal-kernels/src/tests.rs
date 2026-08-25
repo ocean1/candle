@@ -2755,6 +2755,257 @@ fn reduce_undeclared_dtype_has_no_name() {
 // was the thing that could be forgotten: a family absent from it was never
 // checked, which looks exactly like a family that passes.
 
+// ---------------------------------------------------------------------------
+// The parity comparison, and why it is a helper rather than an `assert_eq!`
+// (issue #53).
+//
+// `assert_eq!(split, packed)` passes when both arms are trivially zero: a kernel
+// that does nothing agrees with itself perfectly, and the test is green.
+//
+// That is not a hypothetical. `DESIGN.md` §3.7a records it as the exact
+// signature of a pipeline built without `supportIndirectCommandBuffers`:
+// *"status=completed, error=nil, output all zeros"*. The packed-params work
+// (§11.3a) exists to make the ICB path reachable, and a silently-empty kernel is
+// that path's characteristic failure -- so a parity suite that cannot tell
+// "both correct" from "both silent" is the wrong suite to be relying on when it
+// lands.
+//
+// # Why a helper rather than a guard copied into each arm
+//
+// The guard was written once, by hand, in `packed_matches_split_for_copy2d_f16`.
+// Copying it into the other 29 arms would close today's gap and leave the same
+// failure mode one step along: the 31st arm is added without it, silently, and
+// an unguarded arm is indistinguishable from a passing one. That is the shape
+// #58 removed from the layout checks, and the argument is the same here.
+//
+// So the comparison and the guard are **one operation**. An arm does not get to
+// perform the first without the second, because there is only one function that
+// compares a `(split, packed)` pair and it does both. `every_parity_arm_routes
+// _through_the_helper` then closes the remaining hole -- an arm that hand-rolls
+// its own `assert_eq!` instead of calling this -- by reading the file and naming
+// the offender.
+//
+// This is weaker than #58's `error[E0004]`, and the difference is worth stating
+// rather than glossing: the parity arms are not one operation over a descriptor
+// the way a layout check is. Each has its own call sequence, its own element
+// type and its own buffer setup, so there is no data-shaped registration a type
+// could make exhaustive. What is shared is the *comparison*, and that is where
+// the check is put.
+//
+// # Why "at least two distinct values" rather than "not all zero"
+//
+// The issue proposes not-all-zero as the minimum. It is the right instinct and
+// it is not quite the right predicate, for two reasons found while applying it:
+//
+//  * **Zero is a legitimate output.** `fast_argmax_f32` returns *indices*, and
+//    index 0 is the correct answer whenever the maximum is first in its block.
+//    A not-all-zero guard makes a correct test fail there, and the fix would be
+//    to weaken the guard -- which puts the suite back where it started.
+//  * **Distinctness is strictly stronger where both apply.** A kernel that
+//    writes one constant everywhere passes not-all-zero as long as the constant
+//    is not zero. Requiring two distinct values catches that too, and it is the
+//    same cost -- one pass over the output either way.
+//
+// The arms whose inputs had to change so that a correct kernel produces a varied
+// output, rather than being exempted from the check, are noted at their call
+// sites. Exempting an arm is not offered as an option: there is no parameter to
+// this function that turns the check off.
+
+/// An element type a parity arm compares.
+///
+/// Bit-identical rather than approximately equal, deliberately, and the trait is
+/// what makes that uniform across the four element types the arms use. Both
+/// entry points of every family are instantiated from one body, so anything but
+/// an exact match means the binding style changed what the kernel computed --
+/// which is the question the packed-params work asks. `DESIGN.md` §2.3 makes the
+/// same argument for the engine as a whole.
+///
+/// `Bits` rather than comparing the values directly because `f16` and `f32` are
+/// not `Eq`, and because a NaN produced identically by both arms should compare
+/// equal here: the question is whether the two kernels wrote the same bytes, not
+/// whether those bytes denote the same number.
+trait ParityElem: Copy {
+    /// The comparison key. Equal keys mean identical bytes.
+    type Bits: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+    fn parity_bits(self) -> Self::Bits;
+}
+
+impl ParityElem for f16 {
+    type Bits = u16;
+    fn parity_bits(self) -> u16 {
+        self.to_bits()
+    }
+}
+
+impl ParityElem for f32 {
+    type Bits = u32;
+    fn parity_bits(self) -> u32 {
+        self.to_bits()
+    }
+}
+
+impl ParityElem for u32 {
+    type Bits = u32;
+    fn parity_bits(self) -> u32 {
+        self
+    }
+}
+
+impl ParityElem for u8 {
+    type Bits = u8;
+    fn parity_bits(self) -> u8 {
+        self
+    }
+}
+
+/// Assert that the two binding styles agree, and that the comparison was not
+/// vacuous.
+///
+/// **The only way an arm compares its two outputs.** Both checks or neither;
+/// there is no argument that disables the second, and no second function that
+/// does the first alone.
+///
+/// `what` names the kernel, so a failure says which one broke without the
+/// reader having to map a test name onto a `[[host_name]]`.
+#[track_caller]
+fn assert_packed_matches_split<T: ParityElem>(what: &str, split: &[T], packed: &[T]) {
+    let split_bits: Vec<_> = split.iter().map(|x| x.parity_bits()).collect();
+    let packed_bits: Vec<_> = packed.iter().map(|x| x.parity_bits()).collect();
+    assert_eq!(
+        split_bits, packed_bits,
+        "{what} and its packed form disagree"
+    );
+
+    // The guard. A kernel that wrote nothing -- or wrote one constant
+    // everywhere -- agrees with itself, so equality above is only evidence when
+    // the output actually varies.
+    //
+    // Counted on the *split* arm because it is the classical path: if it is
+    // uniform the arm proves nothing regardless of what packed did, and saying
+    // so against the reference side gives the clearer message.
+    let distinct = split_bits
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct >= 2,
+        "{what} wrote {distinct} distinct value(s) across {} elements, so the \
+         parity comparison is vacuous: two kernels that both do nothing agree \
+         perfectly. `DESIGN.md` §3.7a records all-zero output as the signature \
+         of a missing supportIndirectCommandBuffers. Fix the arm's *input* so a \
+         correct kernel produces a varied output -- do not relax this check.",
+        split_bits.len(),
+    );
+}
+
+/// Every parity arm compares through `assert_packed_matches_split`.
+///
+/// This is the half a helper alone cannot enforce. Routing the 30 existing arms
+/// through one function closes today's gap; nothing stops the 31st from writing
+/// its own `assert_eq!` and skipping the guard, which is exactly how the gap
+/// this issue closes was opened -- one arm had the check, the rest were added
+/// beside it without.
+///
+/// So the file checks itself. A parity arm is a `fn` whose name contains
+/// `packed_matches_split_for_`, and each one must mention the helper. An arm
+/// that does not is named in the failure, with the line it starts at.
+///
+/// # What this does and does not prove
+///
+/// It proves no arm *omits* the call. It does not prove an arm calls it on the
+/// right buffers -- a test can always be written to check the wrong thing, and
+/// no mechanism in the file can see that. What it removes is the silent case:
+/// forgetting, which is what actually happened here across four families.
+///
+/// Source-scanning is a blunt instrument and is used because the alternative is
+/// blunter. A macro generating the arms would make omission impossible, but the
+/// arms differ in call sequence, element type, buffer setup and argument count
+/// -- 30 bodies with almost nothing in common but their last two lines -- so the
+/// macro would take one argument per line of body and hide what each arm tests.
+/// #58 could use the type system because a layout check is data; this is not.
+#[test]
+fn every_parity_arm_routes_through_the_helper() {
+    const HELPER: &str = "assert_packed_matches_split";
+    // The file reads itself. `include_str!` is resolved at compile time against
+    // this same source, so the scan cannot drift from what is compiled.
+    let src = include_str!("tests.rs");
+
+    let mut arms = 0usize;
+    let mut delinquent = Vec::new();
+    let lines: Vec<&str> = src.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("fn ") || !trimmed.contains("packed_matches_split_for_") {
+            continue;
+        }
+        arms += 1;
+        // The body runs to the first line that is exactly `}` at column zero,
+        // which is how every arm in this file ends.
+        let body_end = lines[i + 1..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|off| i + 1 + off)
+            .unwrap_or(lines.len() - 1);
+
+        // Comment lines are dropped before the scan. Without this, *mentioning*
+        // the helper in a comment satisfies the check while an `assert_eq!`
+        // below it does the actual comparing -- which is a bypass a reviewer
+        // would not see. Found by probing this test rather than reasoned about:
+        // the first version matched on the raw body and the comment form passed.
+        let code: String = lines[i..=body_end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The *call* form, not the name. `HELPER` alone would also match a
+        // `let _ = assert_packed_matches_split;` or a doc reference.
+        if !code.contains(&format!("{HELPER}(")) {
+            delinquent.push(format!(
+                "{} (line {}) -- does not call {HELPER}",
+                trimmed.trim_end_matches(" {"),
+                i + 1
+            ));
+        } else if code.contains("assert_eq!(") {
+            // Calling the helper *and* hand-rolling a comparison beside it is
+            // not itself wrong -- the argmax arm asserts its indices that way,
+            // deliberately -- but a bare `assert_eq!` on the two output vectors
+            // is the shape this issue exists to remove, so it is worth naming
+            // when it appears on `outs`/`split`/`packed` directly.
+            let suspicious = code.contains("assert_eq!(\n        outs[0], outs[1]")
+                || code.contains("assert_eq!(\n        split, packed");
+            if suspicious {
+                delinquent.push(format!(
+                    "{} (line {}) -- compares its outputs with a bare assert_eq! \
+                     beside the helper",
+                    trimmed.trim_end_matches(" {"),
+                    i + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        delinquent.is_empty(),
+        "these parity arms compare their two outputs without going through \
+         `{HELPER}`, so they do not carry the non-vacuity guard and would pass \
+         if both kernels wrote nothing (issue #53):\n  {}",
+        delinquent.join("\n  "),
+    );
+
+    // And the scan itself must not be vacuous: a regex that matched nothing
+    // would report success for a file with no arms at all. The exact count is
+    // asserted rather than `> 0` so that an arm *lost* to a bad merge is a
+    // failure too -- the same argument `packed_names_resolve` makes for
+    // checking 90 rather than "some".
+    assert_eq!(
+        arms, 30,
+        "expected 30 parity arms, found {arms}; if a family was added or \
+         removed, update this count deliberately rather than relaxing it"
+    );
+}
+
 /// Every classical name has a `_packed` counterpart in the compiled library.
 ///
 /// The same argument as `reduce_names_resolve`, applied to the new axis: an
@@ -2843,11 +3094,7 @@ fn packed_matches_split_for_sum_f16() {
         .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 25.0))
         .collect();
     let (split, packed) = reduce_both_ways::<f16, f16>(&v, 1024, 8, "fast_sum_f16");
-    assert_eq!(
-        split.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        packed.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "fast_sum_f16 and fast_sum_f16_packed disagree"
-    );
+    assert_packed_matches_split("fast_sum_f16", &split, &packed);
 }
 
 #[test]
@@ -2856,24 +3103,65 @@ fn packed_matches_split_for_sum_f32() {
         .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
         .collect();
     let (split, packed) = reduce_both_ways::<f32, f32>(&v, 2048, 16, "fast_sum_f32");
-    assert_eq!(
-        split.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        packed.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "fast_sum_f32 and fast_sum_f32_packed disagree"
-    );
+    assert_packed_matches_split("fast_sum_f32", &split, &packed);
 }
 
 /// `argmax` exercises the `indexed<T>` accumulator and the arg-reduce entry
 /// points, which are a separate pair of wrappers from the plain reductions.
+///
+/// **This is the arm where zero is a legitimate output** (issue #53): the result
+/// is an index, and 0 is correct whenever a block's maximum is its first
+/// element. A not-all-zero guard would make a correct kernel fail here, and the
+/// fix for that would be to weaken the guard -- which is how a suite ends up
+/// back where it started. Counting *distinct* values instead is what lets the
+/// same check cover this arm and the value-producing ones without an exemption.
 #[test]
 fn packed_matches_split_for_argmax_f32() {
+    // The peak sits at a different offset in each of the four blocks, so a
+    // correct argmax returns four different indices and a kernel returning a
+    // constant -- including a constant 0 -- fails the guard.
+    //
+    // The previous input varied only incidentally: `i * 61 % 97` happened not to
+    // place two block maxima at the same offset. That was true and nothing made
+    // it true, so the arm's non-vacuity was an accident of arithmetic. Planting
+    // the peaks makes it a property of the test.
+    let block = 128usize;
+    let peak_at = [7usize, 40, 99, 126];
     let v: Vec<f32> = (0..512)
-        .map(|i| ((i * 61 % 97) as f32 - 48.0) / 7.0)
+        .map(|i| {
+            let base = ((i * 61 % 97) as f32 - 48.0) / 7.0;
+            // Well clear of `base`'s range, so each peak is unambiguous.
+            if i % block == peak_at[i / block] {
+                100.0
+            } else {
+                base
+            }
+        })
         .collect();
     let (split, packed) = reduce_both_ways::<f32, u32>(&v, 512, 4, "fast_argmax_f32");
+    assert_packed_matches_split("fast_argmax_f32", &split, &packed);
+    // Assert the indices themselves as well. The guard says "not vacuous"; this
+    // says "correct", and they are different claims -- a kernel could return
+    // four distinct wrong indices and satisfy only the first.
+    //
+    // The indices are **global**, not per-block offsets: block `k` answers
+    // `k * block + peak_at[k]`. Read off the kernel rather than assumed -- the
+    // first draft of this arm expected per-block offsets and failed against
+    // `[7, 168, 355, 510]`. Recorded because it is the mirror of the defect this
+    // issue closes: a test asserting the wrong thing, confidently.
+    //
+    // Note this is also why zero stays legitimate here. Only block 0 can answer
+    // 0, and it does so whenever its maximum is the first element -- so a
+    // not-all-zero guard would be wrong on this arm for a reason no amount of
+    // input tuning removes.
     assert_eq!(
-        split, packed,
-        "fast_argmax_f32 and its packed form disagree"
+        split,
+        peak_at
+            .iter()
+            .enumerate()
+            .map(|(k, p)| (k * block + p) as u32)
+            .collect::<Vec<u32>>(),
+        "fast_argmax_f32 did not find the planted peaks"
     );
 }
 
@@ -2909,11 +3197,7 @@ fn packed_matches_split_for_softmax_f32() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, v.len()));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "softmax_f32 and softmax_f32_packed disagree"
-    );
+    assert_packed_matches_split("softmax_f32", &outs[0], &outs[1]);
 }
 
 /// `rmsnorm_f16` — 77 of the 674 dispatches in a decode token, the single
@@ -2957,11 +3241,7 @@ fn packed_matches_split_for_rmsnorm_f16() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, v.len()));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "rmsnorm_f16 and rmsnorm_f16_packed disagree"
-    );
+    assert_packed_matches_split("rmsnorm_f16", &outs[0], &outs[1]);
 }
 
 /// `rope_f16` — 16 dispatches per decode token, and the only family here whose
@@ -2998,11 +3278,7 @@ fn packed_matches_split_for_rope_f16() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, n));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "rope_f16 and rope_f16_packed disagree"
-    );
+    assert_packed_matches_split("rope_f16", &outs[0], &outs[1]);
 }
 
 /// A strided reduction, so the `dims` *and* `strides` arrays both take the
@@ -3047,11 +3323,7 @@ fn packed_matches_split_for_sum_f32_strided() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, 32));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "fast_sum_f32_strided and its packed form disagree"
-    );
+    assert_packed_matches_split("fast_sum_f32_strided", &outs[0], &outs[1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -3223,10 +3495,10 @@ fn packed_matches_split_for_gemv() {
             &[n * k, 1, n],
             ParamStyle::Packed,
         );
-        assert_eq!(
-            split.iter().map(|x: &f32| x.to_bits()).collect::<Vec<_>>(),
-            packed.iter().map(|x: &f32| x.to_bits()).collect::<Vec<_>>(),
-            "gemv and its packed form disagree at (b,m,n,k)=({b},{m},{n},{k})"
+        assert_packed_matches_split(
+            &format!("gemv at (b,m,n,k)=({b},{m},{n},{k})"),
+            &split,
+            &packed,
         );
     }
 }
@@ -3266,10 +3538,10 @@ fn packed_matches_split_for_gemv_t() {
             &[n * k, n, 1],
             ParamStyle::Packed,
         );
-        assert_eq!(
-            split.iter().map(|x: &f32| x.to_bits()).collect::<Vec<_>>(),
-            packed.iter().map(|x: &f32| x.to_bits()).collect::<Vec<_>>(),
-            "gemv_t and its packed form disagree at (b,m,n,k)=({b},{m},{n},{k})"
+        assert_packed_matches_split(
+            &format!("gemv_t at (b,m,n,k)=({b},{m},{n},{k})"),
+            &split,
+            &packed,
         );
     }
 }
@@ -3305,11 +3577,7 @@ fn packed_matches_split_for_gemv_f16() {
         &[n * k, 1, n],
         ParamStyle::Packed,
     );
-    assert_eq!(
-        split.iter().map(|x: &f16| x.to_bits()).collect::<Vec<_>>(),
-        packed.iter().map(|x: &f16| x.to_bits()).collect::<Vec<_>>(),
-        "gemv_float16 and its packed form disagree"
-    );
+    assert_packed_matches_split("gemv_float16", &split, &packed);
 }
 
 /// Every classical gemv name has a `_packed` counterpart in the compiled
@@ -3604,11 +3872,7 @@ fn packed_matches_split_for_unary_silu_f16() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, v.len()));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "silu_f16 and silu_f16_packed disagree"
-    );
+    assert_packed_matches_split("silu_f16", &outs[0], &outs[1]);
 }
 
 /// The strided unary path, which additionally exercises `dims` and `strides`
@@ -3647,11 +3911,7 @@ fn packed_matches_split_for_unary_strided_f32() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, n));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "cos_f32_strided and its packed form disagree"
-    );
+    assert_packed_matches_split("cos_f32_strided", &outs[0], &outs[1]);
 }
 
 /// `copy2d_f16` -- **140 dispatches per decode token, the largest single kernel
@@ -3693,17 +3953,10 @@ fn packed_matches_split_for_copy2d_f16() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, d1 * dst_s));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "copy2d_f16 and copy2d_f16_packed disagree"
-    );
-    // Guard against both arms being trivially zero, which would make the
-    // comparison vacuous: a kernel that does nothing agrees with itself.
-    assert!(
-        outs[0].iter().any(|x| x.to_f32() != 0.0),
-        "copy2d wrote nothing; the parity comparison would be vacuous"
-    );
+    // The hand-written guard that used to sit here -- `any(|x| x != 0.0)`, and
+    // the only one of the 30 arms to carry one -- now lives inside the helper
+    // and applies to every arm. #48 was right to write it; #53 generalised it.
+    assert_packed_matches_split("copy2d_f16", &outs[0], &outs[1]);
 }
 
 /// `bmul_f16` -- 96 dispatches per decode token, the largest binary.
@@ -3743,11 +3996,7 @@ fn packed_matches_split_for_binary_bmul_f16() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, n));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "bmul_f16 and bmul_f16_packed disagree"
-    );
+    assert_packed_matches_split("bmul_f16", &outs[0], &outs[1]);
 }
 
 /// `badd_f16` strided -- 60 dispatches per decode token, and this arm binds
@@ -3794,11 +4043,7 @@ fn packed_matches_split_for_binary_badd_f16_strided() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, n));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "badd_f16_strided and its packed form disagree"
-    );
+    assert_packed_matches_split("badd_f16_strided", &outs[0], &outs[1]);
 }
 
 /// `cast_f16_f32` -- 25 dispatches per decode token, the F32 upcast of K and V.
@@ -3834,11 +4079,7 @@ fn packed_matches_split_for_cast_f16_f32() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, n));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "cast_f16_f32 and its packed form disagree"
-    );
+    assert_packed_matches_split("cast_f16_f32", &outs[0], &outs[1]);
 }
 
 /// `affine_f32` -- 8 dispatches per decode token, the softmax scale.
@@ -3882,11 +4123,7 @@ fn packed_matches_split_for_affine_f32() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, n));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "affine_f32 and affine_f32_packed disagree"
-    );
+    assert_packed_matches_split("affine_f32", &outs[0], &outs[1]);
 }
 
 /// `powf` uses the one-float `ScaleParams` block rather than `AffineParams`.
@@ -3924,11 +4161,7 @@ fn packed_matches_split_for_powf_f32() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, n));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "powf_f32 and its packed form disagree"
-    );
+    assert_packed_matches_split("powf_f32", &outs[0], &outs[1]);
 }
 
 /// The strided affine, whose block is `{size_t, size_t, float, float}` -- 24
@@ -3969,11 +4202,7 @@ fn packed_matches_split_for_affine_f32_strided() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, n));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "affine_f32_strided and its packed form disagree"
-    );
+    assert_packed_matches_split("affine_f32_strided", &outs[0], &outs[1]);
 }
 
 /// The gemv layout check must be able to fail.
@@ -4244,11 +4473,7 @@ fn conv_packed_matches_split_for_conv1d_depthwise_k() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "conv1d_depthwise_f16_k3 and its packed form disagree"
-    );
+    assert_packed_matches_split("conv1d_depthwise_f16_k3", &outs[0], &outs[1]);
 }
 
 /// The generic depthwise kernel, which binds six scalars *and* two arrays.
@@ -4302,11 +4527,7 @@ fn conv_packed_matches_split_for_conv1d_depthwise() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "conv1d_depthwise_f32 and its packed form disagree"
-    );
+    assert_packed_matches_split("conv1d_depthwise_f32", &outs[0], &outs[1]);
 }
 
 /// `im2col` — eight consecutive `constant size_t` parameters, the largest
@@ -4361,11 +4582,7 @@ fn conv_packed_matches_split_for_im2col() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "im2col_f32 and its packed form disagree"
-    );
+    assert_packed_matches_split("im2col_f32", &outs[0], &outs[1]);
 }
 
 /// `im2col1d` — the 1D form, six scalars and two arrays.
@@ -4409,11 +4626,7 @@ fn conv_packed_matches_split_for_im2col1d() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "im2col1d_f16 and its packed form disagree"
-    );
+    assert_packed_matches_split("im2col1d_f16", &outs[0], &outs[1]);
 }
 
 /// `col2im1d` — six scalars and *no* arrays, so nothing takes the promoted
@@ -4457,11 +4670,7 @@ fn conv_packed_matches_split_for_col2im1d() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "col2im1d_f32 and its packed form disagree"
-    );
+    assert_packed_matches_split("col2im1d_f32", &outs[0], &outs[1]);
 }
 
 /// `upsample_bilinear2d` — the mixed-width struct, and the family with pinned
@@ -4518,11 +4727,7 @@ fn conv_packed_matches_split_for_upsample_bilinear2d() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "upsample_bilinear2d_f32 and its packed form disagree"
-    );
+    assert_packed_matches_split("upsample_bilinear2d_f32", &outs[0], &outs[1]);
 }
 
 /// `upsample_nearest2d` — two `size_t` then two `float`, the other mixed-width
@@ -4570,11 +4775,7 @@ fn conv_packed_matches_split_for_upsample_nearest2d() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f16>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "upsample_nearest2d_f16 and its packed form disagree"
-    );
+    assert_packed_matches_split("upsample_nearest2d_f16", &outs[0], &outs[1]);
 }
 
 /// `avg_pool2d_u8` — the accumulator case.
@@ -4638,10 +4839,7 @@ fn conv_packed_matches_split_for_avg_pool2d_u8() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<u8>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0], outs[1],
-        "avg_pool2d_u8 and its packed form disagree"
-    );
+    assert_packed_matches_split("avg_pool2d_u8", &outs[0], &outs[1]);
 }
 
 /// `max_pool2d_f32` — shares `Pool2dParams` with `avg_pool2d`, and has no
@@ -4697,11 +4895,7 @@ fn conv_packed_matches_split_for_max_pool2d() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "max_pool2d_f32 and its packed form disagree"
-    );
+    assert_packed_matches_split("max_pool2d_f32", &outs[0], &outs[1]);
 }
 
 /// `conv_transpose1d_u32` — four arrays promoted at once, and the second
@@ -4768,10 +4962,7 @@ fn conv_packed_matches_split_for_conv_transpose1d_u32() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<u32>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0], outs[1],
-        "conv_transpose1d_u32 and its packed form disagree"
-    );
+    assert_packed_matches_split("conv_transpose1d_u32", &outs[0], &outs[1]);
 }
 
 /// `conv_transpose2d_f32` — six scalars and four arrays, the largest argument
@@ -4841,11 +5032,7 @@ fn conv_packed_matches_split_for_conv_transpose2d() {
         commands.wait_until_completed().unwrap();
         outs.push(read_to_vec::<f32>(&output, dst_el));
     }
-    assert_eq!(
-        outs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        outs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        "conv_transpose2d_f32 and its packed form disagree"
-    );
+    assert_packed_matches_split("conv_transpose2d_f32", &outs[0], &outs[1]);
 }
 
 // ---------------------------------------------------------------------------
