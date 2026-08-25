@@ -522,6 +522,7 @@ fn main() -> Result<()> {
             dev.end_decode_step();
             if step == record_steps - 1 {
                 let excluded = dev.arena_recording_excluded();
+                let by_test = dev.arena_recording_excluded_by_test();
                 let plan = dev
                     .finish_arena_recording(layout)
                     .context("arena recording produced no allocations")?;
@@ -529,8 +530,20 @@ fn main() -> Result<()> {
                 if let Some((n_excl, n_all)) = excluded {
                     eprintln!(
                         "arena: {n_all} allocations recorded over {record_steps} steps, \
-                         {n_excl} excluded as session state (size moved with kv_len)"
+                         {n_excl} excluded as session state"
                     );
+                    // Split by detector, because neither subsumes the other and
+                    // a zero on either side is a result. Size growth finds the
+                    // KV cache; cross-step liveness finds the conv state, which
+                    // never grows and which the size test therefore admits
+                    // (`DESIGN.md` §5.7, §9.2c). The two overlap, so they do not
+                    // sum to `n_excl`.
+                    if let Some((by_size, by_step)) = by_test {
+                        eprintln!(
+                            "arena:   {by_size} caught by size growth (kv_len), \
+                             {by_step} by outliving the step (session state at a fixed size)"
+                        );
+                    }
                 }
                 eprintln!(
                     "arena: {covered} of {total} ordinals served -> {} slots, {} B ({:?})",

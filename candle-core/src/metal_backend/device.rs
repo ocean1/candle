@@ -368,6 +368,25 @@ impl MetalDevice {
         Some(r.excluded())
     }
 
+    /// Exclusions split by which test caught them: `(size_grew, outlived_step)`.
+    ///
+    /// Reported separately because the two detectors see different populations
+    /// and neither subsumes the other -- size growth finds the KV cache, and
+    /// cross-step liveness finds the conv state, which is fixed at
+    /// `[B, 2048, 3]` and invisible to a size comparison (`DESIGN.md` §5.7,
+    /// §9.2c). A run where the second number is zero would mean it is not
+    /// earning its place; a run where it is nonzero names values the size test
+    /// admitted.
+    ///
+    /// The two counts overlap where both tests fire, so they do not sum to the
+    /// total exclusion count.
+    pub fn arena_recording_excluded_by_test(&self) -> Option<(usize, usize)> {
+        let g = self.arena_recorder.lock().ok()?;
+        let rec = g.as_ref()?;
+        let r = rec.lock().ok()?;
+        Some(r.excluded_by_test())
+    }
+
     /// Stop observing and build a plan from what was seen.
     ///
     /// Returns `None` if nothing was recorded, which is a real outcome worth

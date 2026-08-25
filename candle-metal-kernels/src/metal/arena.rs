@@ -756,6 +756,19 @@ pub struct ArenaRecorder {
     /// separates an activation from session state, and it has to be measured
     /// rather than assumed -- see [`Self::kv_dependent`].
     previous: Vec<usize>,
+    /// Which value owned each buffer address at the end of the *previous* step.
+    ///
+    /// Carried across the step boundary so that a bind in this step against a
+    /// buffer allocated in the last one can still be attributed. Without it the
+    /// address is simply absent from `by_addr` and the bind is dropped, which is
+    /// exactly how a value that outlives its step passes for an activation --
+    /// see [`Self::outlives_step`].
+    previous_by_addr: std::collections::HashMap<usize, usize>,
+    /// Ordinals of the *previous* step still bound during this one.
+    ///
+    /// The direct measurement of "this value is session state" (§9.1): it is
+    /// still being read a step after it was produced.
+    survived: std::collections::HashSet<usize>,
 }
 
 impl ArenaRecorder {
@@ -774,7 +787,13 @@ impl ArenaRecorder {
         self.previous = std::mem::take(&mut self.sizes);
         self.first_bind.clear();
         self.last_bind.clear();
-        self.by_addr.clear();
+        // The address map is *carried*, not cleared. A value produced last step
+        // and read in this one is session state, and dropping the map is what
+        // made that invisible -- the bind found no owner and was discarded, so
+        // the interval stopped at the step boundary and the value looked like an
+        // activation that died where it was produced. See `outlives_step`.
+        self.previous_by_addr = std::mem::take(&mut self.by_addr);
+        self.survived.clear();
         self.dispatch = 0;
         self.ordinal = 0;
     }
@@ -810,6 +829,64 @@ impl ArenaRecorder {
             .collect()
     }
 
+    /// Ordinals whose value was still bound a step after it was allocated.
+    ///
+    /// **This is the second way session state gets in, and size cannot see it.**
+    /// [`Self::kv_dependent`] separates activations from session state by the
+    /// size moving with `kv_len`, which is right for the KV cache and blind to
+    /// anything session-scoped at a *fixed* size. LFM2's conv state is exactly
+    /// that: `[B, 2048, 3]` = 12288 B at every `kv_len` (§5.7), so it passes the
+    /// size test and enters the arena.
+    ///
+    /// What it cannot pass is this one, because the property being tested is the
+    /// definition §9.1 gives rather than a proxy for it: session state is state
+    /// that lives across steps, so measure whether it is read in the next one.
+    ///
+    /// Measured on LFM2 decode (`measurements/issue-69-raw/trace-after-packed.txt`):
+    ///
+    /// ```text
+    /// decode[1] pos 4 copy2d out @0x9edae5a40+0   <- conv-state cat destination
+    /// decode[1] pos 5 copy2d out @0x9edae5a40+4
+    /// decode[1] pos 6 bmul   in  @0x9edae5a40+0   <- consumed, same token
+    /// decode[2] pos 4 copy2d in  @0x9edae5a40+2   <- read again, next token
+    /// ```
+    ///
+    /// The interval a within-step recorder sees ends at pos 6; the true one runs
+    /// ~670 dispatches further, into the following step. Packed on the short
+    /// interval, slot 1 serves five values per layer and the conv state is
+    /// overwritten by the `fast_sum` at pos 7 long before pos 4 of the next
+    /// token reads it.
+    ///
+    /// Note what this is *not*. The `narrow` in §6.1's shuffle is a red herring
+    /// for classification: `narrow` shares storage and shifts only the layout,
+    /// so the tail read and the `cat` destination are genuinely separate values
+    /// with disjoint intervals and the packer is right to unify them. The defect
+    /// is that one of those values outlives the step, not that either is
+    /// addressed at an offset.
+    ///
+    /// Ordinals are compared across steps positionally, which is sound for the
+    /// same reason [`Self::kv_dependent`] compares sizes that way: the kernel
+    /// sequence is byte-identical across tokens (§11.1a.1), so the Nth
+    /// allocation of one step is the Nth of the next.
+    pub fn outlives_step(&self) -> Vec<bool> {
+        let n = self.sizes.len();
+        (0..n).map(|i| self.survived.contains(&i)).collect()
+    }
+
+    /// Every ordinal the arena must decline: session state by either test.
+    ///
+    /// Two independent detectors, unioned, because they see different
+    /// populations and neither subsumes the other -- size growth finds the KV
+    /// cache, cross-step liveness finds the conv state.
+    pub fn excluded_flags(&self) -> Vec<bool> {
+        let size = self.kv_dependent();
+        let cross = self.outlives_step();
+        size.iter()
+            .zip(cross.iter())
+            .map(|(a, b)| *a || *b)
+            .collect()
+    }
+
     /// Record an allocation of `size` bytes served by the buffer at `addr`.
     ///
     /// `addr` identifies the *buffer*, and the ordinal identifies the *value*.
@@ -828,6 +905,12 @@ impl ArenaRecorder {
         self.last_bind.push(self.dispatch);
         // The address now names this value. Any earlier value that had it has
         // been reused, and its own binds were recorded while it held it.
+        //
+        // Nothing is removed from `previous_by_addr` here, and that is not an
+        // omission. `record_bind` consults `by_addr` first, so the entry this
+        // line writes already shadows any previous-step entry for the same
+        // address, and a `remove` beside it would be a line no test can fail --
+        // §15.2 #11. The shadowing is stated rather than duplicated.
         self.by_addr.insert(addr, ordinal);
     }
 
@@ -836,9 +919,17 @@ impl ArenaRecorder {
     /// Called once per binding, in encode order, and it is what closes an
     /// interval -- see the type docs. The dispatch counter is the recorder's
     /// own, so it advances with [`Self::record_dispatch`].
+    ///
+    /// A bind that matches no value of *this* step is checked against the
+    /// previous one before being discarded. That is the whole of the
+    /// cross-step detection: an address still being read a step after it was
+    /// allocated names a value that outlived its step, and §9.1 calls such a
+    /// value session state.
     pub fn record_bind(&mut self, addr: usize) {
         if let Some(&ordinal) = self.by_addr.get(&addr) {
             self.last_bind[ordinal] = self.dispatch;
+        } else if let Some(&ordinal) = self.previous_by_addr.get(&addr) {
+            self.survived.insert(ordinal);
         }
     }
 
@@ -856,32 +947,48 @@ impl ArenaRecorder {
         self.sizes.is_empty()
     }
 
-    /// Build a plan from what was observed.
-    ///
-    /// A value never freed is treated as live to the end of the step, which is
-    /// the conservative direction: it can then share bytes with nothing, so the
-    /// plan is larger but never aliases two live values. #68 records 39 such
-    /// values -- dead stores and the final logits, which leave the arena.
     /// Build a plan from what was observed, excluding session state.
     ///
-    /// Ordinals whose size moved between the two recorded steps are left out of
-    /// the arena entirely and take the pool path -- see [`Self::kv_dependent`].
-    /// They keep their place in the ordinal sequence, so excluding one does not
-    /// shift the slot every later allocation resolves to.
+    /// Session state is left out of the arena entirely and takes the pool path,
+    /// by **both** tests -- [`Self::kv_dependent`] for values whose size moves
+    /// with `kv_len`, and [`Self::outlives_step`] for values still bound a step
+    /// after they were produced. An excluded ordinal keeps its place in the
+    /// sequence, so excluding one does not shift the slot every later
+    /// allocation resolves to.
+    ///
+    /// A value never bound again is treated as dying where it was produced,
+    /// which is only safe *because* the cross-step test runs: a value whose
+    /// last reader is in the next step would otherwise look exactly like one
+    /// that was never read at all.
     pub fn plan(&self, layout: ArenaLayout) -> StepPlan {
         plan_from_intervals(
             &self.sizes,
             &self.first_bind,
             &self.last_bind,
-            &self.kv_dependent(),
+            &self.excluded_flags(),
             layout,
         )
     }
 
     /// How many ordinals were excluded as session state, and how many recorded.
     pub fn excluded(&self) -> (usize, usize) {
-        let kv = self.kv_dependent();
-        (kv.iter().filter(|&&x| x).count(), kv.len())
+        let flags = self.excluded_flags();
+        (flags.iter().filter(|&&x| x).count(), flags.len())
+    }
+
+    /// Excluded ordinals split by which test caught them: `(size, cross_step)`.
+    ///
+    /// Reported separately because the two populations are the evidence that
+    /// neither test subsumes the other -- a run where `cross_step` is 0 would
+    /// mean this detector is not earning its place, and one where it is nonzero
+    /// names values the size test admitted.
+    pub fn excluded_by_test(&self) -> (usize, usize) {
+        let size = self.kv_dependent();
+        let cross = self.outlives_step();
+        (
+            size.iter().filter(|&&x| x).count(),
+            cross.iter().filter(|&&x| x).count(),
+        )
     }
 
     /// Forget everything, including the previous step.
@@ -891,6 +998,8 @@ impl ArenaRecorder {
         self.last_bind.clear();
         self.by_addr.clear();
         self.previous.clear();
+        self.previous_by_addr.clear();
+        self.survived.clear();
         self.dispatch = 0;
         self.ordinal = 0;
     }
@@ -1223,6 +1332,7 @@ mod tests {
     /// The recorder cannot make the mistake because it never sees a buffer: the
     /// token identifies the allocation event. This test states that as a
     /// property rather than trusting the absence.
+    ///
     /// Record `f` as two consecutive decode steps.
     ///
     /// Two steps are what the recorder needs to tell an activation from session
@@ -1276,6 +1386,151 @@ mod tests {
             .map(|i| plan.slot_of(i).expect("ordinal is served"))
             .collect();
         assert_eq!(slots, vec![0, 0, 0]);
+    }
+
+    /// **A fixed-size value read in the next step is session state, and the
+    /// size test cannot see it** (§9.1, §9.2c).
+    ///
+    /// This is LFM2's conv state, reduced to its shape. `[B, 2048, 3]` is
+    /// 12288 B at every `kv_len` (§5.7), so it never grows and
+    /// [`ArenaRecorder::kv_dependent`] admits it. It is produced by the §6.1
+    /// shuffle, consumed once in the same token, and then read again by the
+    /// *next* token's shuffle -- which is the pattern the committed trace shows:
+    ///
+    /// ```text
+    /// decode[1] pos 4 copy2d out @0x9edae5a40+0
+    /// decode[1] pos 6 bmul   in  @0x9edae5a40+0
+    /// decode[2] pos 4 copy2d in  @0x9edae5a40+2   <- one token later
+    /// ```
+    ///
+    /// Packed on the within-step interval its slot is reused immediately, and
+    /// the value is gone before the next token reads it.
+    ///
+    /// The mutation this is proof against: drop the `previous_by_addr` carry in
+    /// `next_step` and the cross-step bind matches nothing, `outlives_step` is
+    /// all-false, and the conv-state stand-in packs into a shared slot.
+    #[test]
+    fn a_fixed_size_value_read_next_step_is_excluded() {
+        const CONV: usize = 0xc0;
+        const ACT: usize = 0xa0;
+        const CONV_BYTES: usize = 12288;
+
+        let mut rec = ArenaRecorder::new();
+        let mut step = |rec: &mut ArenaRecorder| {
+            // The shuffle reads *last* step's conv state first. On the opening
+            // step there is none, which is why the read comes before the alloc.
+            rec.record_bind(CONV);
+            rec.record_dispatch();
+            // This step's conv state, at a size that never moves.
+            rec.record_alloc(CONV, CONV_BYTES);
+            rec.record_bind(CONV);
+            rec.record_dispatch();
+            // Consumed within the token, as `bmul` does at pos 6.
+            rec.record_bind(CONV);
+            rec.record_dispatch();
+            // An ordinary activation of the same size, to prove the exclusion
+            // is about liveness and not about the size.
+            rec.record_alloc(ACT, CONV_BYTES);
+            rec.record_bind(ACT);
+            rec.record_dispatch();
+            rec.record_bind(ACT);
+            rec.record_dispatch();
+        };
+        step(&mut rec);
+        rec.next_step();
+        step(&mut rec);
+
+        assert_eq!(
+            rec.kv_dependent(),
+            vec![false, false],
+            "the size test sees nothing here -- that is the point"
+        );
+        assert_eq!(
+            rec.outlives_step(),
+            vec![true, false],
+            "the conv-state stand-in was not detected as living across the step"
+        );
+
+        let plan = rec.plan(ArenaLayout::Packed);
+        assert!(
+            plan.slot_of(0).is_none(),
+            "session state entered the arena; it must fall through to the pool"
+        );
+        assert!(
+            plan.slot_of(1).is_some(),
+            "the ordinary activation was excluded too -- the test is over-broad"
+        );
+        assert_eq!(
+            rec.excluded_by_test(),
+            (0, 1),
+            "exclusion was not attributed to the cross-step test"
+        );
+    }
+
+    /// The counterpart: carrying the address map across the step boundary must
+    /// not make ordinary recycled activations look like survivors.
+    ///
+    /// The failure this guards against is one-sided and quiet. Over-detection
+    /// costs arena coverage rather than correctness, so it breaks nothing
+    /// visible and would not be found by the digests -- which is exactly the
+    /// shape that needs a test rather than a run.
+    ///
+    /// **The over-detection is structurally impossible, and the test says so
+    /// rather than the comment alone.** `record_bind` consults `by_addr` before
+    /// the carried map, and `record_alloc` writes `by_addr` for every value, so
+    /// a previous-step entry is shadowed the moment the address is handed on.
+    /// An earlier draft added a `remove` in `record_alloc` to enforce that; it
+    /// was deleted when no mutation of it could fail this test, which is §15.2
+    /// #11 applied to a guard rather than to state.
+    ///
+    /// The pool recycles an address several times per token (§9.2c's `buf#328`,
+    /// 13 times), so the recycled case here is the common one and the survivor
+    /// beside it is the rare one. Asserting both in one test is what shows they
+    /// are told apart, rather than everything being admitted or everything
+    /// excluded.
+    #[test]
+    fn a_recycled_address_is_not_mistaken_for_a_survivor() {
+        const ADDR: usize = 0xa0;
+        const KEPT: usize = 0xb0;
+        let mut rec = ArenaRecorder::new();
+        let mut step = |rec: &mut ArenaRecorder| {
+            // A genuine survivor, read before anything this step allocates --
+            // the conv-state shape, kept here so the test also shows the two
+            // cases being told apart rather than everything being admitted.
+            rec.record_bind(KEPT);
+            rec.record_dispatch();
+            // Two unrelated values sharing one address, one after the other.
+            // The second's binds are the ones a stale entry would capture.
+            rec.record_alloc(ADDR, 4096);
+            rec.record_bind(ADDR);
+            rec.record_dispatch();
+            rec.record_alloc(ADDR, 4096);
+            rec.record_bind(ADDR);
+            rec.record_dispatch();
+            rec.record_bind(ADDR);
+            rec.record_dispatch();
+            rec.record_alloc(KEPT, 4096);
+            rec.record_bind(KEPT);
+            rec.record_dispatch();
+        };
+        step(&mut rec);
+        rec.next_step();
+        step(&mut rec);
+
+        assert_eq!(
+            rec.outlives_step(),
+            vec![false, false, true],
+            "a value re-allocated at the same address was read as a survivor"
+        );
+        let plan = rec.plan(ArenaLayout::Packed);
+        assert!(
+            plan.slot_of(0).is_some() && plan.slot_of(1).is_some(),
+            "an ordinary recycled activation was excluded from the arena"
+        );
+        assert!(
+            plan.slot_of(2).is_none(),
+            "the genuine survivor was admitted to the arena"
+        );
     }
 
     /// Values that are live at the same time must not share a slot, however
