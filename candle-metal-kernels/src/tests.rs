@@ -3202,3 +3202,493 @@ fn packed_matches_split_for_sum_f32_strided() {
         "fast_sum_f32_strided and its packed form disagree"
     );
 }
+
+// ---------------------------------------------------------------------------
+// gemv carries both binding styles (issue #41)
+//
+// `gemv` is 183 of the 674 dispatches per decode token -- the second-largest
+// single contributor after `copy2d_f16` -- and unlike the elementwise families
+// these are the matmuls, where the weight traffic happens (`DESIGN.md` §13.4a).
+// So these tests check two distinct things: that the two styles agree bit for
+// bit, and that the struct's layout agrees across the language boundary.
+// ---------------------------------------------------------------------------
+
+/// Run one GEMV in a chosen binding style.
+///
+/// Goes through `call_mlx_gemv_with` rather than reimplementing the tile
+/// selection, so both arms pick the same `[[host_name]]` stem and differ only
+/// in the `_packed` suffix and how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+fn run_mlx_gemv_style<T: Clone>(
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &[T],
+    lhs_stride: &[usize],
+    rhs: &[T],
+    rhs_stride: &[usize],
+    style: ParamStyle,
+) -> Vec<T> {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+
+    let lhs_buf = device
+        .new_buffer_with_data(
+            lhs.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(lhs),
+            options,
+        )
+        .unwrap();
+    let rhs_buf = device
+        .new_buffer_with_data(
+            rhs.as_ptr() as *const core::ffi::c_void,
+            std::mem::size_of_val(rhs),
+            options,
+        )
+        .unwrap();
+    let length = b * m * n;
+    let output = device
+        .new_buffer(length * core::mem::size_of::<T>(), options)
+        .unwrap();
+
+    call_mlx_gemv_with(
+        &device,
+        &encoder,
+        &kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        0,
+        &lhs_buf,
+        rhs_stride,
+        0,
+        &rhs_buf,
+        &output,
+        style,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    read_to_vec(&output, length)
+}
+
+/// The two binding styles compute the same bits.
+///
+/// Bit-identical rather than approximately equal, deliberately: both entry
+/// points are instantiated from one body (`gemv_body`), so anything but an
+/// exact match means the binding style changed what the kernel computed, which
+/// is the question issue #41 asks.
+///
+/// The shapes cover both kernels and both tile-selection branches that LFM2
+/// decode reaches: `n == 1` takes `gemv` and `m == 1` takes `gemv_t`, and the
+/// `in_vec_size`/`out_vec_size` ratios pick different `(bm, bn, sm, sn)` rows.
+#[test]
+fn packed_matches_split_for_gemv() {
+    // n == 1 -> gemv (mat[M,K] x vec[K]); K=2048 is LFM2's hidden size.
+    for (b, m, n, k) in [
+        (1usize, 2048usize, 1usize, 2048usize),
+        (1, 512, 1, 64),
+        (2, 128, 1, 256),
+    ] {
+        let lhs: Vec<f32> = (0..b * m * k)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+            .collect();
+        let rhs: Vec<f32> = (0..b * n * k)
+            .map(|i| ((i * 53 % 97) as f32 - 48.0) / 24.0)
+            .collect();
+        let split = run_mlx_gemv_style(
+            GemmDType::F32,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            &rhs,
+            &[n * k, 1, n],
+            ParamStyle::Split,
+        );
+        let packed = run_mlx_gemv_style(
+            GemmDType::F32,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            &rhs,
+            &[n * k, 1, n],
+            ParamStyle::Packed,
+        );
+        assert_eq!(
+            split.iter().map(|x: &f32| x.to_bits()).collect::<Vec<_>>(),
+            packed.iter().map(|x: &f32| x.to_bits()).collect::<Vec<_>>(),
+            "gemv and its packed form disagree at (b,m,n,k)=({b},{m},{n},{k})"
+        );
+    }
+}
+
+/// As above, for the transposed kernel (`m == 1` -> `gemv_t`).
+///
+/// Kept separate so a failure names which of the two kernels broke; they have
+/// different bodies and different threadgroup-reduction paths.
+#[test]
+fn packed_matches_split_for_gemv_t() {
+    for (b, m, n, k) in [
+        (1usize, 1usize, 2048usize, 2048usize),
+        (1, 1, 512, 128),
+        (2, 1, 64, 256),
+    ] {
+        let lhs: Vec<f32> = (0..b * m * k)
+            .map(|i| ((i * 41 % 89) as f32 - 44.0) / 22.0)
+            .collect();
+        let rhs: Vec<f32> = (0..b * n * k)
+            .map(|i| ((i * 29 % 83) as f32 - 41.0) / 20.0)
+            .collect();
+        let split = run_mlx_gemv_style(
+            GemmDType::F32,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            &rhs,
+            &[n * k, n, 1],
+            ParamStyle::Split,
+        );
+        let packed = run_mlx_gemv_style(
+            GemmDType::F32,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            &rhs,
+            &[n * k, n, 1],
+            ParamStyle::Packed,
+        );
+        assert_eq!(
+            split.iter().map(|x: &f32| x.to_bits()).collect::<Vec<_>>(),
+            packed.iter().map(|x: &f32| x.to_bits()).collect::<Vec<_>>(),
+            "gemv_t and its packed form disagree at (b,m,n,k)=({b},{m},{n},{k})"
+        );
+    }
+}
+
+/// The f16 path, which is what LFM2 decode actually dispatches.
+///
+/// 167 of the 183 gemv dispatches per token are f16 (issue #41's inventory), so
+/// an f32-only parity test would leave the decode path itself unchecked.
+#[test]
+fn packed_matches_split_for_gemv_f16() {
+    let (b, m, n, k) = (1usize, 2048usize, 1usize, 2048usize);
+    let lhs: Vec<f16> = (0..b * m * k)
+        .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 50.0))
+        .collect();
+    let rhs: Vec<f16> = (0..b * n * k)
+        .map(|i| f16::from_f32(((i * 53 % 97) as f32 - 48.0) / 48.0))
+        .collect();
+    let split = run_mlx_gemv_style(
+        GemmDType::F16,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        &rhs,
+        &[n * k, 1, n],
+        ParamStyle::Split,
+    );
+    let packed = run_mlx_gemv_style(
+        GemmDType::F16,
+        (b, m, n, k),
+        &lhs,
+        &[m * k, k, 1],
+        &rhs,
+        &[n * k, 1, n],
+        ParamStyle::Packed,
+    );
+    assert_eq!(
+        split.iter().map(|x: &f16| x.to_bits()).collect::<Vec<_>>(),
+        packed.iter().map(|x: &f16| x.to_bits()).collect::<Vec<_>>(),
+        "gemv_float16 and its packed form disagree"
+    );
+}
+
+/// Every classical gemv name has a `_packed` counterpart in the compiled
+/// library, and vice versa.
+///
+/// The same argument as `packed_names_resolve` for `reduce.metal`: an absent
+/// instantiation is a compile error on neither side, and the first symptom
+/// would be a `LoadFunctionError` inside a forward pass. #26 shipped exactly
+/// that for 48 variants, caught only by loading against the library
+/// (`DESIGN.md` §8.1b).
+///
+/// The axis lists are restated here rather than derived from the `.metal`
+/// macros, which is the point: if a tile configuration is added to one and not
+/// the other, this fails. 144 classical names, 144 packed.
+#[test]
+fn gemv_packed_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // (bm, bn, sm, sn, tm, tn), matching `instantiate_gemv_blocks`.
+    let gemv_blocks = [
+        (1, 8, 1, 32, 4, 4),
+        (1, 8, 1, 32, 1, 4),
+        (1, 1, 8, 4, 4, 4),
+        (1, 1, 8, 4, 1, 4),
+        (4, 1, 1, 32, 1, 4),
+        (4, 1, 1, 32, 4, 4),
+        (8, 1, 1, 32, 4, 4),
+    ];
+    // matching `instantiate_gemv_t_blocks`.
+    let gemv_t_blocks = [
+        (1, 2, 8, 4, 4, 1),
+        (1, 2, 8, 4, 4, 4),
+        (1, 4, 8, 4, 4, 4),
+        (1, 16, 8, 4, 4, 4),
+        (1, 16, 4, 8, 4, 4),
+    ];
+
+    let mut checked = 0usize;
+    for (prefix, blocks) in [("gemv", &gemv_blocks[..]), ("gemv_t", &gemv_t_blocks[..])] {
+        for dtype in ["float32", "float16", "bfloat16"] {
+            for &(bm, bn, sm, sn, tm, tn) in blocks.iter() {
+                for nc in [0, 1] {
+                    for axpby in [0, 1] {
+                        let classical = format!(
+                            "{prefix}_{dtype}_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc{nc}_axpby{axpby}"
+                        );
+                        let packed = crate::kernels::params::packed_name(&classical);
+                        kernels
+                            .load_pipeline(&device, Source::Gemv, classical.clone())
+                            .unwrap_or_else(|e| panic!("{classical} does not resolve: {e:?}"));
+                        kernels
+                            .load_pipeline(&device, Source::Gemv, packed.clone())
+                            .unwrap_or_else(|e| panic!("{packed} does not resolve: {e:?}"));
+                        checked += 2;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        checked, 288,
+        "expected 144 classical + 144 packed gemv variants"
+    );
+}
+
+/// `GemvParams`'s layout agrees between `gemv.metal` and `params.rs`.
+///
+/// A `static_assert` on either side proves only that side is self-consistent;
+/// this ships the *compiled kernel's own* `sizeof` and field offsets across the
+/// boundary and compares them against Rust's `size_of`/`offset_of!`. A field at
+/// the wrong offset does not crash -- the kernel reads a well-formed number
+/// from the wrong place and computes a plausible wrong answer (`DESIGN.md`
+/// §3.5, §15.1).
+#[test]
+fn gemv_params_layout_matches_metal() {
+    use crate::kernels::params::{gemv_expected_layout, GEMV_LAYOUT_KERNEL, GEMV_LAYOUT_SLOTS};
+
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let out = device
+        .new_buffer(
+            GEMV_LAYOUT_SLOTS * core::mem::size_of::<u32>(),
+            RESOURCE_OPTIONS,
+        )
+        .unwrap();
+
+    let pipeline = kernels
+        .load_pipeline(&device, Source::Gemv, GEMV_LAYOUT_KERNEL)
+        .unwrap();
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_output_buffer(0, Some(&out), 0);
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let device_side: Vec<u32> = read_to_vec(&out, GEMV_LAYOUT_SLOTS);
+    let mut disagreements = Vec::new();
+    for (slot, (what, rust)) in gemv_expected_layout().into_iter().enumerate() {
+        if device_side[slot] != rust {
+            disagreements.push(format!(
+                "  {what}: metal {} vs rust {rust}",
+                device_side[slot]
+            ));
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "packed parameter layout differs between gemv.metal and params.rs.\n\
+         A field at the wrong offset is silent corruption, not a crash:\n{}",
+        disagreements.join("\n")
+    );
+}
+
+/// The gemv layout check must be able to fail.
+///
+/// `DESIGN.md` §15.1 #1 and `CONTRIBUTING.md` §3.1 #2: a test that cannot fail
+/// is not a test. The mutation is applied to a **copy of `gemv.metal`**
+/// compiled at runtime, so the real source is untouched.
+///
+/// It **swaps `GemvParams.in_vec_size` and `.out_vec_size`** -- two adjacent
+/// fields of the same type, which is the case nothing else catches:
+///
+/// * `sizeof` is unchanged, so the `static_assert` in `gemv.metal` still
+///   passes;
+/// * both are `int`, so no narrowing diagnostic fires -- inserting a field of a
+///   *different* type is rejected at compile time by C++11 narrowing on the
+///   brace initializer, a real layer of defence but not this one;
+/// * the kernel runs and computes a plausible wrong answer, since swapping the
+///   loop bound with the output length is arithmetic that still terminates.
+///
+/// That last point is why this specific pair was chosen over any other adjacent
+/// pair: it is the one whose confusion would corrupt a matmul silently rather
+/// than crash it.
+#[test]
+fn gemv_params_layout_check_detects_a_moved_field() {
+    use crate::kernels::params::{gemv_expected_layout, GEMV_LAYOUT_KERNEL, GEMV_LAYOUT_SLOTS};
+
+    let original = "struct GemvParams {\n  int in_vec_size;\n  int out_vec_size;";
+    let swapped = "struct GemvParams {\n  int out_vec_size;\n  int in_vec_size;";
+    assert!(
+        crate::source::GEMV.contains(original),
+        "the struct this test mutates has been reworded; update the mutation"
+    );
+    let mutant = crate::source::GEMV.replace(original, swapped);
+
+    let device = device();
+    let library = device.new_library_with_source(&mutant, None).unwrap();
+    let function = library.get_function(GEMV_LAYOUT_KERNEL, None).unwrap();
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .unwrap();
+
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let out = device
+        .new_buffer(
+            GEMV_LAYOUT_SLOTS * core::mem::size_of::<u32>(),
+            RESOURCE_OPTIONS,
+        )
+        .unwrap();
+    let enc: &ComputeCommandEncoder = encoder.as_ref();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_output_buffer(0, Some(&out), 0);
+    enc.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let device_side: Vec<u32> = read_to_vec(&out, GEMV_LAYOUT_SLOTS);
+    let disagreements: Vec<String> = gemv_expected_layout()
+        .into_iter()
+        .enumerate()
+        .filter(|(slot, (_, rust))| device_side[*slot] != *rust)
+        .map(|(slot, (what, rust))| format!("{what}: metal {} vs rust {rust}", device_side[slot]))
+        .collect();
+
+    assert!(
+        disagreements
+            .iter()
+            .any(|d| d.starts_with("GemvParams.in_vec_size")),
+        "swapping in_vec_size must be reported; got {disagreements:?}"
+    );
+    assert!(
+        disagreements
+            .iter()
+            .any(|d| d.starts_with("GemvParams.out_vec_size")),
+        "swapping out_vec_size must be reported; got {disagreements:?}"
+    );
+    assert!(
+        !disagreements
+            .iter()
+            .any(|d| d.starts_with("sizeof(GemvParams)")),
+        "the swap must not change sizeof, or it is not the silent case; got {disagreements:?}"
+    );
+}
+
+/// The packed entry point does not change the inner loop's shape.
+///
+/// This is the check issue #41 asks for that the elementwise families did not
+/// need. `gemv` is where the weight traffic happens and decode is bandwidth-
+/// bound at 88 % of a streaming roofline (`DESIGN.md` §13.4a), so an added
+/// per-iteration load or a register spill here is a real regression rather
+/// than noise.
+///
+/// `maxTotalThreadsPerThreadgroup` is computed by the compiler from
+/// registers-per-thread, so it is a direct read on register pressure
+/// (`DESIGN.md` §3.2: registers/thread -> occupancy -> latency hiding). If the
+/// packed form held an extra live value or spilled, this is where it would
+/// show. `staticThreadgroupMemoryLength` covers the other half — the
+/// `tgp_mem_size` the template computed.
+///
+/// Why it should hold, which this measures rather than assumes: both entry
+/// points pass the scalars **by value** into `gemv_body`, whose parameters are
+/// `const int`/`const float`, and `GEMVKernel::run` takes them by value again.
+/// So the loop bound and the row stride are in registers before the first
+/// iteration under either style, and neither `constant int&` nor
+/// `device GemvParams*` is dereferenced inside the loop. Promoting them to a
+/// buffer moves *where the one load happens*, not how often.
+///
+/// There is no `metal-objdump` in this Xcode, so the loop body cannot be
+/// diffed directly; this is the strongest check the runtime exposes. The
+/// standalone form is `measurements/probes/issue-41/regpressure.m`.
+#[test]
+fn gemv_packed_does_not_change_occupancy() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // The four the decode inventory names, plus the bm8 f16 row that carries
+    // the most dispatches. Named explicitly rather than swept so a failure
+    // says which variant regressed.
+    let decode_path = [
+        "gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0",
+        "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0",
+        "gemv_float32_bm1_bn1_sm8_sn4_tm4_tn4_nc0_axpby0",
+        "gemv_t_float32_bm1_bn2_sm8_sn4_tm4_tn4_nc0_axpby0",
+    ];
+
+    let mut differences = Vec::new();
+    for classical in decode_path {
+        let packed = crate::kernels::params::packed_name(classical);
+        let pc = kernels
+            .load_pipeline(&device, Source::Gemv, classical)
+            .unwrap();
+        let pp = kernels
+            .load_pipeline(&device, Source::Gemv, packed.clone())
+            .unwrap();
+        if pc.max_total_threads_per_threadgroup() != pp.max_total_threads_per_threadgroup() {
+            differences.push(format!(
+                "{classical}: maxTotalThreadsPerThreadgroup {} vs {} packed",
+                pc.max_total_threads_per_threadgroup(),
+                pp.max_total_threads_per_threadgroup()
+            ));
+        }
+    }
+
+    assert!(
+        differences.is_empty(),
+        "the packed entry point changed occupancy, which means register pressure \
+         in the matmul inner loop moved:\n{}",
+        differences.join("\n")
+    );
+}

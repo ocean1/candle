@@ -24,8 +24,11 @@ pub use conv_names::ConvKernel;
 pub use convolution::*;
 pub use fill::*;
 pub use indexing::*;
-pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
-pub use params::{NormParams, ReduceParams, RopeIParams, RopeParams, RopeThdParams, SoftmaxParams};
+pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_with, GemmDType};
+pub use params::{
+    GemvParams, NormParams, ParamStyle, ReduceParams, RopeIParams, RopeParams, RopeThdParams,
+    SoftmaxParams,
+};
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,
 };
