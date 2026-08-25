@@ -302,7 +302,7 @@ fn render(step: &Step) -> String {
     ));
     for (i, d) in step.dispatches.iter().enumerate() {
         out.push_str(&format!(
-            "{i:>4}  {} grid={:?} tg={:?} {}\n",
+            "{i:>4}  {} grid={:?} tg={:?} {} enc={}{}\n",
             d.pipeline,
             d.grid,
             d.threadgroup,
@@ -310,7 +310,9 @@ fn render(step: &Step) -> String {
                 "threadgroups"
             } else {
                 "threads"
-            }
+            },
+            d.encoder,
+            if d.barrier { "  BARRIER" } else { "" }
         ));
         for b in &d.bindings {
             out.push_str(&format!(
@@ -605,6 +607,51 @@ fn main() -> Result<()> {
         );
     }
     println!("\ndistinct decode dispatch counts: {counts:?}");
+
+    // Barriers per token -- `DESIGN.md` §9.2e's standing check on arena work.
+    //
+    // `MTLDispatchType::Concurrent` means dispatches within an encoder overlap
+    // and the GPU does not drain between them (§3.5), so serialization comes
+    // from barriers. A layout that stabilises buffer identity while multiplying
+    // this number is a regression wearing the acceptance criterion as a
+    // disguise, and the two numbers therefore belong side by side.
+    //
+    // These are *observed*, not simulated: `auto_barrier` reports each barrier
+    // it emits. Encoder sessions are reported beside them because hazard state
+    // is per encoder -- candle opens a new one every
+    // `CANDLE_METAL_COMPUTE_PER_BUFFER` dispatches (50 by default), and a
+    // barrier orders nothing across that boundary.
+    println!("\n== barriers per decode token ==");
+    let mut barrier_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    for s in &decode_steps {
+        let barriers = s.dispatches.iter().filter(|d| d.barrier).count();
+        let encoders = s
+            .dispatches
+            .iter()
+            .map(|d| d.encoder)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        *barrier_counts.entry(barriers).or_default() += 1;
+        println!(
+            "{:<28} {barriers:>4} barriers / {} dispatches   ({encoders} encoder sessions)",
+            s.label,
+            s.dispatches.len()
+        );
+    }
+    println!("distinct decode barrier counts: {barrier_counts:?}");
+    // The last step, not step 1. Under `--arena` the first `record_steps`
+    // decode steps run *before* the arena is installed, so step 1 reports the
+    // classical count in every arm and would make the arena look free. Reading
+    // the last step is what makes this number the one §9.2e asks for.
+    if let Some(steady) = decode_steps.last() {
+        let barriers = steady.dispatches.iter().filter(|d| d.barrier).count();
+        println!(
+            "steady-state ({}): {barriers} barriers over {} dispatches ({:.1} %)",
+            steady.label,
+            steady.dispatches.len(),
+            100.0 * barriers as f64 / steady.dispatches.len().max(1) as f64
+        );
+    }
 
     // Kernel histogram: what the per-token dispatch budget is actually spent on.
     // §11.2 estimates ~240 from 30 layers x ~8 ops; the issue asks for the

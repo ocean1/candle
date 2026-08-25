@@ -256,6 +256,11 @@ impl ComputeCommandEncoder {
         let mut s = self.state.lock().unwrap();
         if s.needs_barrier {
             self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+            // Observed here rather than reconstructed downstream: the barrier
+            // count `DESIGN.md` §9.2e requires is a property of this branch, and
+            // deriving it from a trace of bindings would additionally have to
+            // model where each encoder session began.
+            trace::record_barrier();
             s.needs_barrier = false;
             s.prev_outputs = std::mem::take(&mut s.next_outputs);
             s.prev_inputs = std::mem::take(&mut s.next_inputs);

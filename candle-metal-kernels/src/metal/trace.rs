@@ -61,6 +61,25 @@ pub struct Dispatch {
     pub by_threadgroups: bool,
     /// Buffers bound since the previous dispatch, in binding order.
     pub bindings: Vec<Binding>,
+    /// Whether `auto_barrier` emitted a `memoryBarrierWithScope(Buffers)`
+    /// immediately before this dispatch.
+    ///
+    /// Recorded rather than reconstructed. `DESIGN.md` §9.2e requires arena work
+    /// to report barriers per token, and the count can only be *simulated* from
+    /// a trace if the simulation also knows where each encoder began -- candle
+    /// starts a fresh `EncoderState` every `CANDLE_METAL_COMPUTE_PER_BUFFER`
+    /// dispatches (50 by default), and a simulation that misses those
+    /// boundaries accumulates `prev_outputs` for the whole token and
+    /// over-counts. Observing the barrier directly removes the modelling
+    /// question entirely.
+    pub barrier: bool,
+    /// Which encoder session this dispatch belongs to, counted from the start of
+    /// the trace.
+    ///
+    /// Hazard state is per encoder, so this is what makes a barrier count
+    /// interpretable: two dispatches in different sessions cannot be ordered by
+    /// a barrier at all, only by a fence.
+    pub encoder: u64,
     /// Caller-supplied marker this dispatch falls under, e.g. a decode step.
     pub region: Option<String>,
 }
@@ -148,6 +167,11 @@ struct TraceState {
     next_buffer_id: u64,
     region: Option<String>,
     next_seq: u64,
+    /// Set by `record_barrier` when `auto_barrier` emits one, consumed by the
+    /// dispatch that immediately follows it.
+    pending_barrier: bool,
+    /// Encoder sessions begun so far, so a dispatch can name the one it is in.
+    encoder: u64,
 }
 
 impl TraceState {
@@ -160,6 +184,8 @@ impl TraceState {
             next_buffer_id: 0,
             region: None,
             next_seq: 0,
+            pending_barrier: false,
+            encoder: 0,
         }
     }
 
@@ -239,6 +265,38 @@ pub fn record_pipeline(name: &str) {
     }
 }
 
+/// Record that `auto_barrier` emitted a barrier before the next dispatch.
+///
+/// Called from the barrier site itself, so this is an observation of what
+/// candle did rather than a reconstruction of what it would do. `DESIGN.md`
+/// §9.2e asks for barriers per token as a standing check on arena work, and a
+/// count derived from bindings alone would have to model encoder boundaries
+/// (§9.2e's simulation does; see `tools/barrier-count/`).
+#[inline]
+pub fn record_barrier() {
+    if !is_recording() {
+        return;
+    }
+    if let Ok(mut s) = state().lock() {
+        s.pending_barrier = true;
+    }
+}
+
+/// Record that a new encoder session began, resetting hazard state.
+///
+/// Barriers order dispatches only *within* an encoder, so a barrier count is
+/// uninterpretable without knowing where the sessions divide. Candle opens one
+/// every `CANDLE_METAL_COMPUTE_PER_BUFFER` dispatches.
+#[inline]
+pub fn record_encoder_begin() {
+    if !is_recording() {
+        return;
+    }
+    if let Ok(mut s) = state().lock() {
+        s.encoder += 1;
+    }
+}
+
 /// Record a buffer binding against the dispatch that will consume it.
 #[inline]
 pub fn record_binding(index: usize, addr: usize, offset: usize, is_output: bool) {
@@ -275,6 +333,10 @@ pub fn record_dispatch(
         SKIPPED.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut s) = state().lock() {
             s.pending.clear();
+            // Cleared with the bindings, and for the same reason: an unrecorded
+            // dispatch's barrier must not be attributed to the first recorded
+            // one.
+            s.pending_barrier = false;
         }
         return;
     }
@@ -289,6 +351,8 @@ pub fn record_dispatch(
             // so it is named rather than dropped.
             .unwrap_or_else(|| "<unknown>".to_string());
         let region = s.region.clone();
+        let barrier = std::mem::take(&mut s.pending_barrier);
+        let encoder = s.encoder;
         s.dispatches.push(Dispatch {
             seq,
             pipeline,
@@ -296,6 +360,8 @@ pub fn record_dispatch(
             threadgroup,
             by_threadgroups,
             bindings,
+            barrier,
+            encoder,
             region,
         });
     }
