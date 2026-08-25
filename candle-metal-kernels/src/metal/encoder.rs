@@ -15,7 +15,7 @@ use std::{
     ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 
@@ -27,15 +27,194 @@ fn size_tuple(size: MTLSize) -> (usize, usize, usize) {
     (size.width, size.height, size.depth)
 }
 
+/// How intra-encoder hazards are keyed (`DESIGN.md` §9.2e).
+///
+/// Metal barriers are resource-granular and always will be (§3.5) -- this
+/// changes the *decision* to emit one, never the barrier itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HazardKey {
+    /// The buffer pointer alone. What candle has always done, and correct:
+    /// two values in one allocation are one resource, so ordering them is
+    /// conservative rather than wrong.
+    ///
+    /// Its cost is that it cannot tell "the same bytes" from "the same
+    /// allocation". Under the pool those coincide often enough not to matter;
+    /// under an arena every activation shares one pointer, so every
+    /// write-then-read pair inside it becomes a false dependency.
+    #[default]
+    Pointer,
+    /// `(pointer, offset, length)`, with overlap decided by an interval test --
+    /// §9.2e's route (a).
+    ///
+    /// Strictly more precise than [`HazardKey::Pointer`]: two bindings that
+    /// overlap in bytes still collide, and two that do not no longer do. So it
+    /// can only ever *remove* barriers, never add one, and it cannot introduce
+    /// a missing dependency -- an edge it drops is one where the two bindings
+    /// provably touch disjoint bytes.
+    Range,
+}
+
+/// The hazard keying every new encoder session adopts.
+///
+/// Process-global for the same reason the dispatch trace's switch is: the
+/// choice is made by a harness in `candle-core` and consumed in the encoder,
+/// and threading it through would add a parameter to
+/// `compute_command_encoder` and to everything that calls it. It is read once
+/// per encoder session -- 14 times per decode token -- not per bind, so the
+/// atomic is nowhere near a hot path.
+///
+/// `Pointer` is the default and is the behaviour that shipped, so an
+/// unconfigured process is byte-for-byte what it was.
+static HAZARD_KEY: AtomicBool = AtomicBool::new(false);
+
+/// Whether `CANDLE_METAL_HAZARD_KEY` has been consulted yet.
+static HAZARD_KEY_FROM_ENV: OnceLock<()> = OnceLock::new();
+
+/// Apply `CANDLE_METAL_HAZARD_KEY=range` if it is set, once per process.
+///
+/// An environment switch rather than a parameter, so that **any** harness gets
+/// the A/B without being taught about it -- including the determinism probe,
+/// which is the one that matters here. Route (a) *removes* ordering edges, and
+/// under `HazardTrackingModeUntracked` a wrongly-removed edge is silent
+/// corruption rather than an error (§3.5), so it has to be run against the
+/// §15.1 #7 gate and not only against a barrier count. A probe that cannot
+/// select the mode cannot gate it.
+fn init_hazard_key_from_env() {
+    HAZARD_KEY_FROM_ENV.get_or_init(|| {
+        if let Ok(v) = std::env::var("CANDLE_METAL_HAZARD_KEY") {
+            match v.as_str() {
+                "range" => HAZARD_KEY.store(true, Ordering::Relaxed),
+                "pointer" | "ptr" | "" => {}
+                other => {
+                    // Loudly, because the silent alternative is measuring the
+                    // default while believing the variable was honoured.
+                    panic!("CANDLE_METAL_HAZARD_KEY={other:?}; want range or pointer")
+                }
+            }
+        }
+    });
+}
+
+/// Select how new encoder sessions key hazards (`DESIGN.md` §9.2e).
+///
+/// Takes effect at the next encoder session rather than immediately: hazard
+/// state is per session and the two keyings hold different state, so switching
+/// mid-session would compare bindings recorded under one rule against a lookup
+/// under the other.
+pub fn set_hazard_key(key: HazardKey) {
+    // Mark the environment as consulted, so an explicit call wins over it
+    // rather than being overwritten at the next session.
+    let _ = HAZARD_KEY_FROM_ENV.set(());
+    HAZARD_KEY.store(key == HazardKey::Range, Ordering::Relaxed);
+}
+
+/// The keying new encoder sessions will use.
+pub fn hazard_key() -> HazardKey {
+    init_hazard_key_from_env();
+    if HAZARD_KEY.load(Ordering::Relaxed) {
+        HazardKey::Range
+    } else {
+        HazardKey::Pointer
+    }
+}
+
+/// One buffer binding, as the hazard tracking sees it.
+///
+/// Carries the range even under [`HazardKey::Pointer`], where the extra fields
+/// are simply not compared. Keeping one type means the two modes cannot drift
+/// apart in what they record, only in how they compare it -- the same reason
+/// §11.3d gives for building the packed block out of the classical argument
+/// list rather than beside it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BoundRange {
+    pub ptr: usize,
+    pub offset: usize,
+    pub len: usize,
+}
+
+impl BoundRange {
+    /// Whether these two bindings can touch the same byte.
+    ///
+    /// A zero length is treated as covering the whole allocation rather than
+    /// nothing: an unknown extent must fail toward ordering, since the cost of
+    /// a spurious barrier is throughput and the cost of a missing one is silent
+    /// corruption (§3.5).
+    #[inline]
+    fn overlaps(&self, other: &BoundRange) -> bool {
+        if self.ptr != other.ptr {
+            return false;
+        }
+        if self.len == 0 || other.len == 0 {
+            return true;
+        }
+        self.offset < other.offset + other.len && other.offset < self.offset + self.len
+    }
+}
+
+/// The set of bindings seen in one phase, comparable under either keying.
+///
+/// `Pointer` mode keeps a pointer set and answers in O(1). `Range` mode keeps
+/// the ranges bucketed *by pointer*, so a lookup scans only the bindings that
+/// share an allocation -- one bucket, not the encoder's whole history. Under
+/// the pool that bucket holds one or two entries; under an arena it holds the
+/// slots, which is 6.
+#[derive(Default)]
+pub struct BoundSet {
+    ptrs: HashSet<usize>,
+    ranges: HashMap<usize, Vec<BoundRange>>,
+}
+
+impl BoundSet {
+    fn insert(&mut self, key: HazardKey, b: BoundRange) {
+        match key {
+            HazardKey::Pointer => {
+                self.ptrs.insert(b.ptr);
+            }
+            HazardKey::Range => {
+                let bucket = self.ranges.entry(b.ptr).or_default();
+                if !bucket.contains(&b) {
+                    bucket.push(b);
+                }
+            }
+        }
+    }
+
+    fn conflicts(&self, key: HazardKey, b: &BoundRange) -> bool {
+        match key {
+            HazardKey::Pointer => self.ptrs.contains(&b.ptr),
+            HazardKey::Range => self
+                .ranges
+                .get(&b.ptr)
+                .is_some_and(|bucket| bucket.iter().any(|seen| seen.overlaps(b))),
+        }
+    }
+
+    fn absorb(&mut self, other: &mut BoundSet) {
+        self.ptrs.extend(other.ptrs.drain());
+        for (ptr, mut v) in other.ranges.drain() {
+            self.ranges.entry(ptr).or_default().append(&mut v);
+        }
+    }
+
+    fn take(&mut self) -> BoundSet {
+        BoundSet {
+            ptrs: std::mem::take(&mut self.ptrs),
+            ranges: std::mem::take(&mut self.ranges),
+        }
+    }
+}
+
 /// Barrier tracking state for one encoder session.
 /// Owned by ComputeCommandEncoder via Arc<Mutex<>> so clones share state.
 pub struct EncoderState {
-    /// Buffer ptrs written since last barrier (RAW/WAW detection).
-    pub prev_outputs: HashSet<usize>,
-    pub next_outputs: HashSet<usize>,
-    /// Buffer ptrs read since last barrier (WAR detection).
-    pub prev_inputs: HashSet<usize>,
-    pub next_inputs: HashSet<usize>,
+    /// How hazards are keyed this session.
+    pub hazard_key: HazardKey,
+    /// Bindings written since last barrier (RAW/WAW detection).
+    pub prev_outputs: BoundSet,
+    pub next_outputs: BoundSet,
+    /// Bindings read since last barrier (WAR detection).
+    pub prev_inputs: BoundSet,
+    pub next_inputs: BoundSet,
     pub needs_barrier: bool,
     /// All inputs seen this encoder session (cross-encoder fence coordination).
     pub all_inputs: HashSet<usize>,
@@ -51,13 +230,24 @@ pub struct EncoderState {
     pub current_pipeline: Option<Arc<str>>,
 }
 
+impl Default for EncoderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EncoderState {
     pub fn new() -> Self {
+        Self::with_hazard_key(HazardKey::default())
+    }
+
+    pub fn with_hazard_key(hazard_key: HazardKey) -> Self {
         EncoderState {
-            prev_outputs: HashSet::new(),
-            next_outputs: HashSet::new(),
-            prev_inputs: HashSet::new(),
-            next_inputs: HashSet::new(),
+            hazard_key,
+            prev_outputs: BoundSet::default(),
+            next_outputs: BoundSet::default(),
+            prev_inputs: BoundSet::default(),
+            next_inputs: BoundSet::default(),
             needs_barrier: false,
             all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
@@ -160,7 +350,7 @@ impl ComputeCommandEncoder {
             raw,
             command_buffer,
             fence,
-            state: Arc::new(Mutex::new(EncoderState::new())),
+            state: Arc::new(Mutex::new(EncoderState::with_hazard_key(hazard_key()))),
             prev_ce_outputs,
             executor,
             capturing: Arc::new(AtomicBool::new(false)),
@@ -262,13 +452,30 @@ impl ComputeCommandEncoder {
             // model where each encoder session began.
             trace::record_barrier();
             s.needs_barrier = false;
-            s.prev_outputs = std::mem::take(&mut s.next_outputs);
-            s.prev_inputs = std::mem::take(&mut s.next_inputs);
+            // Replaced, not extended: everything bound before the barrier is
+            // now ordered against everything after it.
+            s.prev_outputs = s.next_outputs.take();
+            s.prev_inputs = s.next_inputs.take();
         } else {
-            let next_out = std::mem::take(&mut s.next_outputs);
-            s.prev_outputs.extend(next_out);
-            let next_in = std::mem::take(&mut s.next_inputs);
-            s.prev_inputs.extend(next_in);
+            let mut next_out = s.next_outputs.take();
+            s.prev_outputs.absorb(&mut next_out);
+            let mut next_in = s.next_inputs.take();
+            s.prev_inputs.absorb(&mut next_in);
+        }
+    }
+
+    /// The binding a hazard check should compare, including its extent.
+    ///
+    /// `offset` is the byte the kernel starts at -- already including the
+    /// arena's `base_offset` where there is one -- and `length()` is what the
+    /// handle addresses from there, which for an arena view is its slot rather
+    /// than the whole arena.
+    #[inline]
+    fn bound_range(buf: &Buffer, offset: usize) -> BoundRange {
+        BoundRange {
+            ptr: buf.raw_ptr() as usize,
+            offset,
+            len: buf.length(),
         }
     }
 
@@ -290,11 +497,14 @@ impl ComputeCommandEncoder {
             // Read-after-write against an earlier encoder: order against that
             // buffer's last writer only.
             self.wait_for_buffer(ptr);
+            let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock().unwrap();
-            if s.prev_outputs.contains(&ptr) {
+            let key = s.hazard_key;
+            // Read-after-write within this encoder.
+            if s.prev_outputs.conflicts(key, &range) {
                 s.needs_barrier = true;
             }
-            s.next_inputs.insert(ptr);
+            s.next_inputs.insert(key, range);
             s.all_inputs.insert(ptr);
             drop(s);
             if !self.executor.is_classical() {
@@ -318,11 +528,14 @@ impl ComputeCommandEncoder {
             arena::note_bind(ptr);
             // Write-after-write or write-after-read against an earlier encoder.
             self.wait_for_buffer(ptr);
+            let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock().unwrap();
-            if s.prev_outputs.contains(&ptr) || s.prev_inputs.contains(&ptr) {
+            let key = s.hazard_key;
+            // Write-after-write, and write-after-read.
+            if s.prev_outputs.conflicts(key, &range) || s.prev_inputs.conflicts(key, &range) {
                 s.needs_barrier = true;
             }
-            s.next_outputs.insert(ptr);
+            s.next_outputs.insert(key, range);
             s.all_outputs.insert(ptr);
             drop(s);
             if !self.executor.is_classical() {
@@ -408,8 +621,10 @@ impl ComputeCommandEncoder {
         let ptr = buffer.raw_ptr() as usize;
         self.wait_for_buffer(ptr);
         {
+            let range = Self::bound_range(&buffer, 0);
             let mut s = self.state.lock().unwrap();
-            s.next_inputs.insert(ptr);
+            let key = s.hazard_key;
+            s.next_inputs.insert(key, range);
             s.all_inputs.insert(ptr);
         }
         unsafe {
@@ -702,5 +917,122 @@ impl BlitCommandEncoder {
             },
             value,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(ptr: usize, offset: usize, len: usize) -> BoundRange {
+        BoundRange { ptr, offset, len }
+    }
+
+    /// The property route (a) rests on: two bindings collide exactly when they
+    /// can touch the same byte (`DESIGN.md` §9.2e).
+    ///
+    /// Adjacency is the case worth pinning. `[0, 128)` and `[128, 256)` share no
+    /// byte, so they must not collide -- which is precisely the pair an arena
+    /// produces, since slots are laid out end to end at 128 B alignment. Getting
+    /// the comparison non-strict would make every neighbouring slot conflict and
+    /// silently give back the whole win.
+    #[test]
+    fn ranges_overlap_exactly_when_they_share_a_byte() {
+        assert!(
+            !r(1, 0, 128).overlaps(&r(1, 128, 128)),
+            "adjacent ranges collided"
+        );
+        assert!(
+            !r(1, 128, 128).overlaps(&r(1, 0, 128)),
+            "adjacency is not symmetric"
+        );
+        assert!(
+            r(1, 0, 129).overlaps(&r(1, 128, 128)),
+            "a one-byte overlap was missed"
+        );
+        assert!(
+            r(1, 0, 256).overlaps(&r(1, 64, 64)),
+            "containment was missed"
+        );
+        assert!(
+            r(1, 64, 64).overlaps(&r(1, 0, 256)),
+            "containment is not symmetric"
+        );
+        assert!(
+            r(1, 0, 128).overlaps(&r(1, 0, 128)),
+            "a range did not overlap itself"
+        );
+        // Different allocations never collide, whatever their offsets say --
+        // offsets are only comparable within one buffer.
+        assert!(
+            !r(1, 0, 128).overlaps(&r(2, 0, 128)),
+            "distinct buffers collided"
+        );
+    }
+
+    /// An unknown extent must fail toward ordering.
+    ///
+    /// A spurious barrier costs throughput; a missing one is silent corruption
+    /// under `HazardTrackingModeUntracked` (§3.5). So a zero length covers the
+    /// whole allocation rather than nothing -- the asymmetry is deliberate and
+    /// is the one place this logic is allowed to be imprecise.
+    #[test]
+    fn an_unknown_extent_orders_conservatively() {
+        assert!(
+            r(1, 0, 0).overlaps(&r(1, 4096, 128)),
+            "a zero length did not order"
+        );
+        assert!(
+            r(1, 4096, 128).overlaps(&r(1, 0, 0)),
+            "zero-length is not symmetric"
+        );
+        assert!(
+            !r(1, 0, 0).overlaps(&r(2, 0, 0)),
+            "zero length crossed buffers"
+        );
+    }
+
+    /// `Range` can only ever remove barriers relative to `Pointer`, never add
+    /// one. That is what makes it safe to adopt without re-verifying every
+    /// dependency: an edge it drops is one where the bindings provably touch
+    /// disjoint bytes, and Metal's barrier was resource-granular anyway.
+    #[test]
+    fn range_keying_is_a_refinement_of_pointer_keying() {
+        let a = r(7, 0, 128);
+        let b = r(7, 128, 128);
+
+        let mut ptr_set = BoundSet::default();
+        ptr_set.insert(HazardKey::Pointer, a);
+        assert!(
+            ptr_set.conflicts(HazardKey::Pointer, &b),
+            "pointer keying stopped ordering two values in one allocation"
+        );
+
+        let mut range_set = BoundSet::default();
+        range_set.insert(HazardKey::Range, a);
+        assert!(
+            !range_set.conflicts(HazardKey::Range, &b),
+            "range keying ordered two disjoint slots"
+        );
+        // ... but it still orders anything that genuinely overlaps.
+        assert!(
+            range_set.conflicts(HazardKey::Range, &r(7, 64, 128)),
+            "range keying dropped a real dependency"
+        );
+    }
+
+    /// The keying is read per encoder session, so switching it is only visible
+    /// to sessions opened afterwards. Stated as a test because the alternative
+    /// -- switching mid-session -- would compare bindings recorded under one
+    /// rule against a lookup under the other.
+    #[test]
+    fn a_sessions_keying_is_fixed_when_it_opens() {
+        let s = EncoderState::with_hazard_key(HazardKey::Range);
+        assert_eq!(s.hazard_key, HazardKey::Range);
+        let s = EncoderState::with_hazard_key(HazardKey::Pointer);
+        assert_eq!(s.hazard_key, HazardKey::Pointer);
+        // The default is what shipped, so an unconfigured process is unchanged.
+        assert_eq!(EncoderState::new().hazard_key, HazardKey::Pointer);
+        assert_eq!(HazardKey::default(), HazardKey::Pointer);
     }
 }

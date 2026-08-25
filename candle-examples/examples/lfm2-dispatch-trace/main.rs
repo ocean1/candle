@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-use candle::metal_backend::{trace, ArenaLayout};
+use candle::metal_backend::{set_hazard_key, trace, ArenaLayout, HazardKey};
 
 #[derive(Parser, Debug)]
 #[command(about = "LFM2 decode dispatch-sequence probe")]
@@ -118,6 +118,22 @@ struct Args {
     /// under `HazardTrackingModeUntracked`.
     #[arg(long, default_value = "packed")]
     arena_layout: String,
+
+    /// How intra-encoder hazards are keyed: `pointer` (candle's, and the
+    /// default) or `range` (`DESIGN.md` §9.2e route (a)).
+    ///
+    /// `pointer` treats two values at different offsets of one allocation as
+    /// the same resource, which is correct but cannot tell "the same bytes"
+    /// from "the same allocation" -- under an arena every activation shares one
+    /// pointer, so every write-then-read pair inside it becomes a false
+    /// dependency. `range` decides overlap by an interval test, so it can only
+    /// remove barriers and never add one.
+    ///
+    /// Defaults to `CANDLE_METAL_HAZARD_KEY` when that is set, so a harness
+    /// without the flag still gets the A/B -- the determinism probe is driven
+    /// that way.
+    #[arg(long)]
+    hazard_key: Option<String>,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -463,6 +479,24 @@ fn main() -> Result<()> {
         "non-aliasing" | "nonaliasing" | "reference" => ArenaLayout::NonAliasing,
         other => anyhow::bail!("unknown --arena-layout {other:?}; want packed or non-aliasing"),
     };
+    // Set before any encoder session opens, since the keying is read once per
+    // session rather than per bind.
+    // An explicit flag wins; otherwise leave the selector alone so that
+    // `CANDLE_METAL_HAZARD_KEY` is honoured. Calling `set_hazard_key`
+    // unconditionally would consume the env switch and silently pin the
+    // default -- which it did, and which made a determinism run that believed
+    // it was testing route (a) actually test the default.
+    if let Some(requested) = args.hazard_key.as_deref() {
+        let key = match requested {
+            "pointer" | "ptr" => HazardKey::Pointer,
+            "range" => HazardKey::Range,
+            other => anyhow::bail!("unknown --hazard-key {other:?}; want pointer or range"),
+        };
+        set_hazard_key(key);
+    }
+    // Reported rather than assumed, for the same reason: a run has to be able
+    // to say which arm it was.
+    eprintln!("hazard key: {:?}", candle::metal_backend::hazard_key());
     // Decode steps 0..record_steps are recorded, and the arena is installed
     // after them.
     //

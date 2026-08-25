@@ -24,7 +24,9 @@ pub use device::{DeviceId, MetalDevice};
 ///
 /// Re-exported for the same reason `trace` is below: a harness selecting a
 /// layout should not need a direct dependency on `candle-metal-kernels`.
-pub use candle_metal_kernels::metal::{ArenaCounters, ArenaLayout, Slot, StepPlan};
+pub use candle_metal_kernels::metal::{
+    hazard_key, set_hazard_key, ArenaCounters, ArenaLayout, HazardKey, Slot, StepPlan,
+};
 
 /// Per-dispatch recording of the Metal command stream.
 ///
