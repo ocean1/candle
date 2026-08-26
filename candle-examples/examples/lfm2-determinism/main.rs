@@ -820,11 +820,12 @@ fn main() -> Result<()> {
     // `elapsed_ms` stays because §2.3.8's evidence is that wall time varied while
     // the bits did not; it is a duration, not a rate, and dividing it by
     // `generated` reconstructs the discredited figure. Measured while removing the
-    // field: nine runs of this harness at `--turns 3` produced one digest pair and
-    // wall clocks from 8291 to 20085 ms as the machine's load moved -- a 2.42x
-    // spread on the removed quantity. Sharpest inside one three-run gate on one
-    // binary, minutes apart: 19630, 19894 and 8291 ms, which the field would have
-    // reported as 13.60, 13.42 and 32.20 tok/s
+    // field: every run taken for lloom #102 produced one digest pair, with wall
+    // clocks spanning 8291 to 20085 ms as the machine's load moved -- a 2.4x
+    // spread on the removed quantity. Sharpest inside a single three-run gate, one
+    // binary, minutes apart: 31.90, 13.41 and 13.34 tok/s, from bit-identical
+    // output -- and the preceding gate reproduced the same shape, so a 2.4x swing
+    // within one gate happened twice out of two
     // (`measurements/issue-102-tok-per-s-removed.md` §4.1).
     println!(
         "RESULT label={} n={} tokens_sha256={} logits_sha256={} prompt_tokens={} generated={} \
