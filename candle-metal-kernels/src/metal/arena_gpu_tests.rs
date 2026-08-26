@@ -548,6 +548,78 @@ fn a_packed_plan_is_not_bump_reproducible() {
     );
 }
 
+/// **An arena refuses GPU offsets that disagree with its plan**, rather than
+/// binding them.
+///
+/// The check runs *before* the switch, so a wrong offset can never reach a
+/// bind. That ordering is the whole safety argument for the GPU path: §9.3 says
+/// aliasing correctness rests entirely on this arithmetic and that
+/// `HazardTrackingModeUntracked` gives no safety net, so an offset wrong by one
+/// slot does not fail -- it silently overlaps another value and corrupts
+/// intermittently (§2.3.2). Refusing costs nothing, because the CPU path it
+/// falls back to is the default anyway.
+///
+/// Three ways to disagree are checked, because they are separate code paths and
+/// a fix for one would not catch the others: a served ordinal at the wrong
+/// offset, a declined ordinal handed a real offset, and a table of the wrong
+/// length.
+#[test]
+fn an_arena_refuses_gpu_offsets_that_disagree_with_the_plan() {
+    let device = device();
+    let sizes = [4096usize, 21504, 1024];
+    let excluded = [false, true, false];
+    let plan = reference_plan(&sizes, &excluded);
+    let base = device
+        .new_buffer(plan.bump_capacity().max(1), crate::RESOURCE_OPTIONS)
+        .unwrap();
+    let pool = crate::metal::BufferPool::new();
+    let arena =
+        crate::metal::Arena::new(&pool, base, plan.clone(), ArenaLayout::NonAliasing).unwrap();
+
+    let correct: Vec<u32> = plan
+        .expected_offsets()
+        .iter()
+        .map(|e| e.map_or(ARENA_DECLINED, |o| o as u32))
+        .collect();
+
+    // Control: the correct table is adopted, so the rejections below are not
+    // "this arena refuses everything".
+    assert_eq!(arena.offsets(), ArenaOffsets::Cpu, "default is not the CPU");
+    arena
+        .adopt_gpu_offsets(&correct)
+        .expect("the correct table was refused");
+    assert_eq!(
+        arena.offsets(),
+        ArenaOffsets::Gpu,
+        "adoption did not record that the GPU path engaged"
+    );
+    assert_eq!(arena.counters().gpu_verified, 1);
+
+    // 1. A served ordinal at the wrong offset -- off by one slot, the shape a
+    //    real arithmetic slip produces.
+    let mut wrong = correct.clone();
+    wrong[0] += ARENA_ALIGNMENT as u32;
+    let err = arena
+        .adopt_gpu_offsets(&wrong)
+        .expect_err("a wrong offset was adopted");
+    assert!(err.contains("ordinal 0"), "unexpected error: {err}");
+
+    // 2. A declined ordinal handed a real offset -- session state pulled into
+    //    the arena, which §9.1 says must never happen.
+    let mut intruding = correct.clone();
+    intruding[1] = 0;
+    let err = arena
+        .adopt_gpu_offsets(&intruding)
+        .expect_err("session state was admitted");
+    assert!(err.contains("ordinal 1"), "unexpected error: {err}");
+
+    // 3. A table of the wrong length, which would otherwise index past the plan.
+    let err = arena
+        .adopt_gpu_offsets(&correct[..2])
+        .expect_err("a short table was adopted");
+    assert!(err.contains("ordinals"), "unexpected error: {err}");
+}
+
 /// The offset source defaults to the CPU, so an unconfigured process is #69's
 /// path byte for byte.
 ///

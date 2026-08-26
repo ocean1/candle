@@ -4,9 +4,9 @@ use crate::{DType, Result};
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        Arena, ArenaCounters, ArenaLayout, ArenaRecorder, BlitCommandsGuard, Buffer, BufferPool,
-        Commands, CommandsGuard, Device, MTLResourceOptions, PoolCounters, PoolOccupancySnapshot,
-        PooledBuffer, ResidencySet, StepPlan,
+        Arena, ArenaCounters, ArenaCursor, ArenaLayout, ArenaOffsets, ArenaRecorder,
+        BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
+        PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet, StepPlan,
     },
     Kernels,
 };
@@ -280,7 +280,14 @@ impl MetalDevice {
     /// caller is asked to release anything, and removing the arena with
     /// [`Self::clear_arena`] returns the device to the classical path exactly.
     pub fn install_arena(&self, plan: StepPlan, layout: ArenaLayout) -> Result<()> {
-        let bytes = plan.arena_bytes().max(1);
+        // `bump_capacity`, not `arena_bytes`: the two differ when the last
+        // slot's size is not a multiple of the 128 B alignment, and a GPU bump
+        // allocator rounds every request including the last (issue #70). Sizing
+        // to the larger figure costs at most 127 bytes of tail and lets either
+        // offset source serve every ordinal; sizing to the smaller one makes the
+        // GPU path decline an ordinal that fits the plan perfectly, which is a
+        // silent loss of coverage rather than an error.
+        let bytes = plan.bump_capacity().max(plan.arena_bytes()).max(1);
         let base = self
             .device
             .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
@@ -292,6 +299,69 @@ impl MetalDevice {
             *slot = Some(arena);
         }
         Ok(())
+    }
+
+    /// Compute this arena's offsets on the GPU and adopt them if they agree
+    /// with the plan (`DESIGN.md` §9.2d, issue #70).
+    ///
+    /// Dispatches the bump allocator over the installed arena's plan, reads the
+    /// offsets back, and hands them to
+    /// [`Arena::adopt_gpu_offsets`](candle_metal_kernels::metal::Arena::adopt_gpu_offsets),
+    /// which verifies them element-wise before switching. A disagreement is an
+    /// error and the arena keeps binding through the CPU plan.
+    ///
+    /// # Why this is a one-off rather than per step
+    ///
+    /// The plan is fixed once recorded and the request sizes never change, so
+    /// the allocator computes the same table every step. Running it per token
+    /// would burn a dispatch and a readback to re-derive a constant.
+    ///
+    /// What *is* per step is the reset, and it stays that way for the reason
+    /// `call_arena_reset` gives: it is the ordering point, not a computation.
+    ///
+    /// # The readback, stated plainly
+    ///
+    /// The offsets cross back to the host because `setBuffer_offset_atIndex` is
+    /// a CPU call -- a classical dispatch cannot consume a GPU-computed offset
+    /// any other way. That is the boundary §11.3c describes, not a shortcut:
+    /// consuming an offset without a round-trip requires an ICB command written
+    /// by an encoding kernel, and the ICB executor is out of scope here. Doing
+    /// it once at install rather than per token is what keeps the cost off the
+    /// per-token path entirely.
+    pub fn install_gpu_arena_offsets(&self) -> Result<usize> {
+        use candle_metal_kernels::call_arena_bump;
+
+        let arena = self
+            .arena_slot()
+            .ok_or_else(|| MetalError::Message("no arena installed".to_string()))?;
+        let plan = arena.plan_snapshot();
+        let sizes = plan.request_sizes();
+        let capacity = plan.bump_capacity().max(plan.arena_bytes()).max(1);
+
+        let cursor = ArenaCursor::new(&self.device, &sizes, capacity)
+            .map_err(|e| MetalError::Message(format!("arena cursor: {e}")))?;
+        {
+            let guard = self.commands.command_encoder().map_err(MetalError::from)?;
+            call_arena_bump(
+                &self.device,
+                &guard,
+                &self.kernels,
+                cursor.cursor_buffer(),
+                cursor.sizes_buffer(),
+                cursor.offsets_buffer(),
+                cursor.len(),
+                cursor.capacity(),
+            )
+            .map_err(MetalError::from)?;
+        }
+        // The offsets live in shared storage, so they are only meaningful once
+        // the command buffer carrying the allocator has completed. Reading them
+        // sooner is a race the host cannot detect.
+        self.wait_until_completed()?;
+
+        Ok(arena
+            .adopt_gpu_offsets(&cursor.offsets())
+            .map_err(|e| MetalError::Message(format!("GPU offsets rejected: {e}")))?)
     }
 
     /// Remove the arena. Subsequent allocations all take the pool path.
@@ -326,6 +396,16 @@ impl MetalDevice {
 
     pub fn arena_counters(&self) -> Option<ArenaCounters> {
         self.arena_slot().map(|a| a.counters())
+    }
+
+    /// Where the installed arena's offsets came from (issue #70).
+    ///
+    /// Reported so a harness can show the GPU path *engaged* rather than
+    /// asserting that a flag was passed. §2.4: an instrument that cannot be
+    /// shown to have engaged has not measured anything, and #69's first
+    /// determinism gate was vacuous for exactly that reason.
+    pub fn arena_offsets(&self) -> Option<ArenaOffsets> {
+        self.arena_slot().map(|a| a.offsets())
     }
 
     /// Begin observing allocations so a plan can be derived from one step.
