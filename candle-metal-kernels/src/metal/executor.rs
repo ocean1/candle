@@ -317,5 +317,26 @@ impl std::fmt::Debug for ExecutorSlot {
 /// been repeated as fact. It originates in §8.1b, about a *build script*
 /// emitting generated `.metal` into `OUT_DIR` -- a different change, with a
 /// different cost. **No candle maintainer has been asked about this one.**
+///
+/// # Built 2026-08-26 (issue #115) -- see [`crate::metal::icb::IcbExecutor`]
+///
+/// The constants prerequisite above was discharged per family across #38 to #81,
+/// and this note is kept because **it was not sufficient, for a reason it does
+/// not state**. Every family gained a `_packed` entry point and *nothing
+/// selected one*: `candle-core` calls only the classical `call_*`, each passing
+/// `ParamStyle::default()`, which derived to `Split`. So an executor installed at
+/// this seam would have found every position unencodable, with the whole
+/// prerequisite recorded as done.
+///
+/// Expressible and selected are different properties. `set_default_param_style`
+/// is what closes the second, and the executor covers **433 of 556 decode
+/// positions** once it is set.
+///
+/// The other thing this note does not say, and which turned out to matter more:
+/// the eleven-method list above establishes what is *absent*, and it equally
+/// establishes what is *present*. `setBarrier` is in it, and an ICB whose
+/// commands are `ConcurrentDispatch` carries none of candle's ordering (§3.5) --
+/// so a replayed run needs those edges re-expressed on the commands themselves
+/// or it computes a plausible wrong answer. Read the list in both directions.
 #[derive(Debug)]
 pub struct IcbFeasibility;
