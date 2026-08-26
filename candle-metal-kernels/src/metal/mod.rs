@@ -16,6 +16,9 @@ pub mod executor;
 #[cfg(test)]
 mod executor_tests;
 pub mod fence;
+pub mod icb;
+#[cfg(test)]
+mod icb_executor_tests;
 #[cfg(test)]
 mod icb_tests;
 pub mod library;

@@ -96,6 +96,29 @@ pub trait Executor: Send + Sync {
         true
     }
 
+    /// As [`Self::dispatch`], but able to ask for a pre-encoded range to run
+    /// here instead (`DESIGN.md` §11.3).
+    ///
+    /// The `bool` above can say "do not encode this dispatch" and nothing more,
+    /// which is enough for a recorder and not for a replayer: an ICB executes
+    /// its commands wherever `executeCommandsInBuffer` is called, so a replaying
+    /// executor has to name a *point in the stream* as well as a range. The
+    /// covered positions are not one contiguous block -- 431 of them form 31
+    /// runs on `Sdpa × arena` (issue #115) -- so the range has to be requested at
+    /// the position where the run starts, or the replayed dispatches move across
+    /// the uncovered ones between them, and §3.5 makes that a silent wrong
+    /// answer rather than an error.
+    ///
+    /// Defaulted in terms of [`Self::dispatch`] so no existing implementor
+    /// changes and the classical path is untouched.
+    fn dispatch_action(&self, record: &DispatchRecord) -> DispatchAction {
+        if self.dispatch(record) {
+            DispatchAction::Encode
+        } else {
+            DispatchAction::Suppress
+        }
+    }
+
     /// Called when a buffer is bound, before the bind reaches Metal.
     ///
     /// A replaying executor needs this because bindings are applied as
@@ -106,6 +129,49 @@ pub trait Executor: Send + Sync {
     /// Called when pipeline state is set, before it reaches Metal.
     fn will_set_pipeline(&self, _pipeline: &ComputePipeline) {}
 }
+
+/// What the encoder should do at a dispatch position.
+///
+/// `Encode` and `Suppress` are the two states [`Executor::dispatch`]'s `bool`
+/// could express. `ExecuteIcb` is the third one replay needs: suppress this
+/// dispatch *and* run a pre-encoded range at this point, because the commands
+/// that replace it and the ones after it must land where the originals were.
+pub enum DispatchAction {
+    /// Encode the dispatch normally. The classical behaviour.
+    Encode,
+    /// Do not encode it, and run nothing in its place.
+    Suppress,
+    /// Do not encode it; execute `length` ICB commands from `location` here.
+    ///
+    /// The resources every command touches must already be resident on this
+    /// encoder: `useResource` is mandatory for an ICB and omitting it is silent
+    /// corruption rather than an error (`DESIGN.md` §3.7). Unified memory can
+    /// hide the omission, which is why the executor hands the residency set over
+    /// rather than leaving it to the caller to remember.
+    ExecuteIcb {
+        icb: std::sync::Arc<IcbRange>,
+        location: usize,
+        length: usize,
+    },
+}
+
+/// An ICB and the resources its commands reference.
+///
+/// Bundled so a residency set cannot be forgotten at one of the call sites that
+/// executes a range -- there are as many of those as there are runs.
+pub struct IcbRange {
+    pub icb: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>,
+    >,
+    pub resident: Vec<Buffer>,
+}
+
+// SAFETY: the Metal objects held here are used under the owning executor's
+// mutex, and residency plus execution happen on the encoding thread. These
+// markers assert only that the handle may be moved between threads, which is
+// sound because every use is serialised by that lock.
+unsafe impl Send for IcbRange {}
+unsafe impl Sync for IcbRange {}
 
 /// The default: forward every dispatch to the command encoder unchanged.
 ///
@@ -160,6 +226,14 @@ impl ExecutorSlot {
         match self {
             ExecutorSlot::Classical => true,
             ExecutorSlot::Custom(e) => e.dispatch(record),
+        }
+    }
+
+    #[inline(always)]
+    pub fn dispatch_action(&self, record: &DispatchRecord) -> DispatchAction {
+        match self {
+            ExecutorSlot::Classical => DispatchAction::Encode,
+            ExecutorSlot::Custom(e) => e.dispatch_action(record),
         }
     }
 

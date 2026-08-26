@@ -24,12 +24,21 @@ pub use kernels::{
 // switch that decides whether a decode dispatch is ICB-encodable at all, and
 // `set_default_param_style` says why the choice lives here and not at the call
 // sites.
-pub use kernels::params::{default_param_style, set_default_param_style};
+pub use kernels::params::{
+    constants_pool, default_param_style, set_constants_pool_enabled, set_default_param_style,
+    ConstantsPool,
+};
 // The arena's GPU-side allocator vocabulary (`DESIGN.md` §9.2d, issue #70).
 // Named rather than arriving through a glob, because `ARENA_DECLINED` is a
 // cross-language constant -- `arena_alloc.metal` writes the same sentinel, and
 // `arena_alloc_reports_alignment` is what checks the two agree.
 pub use metal::{ArenaCursor, ArenaOffsets, ARENA_DECLINED};
+// The `supportIndirectCommandBuffers` switch (issue #115). Named here because
+// getting it wrong is §3.7d's segfault at encode time rather than a wrong
+// answer, so it should be as reachable as the executor that requires it.
+pub use metal::device::{pipelines_support_icb, set_pipelines_support_icb};
+// The ICB executor itself (`DESIGN.md` §17 Phase 2 item 10).
+pub use metal::icb::{Coverage, IcbExecutor};
 // The scratch class's vocabulary (`DESIGN.md` §9.1, issue #71). Named rather
 // than arriving through a glob for the same reason as the line above: `Sizing`
 // is a compile-tier policy whose spellings must agree with the `[[host_name]]`

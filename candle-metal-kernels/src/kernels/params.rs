@@ -1402,15 +1402,152 @@ pub(crate) fn finish_packed_params(
         return Ok(Vec::new());
     }
     let (bytes, mut staged) = encoder.end_param_capture(align);
-    let params = device.new_buffer_with_data(
-        bytes.as_ptr() as *const std::ffi::c_void,
-        bytes.len(),
-        RESOURCE_OPTIONS,
-    )?;
+    let params = match constants_pool() {
+        // A plan-owned constants buffer (`DESIGN.md` §4.4, §15.2 #8), which is
+        // what §11.3d says a real ICB path wants instead of the per-call
+        // allocation below. Off by default, so nothing changes for any caller
+        // that has not asked for it.
+        Some(pool) => pool.next(device, &bytes)?,
+        None => device.new_buffer_with_data(
+            bytes.as_ptr() as *const std::ffi::c_void,
+            bytes.len(),
+            RESOURCE_OPTIONS,
+        )?,
+    };
     // Slot 0, after the capture has closed, so this is not renumbered.
     encoder.set_input_buffer(0, Some(&params), 0);
     staged.push(params);
     Ok(staged)
+}
+
+/// Reusable storage for packed-params blocks, so their buffer identity is stable
+/// across steps.
+///
+/// # Why this has to exist for replay
+///
+/// `finish_packed_params` allocated a fresh buffer per dispatch, which §11.3d
+/// recorded as "deliberate for this change and *not* what a decode path should
+/// do". It is worse than untidy for an ICB: a command binds a buffer *by
+/// identity* at encode time, so a params buffer that is newly allocated every
+/// step makes every packed position vary, and a replaying executor covers
+/// **none** of them. Measured -- with per-call allocation the covered set is
+/// empty, and the executor's own non-vacuity guard is what reported it rather
+/// than a passing comparison between two classical runs.
+///
+/// # Why a ring and not one buffer per call site
+///
+/// The blocks are small (12 to 56 bytes) and there are 546 packed dispatches per
+/// decode token, so what is needed is that dispatch *position* N gets the same
+/// buffer on every step -- not that each call site owns one. Dispatch order is
+/// identical across steps (§11.1a.1, measured: the kernel sequence is
+/// byte-identical over 24 tokens), so a cursor that advances per dispatch and
+/// resets per step assigns the same buffer to the same position by construction.
+/// That is the same reasoning `#70`'s bump allocator rests on, one level up.
+///
+/// A position whose block *contents* change between steps is still correct: the
+/// bytes are rewritten in place before the dispatch that reads them, ordered by
+/// the same barrier that orders any other write-then-read on the buffer.
+pub struct ConstantsPool {
+    inner: std::sync::Mutex<ConstantsPoolInner>,
+}
+
+#[derive(Default)]
+struct ConstantsPoolInner {
+    buffers: Vec<Buffer>,
+    cursor: usize,
+    /// Largest block seen, so every buffer is sized for the worst case and a
+    /// later, larger block cannot outgrow the one already handed to a command.
+    stride: usize,
+}
+
+/// The width every pooled constants buffer is allocated at.
+///
+/// Fixed rather than grown to fit, because growing would reallocate a buffer an
+/// ICB command already holds by identity -- which is the failure this pool
+/// exists to remove. 256 B is comfortably above the largest packed struct in the
+/// tree (`IndexParams`, 56 B; §11.3k) and is a multiple of the 128 B alignment
+/// §9.2 requires of anything the arena touches.
+const CONSTANTS_SLOT_BYTES: usize = 256;
+
+impl ConstantsPool {
+    fn new() -> ConstantsPool {
+        ConstantsPool {
+            inner: std::sync::Mutex::new(ConstantsPoolInner::default()),
+        }
+    }
+
+    /// The buffer for the next dispatch position, with `bytes` written into it.
+    fn next(&self, device: &Device, bytes: &[u8]) -> Result<Buffer, MetalKernelError> {
+        let mut inner = self.inner.lock().unwrap();
+        if bytes.len() > CONSTANTS_SLOT_BYTES {
+            return Err(MetalKernelError::InvalidInput(format!(
+                "packed params block of {} bytes exceeds the {CONSTANTS_SLOT_BYTES} B pooled \
+                 slot; widening the slot means reallocating buffers an ICB command already \
+                 binds by identity, so the constant is raised deliberately rather than grown",
+                bytes.len()
+            )));
+        }
+        inner.stride = inner.stride.max(bytes.len());
+        let index = inner.cursor;
+        inner.cursor += 1;
+        if index == inner.buffers.len() {
+            let buf = device.new_buffer(CONSTANTS_SLOT_BYTES, RESOURCE_OPTIONS)?;
+            inner.buffers.push(buf);
+        }
+        let buf = inner.buffers[index].clone();
+        // SAFETY: shared storage, `CONSTANTS_SLOT_BYTES` long, and `bytes` is no
+        // longer than that -- checked above. The write is ordered against the
+        // dispatch that reads it by the barrier `set_input_buffer` will request,
+        // exactly as any other write-then-read on this buffer would be.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents(), bytes.len());
+        }
+        Ok(buf)
+    }
+
+    /// Start a new step: hand out the same buffers again, from the top.
+    ///
+    /// This is what makes position N's buffer stable. It must be called at the
+    /// step boundary and nowhere else -- resetting mid-step would give two live
+    /// dispatches the same buffer.
+    pub fn reset(&self) {
+        self.inner.lock().unwrap().cursor = 0;
+    }
+
+    /// How many distinct buffers the pool has handed out, i.e. the high-water
+    /// mark of packed dispatches in one step.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().buffers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+static CONSTANTS_POOL: std::sync::OnceLock<ConstantsPool> = std::sync::OnceLock::new();
+static CONSTANTS_POOL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Serve packed-params blocks from a reusable pool rather than allocating one
+/// per dispatch (issue #115).
+///
+/// Off by default: it changes where a packed dispatch's constants live, and
+/// while that is invisible to the kernel it is very visible to anything keyed on
+/// buffer identity. Every caller that has not asked for it keeps §11.3d's
+/// per-call allocation.
+pub fn set_constants_pool_enabled(enabled: bool) {
+    if enabled {
+        CONSTANTS_POOL.get_or_init(ConstantsPool::new);
+    }
+    CONSTANTS_POOL_ON.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The pool, when one is enabled.
+pub fn constants_pool() -> Option<&'static ConstantsPool> {
+    if !CONSTANTS_POOL_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    CONSTANTS_POOL.get()
 }
 
 /// The segment appended to a classical `[[host_name]]` to name its packed
