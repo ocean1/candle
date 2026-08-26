@@ -771,6 +771,117 @@ pub fn expected_indexing_layout() -> Vec<(&'static str, u32)> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// `scaled_dot_product_attention.metal` (issue #103).
+//
+// One family, six `constant &` parameters on the `sdpa_vector` signature. The
+// family became a decode-path one on 2026-08-26: #97 routed LFM2's attention
+// through `sdpa_vector_float16_t_64`, 8 dispatches per token, one per attention
+// layer (`DESIGN.md` §6.2a). Until then §11.3h deferred it on the ground that
+// Phase 4 was about to rewrite the signature -- and Phase 4 dispatched the
+// kernel *unchanged*, so the deferral's premise was discharged without the work
+// being discharged with it.
+//
+// **The width hazard #38 names is live in this family and the classical path
+// already handles it correctly.** `k_stride` and `v_stride` are
+// `constant size_t &` -- 8 bytes -- where `gqa_factor` and `N` are
+// `constant int &` at 4. `call_sdpa_vector` binds them as `usize` and `i32`
+// respectively, which agrees. The failure #38 found (a `usize` bound to a
+// 4-byte `constant uint &`, benign under `setBytes` because it writes 8 bytes
+// and a little-endian 4-byte read takes the low half, and **wrong once
+// packed**) is therefore absent -- checked by enumerating every `constant &`
+// parameter in the file and its binding at the call site, not assumed.
+//
+// **The `()` hazard #41 names is absent, and the reason is different from
+// every other family's.** `sdpa_vector` has optional `mask`,
+// `mask_seq_stride` and `mask_head_stride` arguments, which is exactly the
+// shape that produced #41's GPU hang. They are gated on the
+// `sdpa_vector_has_mask` **function constant** rather than passed as `()`, so
+// when it is false they are not in the signature at all -- the parameters are
+// removed by the compiler rather than left unbound, and nothing consumes a
+// slot that is never filled. `call_sdpa_vector` sets that constant to `false`
+// unconditionally, so no call site passes `()` for them either.
+//
+// The mask arguments are consequently **not** fields of [`SdpaVectorParams`].
+// Adding them would mean a struct whose shape depends on a function constant,
+// which the layout check cannot express and which no caller wants today; a
+// masked packed variant is a change to make when one does.
+// ---------------------------------------------------------------------------
+
+/// Scalars bound by `sdpa_vector` — LFM2's decode attention, 8 dispatches per
+/// token (`DESIGN.md` §6.2a).
+///
+/// **32 bytes, not 28.** `gqa_factor` and `N` are 4-byte `int`, then
+/// `k_stride` is a `size_t` and cannot start until 8; the two trailing `f32`
+/// end at 28 and the struct pads to 32 for its own 8-byte alignment. Neither
+/// number is a field width, which is the argument for shipping them across the
+/// boundary rather than asserting them on each side.
+///
+/// Field order mirrors `call_sdpa_vector`'s classical argument list exactly.
+/// That is load-bearing rather than stylistic: the packed block is built by
+/// letting the existing `set_params!` call run and diverting each scalar as it
+/// passes, so a struct whose order differs from the argument list would
+/// silently misread every field after the first divergence.
+///
+/// `i32`/`u64`, not `u32`/`usize`: the kernel declares `constant int &` and
+/// `constant size_t &`, and `gqa_factor` is compared signed against
+/// `head_idx`. Mirroring the widths or the signedness differently would be a
+/// numeric change smuggled in beside a binding change.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SdpaVectorParams {
+    pub gqa_factor: i32,
+    pub n: i32,
+    pub k_stride: u64,
+    pub v_stride: u64,
+    pub scale: f32,
+    pub softcapping: f32,
+}
+
+/// The kernel in `scaled_dot_product_attention.metal` that reports the
+/// device-side layout.
+pub const SDPA_LAYOUT_KERNEL: &str = "sdpa_params_layout";
+
+/// What each slot of [`SDPA_LAYOUT_KERNEL`]'s output means, and what Rust
+/// computes for it.
+///
+/// As [`expected_reduce_layout`], for the sdpa family. The interesting rows are
+/// `k_stride` at 8 — not 4, because the `size_t` re-aligns after two `int`s —
+/// and a `sizeof` of 32 where the fields sum to 28.
+pub fn expected_sdpa_layout() -> Vec<(&'static str, u32)> {
+    use core::mem::{align_of, offset_of, size_of};
+
+    debug_assert_eq!(align_of::<SdpaVectorParams>(), 8);
+
+    vec![
+        (
+            "sizeof(SdpaVectorParams)",
+            size_of::<SdpaVectorParams>() as u32,
+        ),
+        (
+            "SdpaVectorParams.gqa_factor",
+            offset_of!(SdpaVectorParams, gqa_factor) as u32,
+        ),
+        ("SdpaVectorParams.N", offset_of!(SdpaVectorParams, n) as u32),
+        (
+            "SdpaVectorParams.k_stride",
+            offset_of!(SdpaVectorParams, k_stride) as u32,
+        ),
+        (
+            "SdpaVectorParams.v_stride",
+            offset_of!(SdpaVectorParams, v_stride) as u32,
+        ),
+        (
+            "SdpaVectorParams.scale",
+            offset_of!(SdpaVectorParams, scale) as u32,
+        ),
+        (
+            "SdpaVectorParams.softcapping",
+            offset_of!(SdpaVectorParams, softcapping) as u32,
+        ),
+    ]
+}
+
 /// The kernel in `reduce.metal` that reports the device-side layout.
 pub const REDUCE_LAYOUT_KERNEL: &str = "reduce_params_layout";
 
@@ -1433,6 +1544,9 @@ pub enum LayoutFamily {
     /// `indexing.metal` — issue #81. The last decode-path family, and the one
     /// where the `bool` hazard §11.3b names finally fires.
     Indexing,
+    /// `scaled_dot_product_attention.metal` — issue #103. The family §11.3h
+    /// deferred and #97 made decode-path, 8 dispatches per token.
+    Sdpa,
 }
 
 /// Everything the layout check needs to know about one family.
@@ -1482,6 +1596,7 @@ impl LayoutFamily {
         LayoutFamily::Gemv,
         LayoutFamily::Conv,
         LayoutFamily::Indexing,
+        LayoutFamily::Sdpa,
     ];
 
     /// The name of the `.metal` file this family lives in, for error messages.
@@ -1495,6 +1610,7 @@ impl LayoutFamily {
             LayoutFamily::Gemv => "gemv.metal",
             LayoutFamily::Conv => "conv.metal",
             LayoutFamily::Indexing => "indexing.metal",
+            LayoutFamily::Sdpa => "scaled_dot_product_attention.metal",
         }
     }
 
@@ -1545,6 +1661,11 @@ impl LayoutFamily {
                 crate::Source::Indexing,
                 INDEXING_LAYOUT_KERNEL,
                 expected_indexing_layout(),
+            ),
+            LayoutFamily::Sdpa => (
+                crate::Source::Sdpa,
+                SDPA_LAYOUT_KERNEL,
+                expected_sdpa_layout(),
             ),
         };
         LayoutDescriptor {

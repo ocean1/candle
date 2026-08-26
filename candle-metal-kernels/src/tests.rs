@@ -3000,8 +3000,8 @@ fn every_parity_arm_routes_through_the_helper() {
     // failure too -- the same argument `packed_names_resolve` makes for
     // checking 90 rather than "some".
     assert_eq!(
-        arms, 36,
-        "expected 36 parity arms, found {arms}; if a family was added or \
+        arms, 37,
+        "expected 37 parity arms, found {arms}; if a family was added or \
          removed, update this count deliberately rather than relaxing it"
     );
 }
@@ -5092,6 +5092,7 @@ fn every_family_params_layout_matches_metal() {
         ("gemv.metal", 8),
         ("conv.metal", 65),
         ("indexing.metal", 27),
+        ("scaled_dot_product_attention.metal", 7),
     ];
 
     let mut failures = Vec::new();
@@ -5136,8 +5137,8 @@ fn every_family_params_layout_matches_metal() {
     assert_eq!(
         observed,
         EXPECTED_SLOTS.to_vec(),
-        "family or slot count changed. Eight families and their slot counts are \
-         the state at issue #81; update this only alongside a deliberate addition."
+        "family or slot count changed. Nine families and their slot counts are \
+         the state at issue #103; update this only alongside a deliberate addition."
     );
 }
 
@@ -5168,6 +5169,7 @@ fn layout_registry_covers_every_family() {
             LayoutFamily::Gemv => "gemv",
             LayoutFamily::Conv => "conv",
             LayoutFamily::Indexing => "indexing",
+            LayoutFamily::Sdpa => "sdpa",
         }
     }
 
@@ -5180,6 +5182,7 @@ fn layout_registry_covers_every_family() {
         LayoutFamily::Gemv,
         LayoutFamily::Conv,
         LayoutFamily::Indexing,
+        LayoutFamily::Sdpa,
     ];
 
     for family in expected {
@@ -5872,5 +5875,413 @@ fn indexing_moving_the_bool_is_rejected_at_compile_time() {
          wrapper's brace initializer -- the earliest of the three guards. If \
          this stops firing, check whether the wrapper still builds the struct \
          positionally; got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `scaled_dot_product_attention.metal` (issue #103).
+//
+// The family §11.3h deferred and #97 made decode-path. Three arms, and they
+// check different things:
+//
+// * `sdpa_packed_names_resolve` -- every declared classical name has a
+//   `_packed` counterpart in the compiled library. An absent instantiation is
+//   not a compile error on either side, and the first symptom would be a
+//   `LoadFunctionError` inside a forward pass (`DESIGN.md` §8.1b).
+// * `sdpa_packed_matches_split_for_sdpa_vector` -- the two styles compute the
+//   same bits, through the enforced helper, at LFM2's own geometry.
+// * `sdpa_params_layout_check_detects_a_moved_field` -- the layout check can
+//   fail, and fails on the silent case.
+// ---------------------------------------------------------------------------
+
+/// Every `sdpa_vector` name this crate can dispatch has a `_packed`
+/// counterpart in the compiled library.
+///
+/// The same argument as `packed_names_resolve` and its siblings: an absent
+/// instantiation is not a compile error on either side, and #26 shipped
+/// precisely that for 48 variants, caught only by loading against the library.
+///
+/// # This family has no registry, and the check is weaker for it
+///
+/// Every other converted family declares its names in a registry — `ReduceKernel`,
+/// `ConvKernel`, `IndexingKernel`, the elementwise axes — so its resolve test
+/// iterates a declared list and a count assertion catches a name that stops
+/// being covered. `sdpa.rs` has a hand-written `match (head_dim, dtype)`
+/// instead, which `DESIGN.md` §11.3h names as "the same registry gap `indexing`
+/// has" and which is still open.
+///
+/// So this test enumerates the axes the way `sdpa.rs`'s match does, and asserts
+/// **both spellings** rather than only the packed one — because the gap this
+/// family actually has runs the other way. See
+/// `sdpa_vector_declares_variants_the_name_table_cannot_reach`.
+///
+/// # It must resolve *with constants*, and that is new
+///
+/// Every prior family's resolve test calls `load_pipeline`, which builds a
+/// pipeline from a plain `newFunctionWithName:`. That **aborts** here rather
+/// than returning an error:
+///
+/// ```text
+/// validateWithDevice:1530: failed assertion `Compute Pipeline Descriptor Validation
+/// function sdpa_vector_float16_t_32 cannot be used to build a pipeline state.
+/// Use newFunctionWithName:constantValues:... to get the specialized function'
+/// ```
+///
+/// `sdpa_vector` is the first converted family whose kernels take a **function
+/// constant** (`sdpa_vector_has_mask`, index 20), and an unspecialized function
+/// is not a pipeline-able object. So the check has to supply the same constant
+/// the call site does — which makes it a slightly stronger check than the
+/// others, since it proves the name resolves *in the configuration that is
+/// dispatched* rather than merely existing.
+///
+/// Worth carrying: `SIGABRT` rather than a `Result` is what a missing
+/// `constantValues` gives, so it cannot be caught and reported. That is the
+/// same shape as §3.7d's `supportIndirectCommandBuffers` traps — the failure
+/// kills the process rather than failing a test.
+#[test]
+fn sdpa_packed_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // The (dtype token, head_dim) pairs `call_sdpa_vector`'s match arm covers.
+    // Written out rather than derived, because there is nothing to derive from:
+    // the match is the only declaration of this set that exists.
+    const DTYPES: &[&str] = &["float16_t", "bfloat16_t", "float"];
+    const HEAD_DIMS: &[usize] = &[32, 64, 96, 128, 256, 512];
+
+    // The configuration `call_sdpa_vector` dispatches, and the only one in
+    // which these functions are pipeline-able at all.
+    let constants = || {
+        Some(ConstantValues::new(vec![(
+            20,
+            Value::Bool(/* sdpa_vector_has_mask */ false),
+        )]))
+    };
+
+    let mut checked = 0usize;
+    for dtype in DTYPES {
+        for head_dim in HEAD_DIMS {
+            let classical = format!("sdpa_vector_{dtype}_{head_dim}");
+            let packed = crate::kernels::params::packed_name(&classical);
+            // The classical name first: if it does not resolve, a failure on
+            // the packed one would be misattributed to this change.
+            kernels
+                .load_pipeline_with_constants(
+                    &device,
+                    Source::Sdpa,
+                    classical.clone(),
+                    constants(),
+                )
+                .unwrap_or_else(|e| {
+                    panic!("scaled_dot_product_attention.metal has no kernel named {classical:?}: {e:?}")
+                });
+            kernels
+                .load_pipeline_with_constants(&device, Source::Sdpa, packed.clone(), constants())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "scaled_dot_product_attention.metal has no kernel named \
+                         {packed:?} (the packed form of {classical:?}): {e:?}"
+                    )
+                });
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked,
+        DTYPES.len() * HEAD_DIMS.len(),
+        "expected a packed counterpart for all 18 dispatchable sdpa_vector \
+         variants, found {checked}"
+    );
+}
+
+/// `sdpa_vector` instantiates two head dimensions that `sdpa.rs` cannot ask
+/// for, and this pins that rather than silently inheriting it.
+///
+/// `instantiate_sdpa_vector_heads` names **eight** head dimensions — 32, 64,
+/// 72, 80, 96, 128, 256, 512 — while `call_sdpa_vector`'s `match (bk, itype)`
+/// covers **six**. `sdpa_vector_float16_t_72` and `_80` are in the metallib and
+/// unreachable from Rust; asking for head_dim 72 or 80 returns
+/// `SdpaHeadSizeMismatch` naming an expected set that does not include them,
+/// even though the kernel exists.
+///
+/// # Why this is worth a test rather than a fix here
+///
+/// It is the **inverse** of `DESIGN.md` §8.1b's absent-variant class, which has
+/// now fired four times: there, a name was *asked for* and not declared, and the
+/// symptom was a `LoadFunctionError` in a forward pass. Here a name is
+/// *declared* and not askable, and the symptom is a capability that silently
+/// does not exist — six dead instantiations in the metallib, paid for at every
+/// cold compile.
+///
+/// `call_sdpa_full`'s own list is a third spelling of the same axis and covers
+/// **eight** including 72 and 80, so the two entry points in one file disagree
+/// about which head dimensions this file supports. That is precisely the
+/// hand-sync a registry removes, and this family is the one §11.3h records as
+/// still lacking one.
+///
+/// Not fixed here: widening the match is a behaviour change to a public entry
+/// point (two shapes that error today would start computing), and it wants its
+/// own bisect point beside a binding-style change — the same reason #64 split
+/// #82 out and #81 left `left_size` alone. Pinned in #64's shape instead:
+/// asserting the **current** state, so it turns red when corrected rather than
+/// sitting as a TODO.
+#[test]
+fn sdpa_vector_declares_variants_the_name_table_cannot_reach() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // With constants, for the reason `sdpa_packed_names_resolve` records: an
+    // unspecialized function carrying a function constant aborts rather than
+    // erroring when a pipeline is built from it.
+    let constants = || {
+        Some(ConstantValues::new(vec![(
+            20,
+            Value::Bool(/* sdpa_vector_has_mask */ false),
+        )]))
+    };
+
+    for head_dim in [72usize, 80] {
+        let name = format!("sdpa_vector_float16_t_{head_dim}");
+        kernels
+            .load_pipeline_with_constants(&device, Source::Sdpa, name.clone(), constants())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{name:?} is expected to be instantiated in \
+                     scaled_dot_product_attention.metal but absent from \
+                     sdpa.rs's name table. If it no longer compiles, the \
+                     instantiation list changed and this test should be \
+                     revisited rather than deleted: {e:?}"
+                )
+            });
+        // And its packed sibling, since the instantiation macro emits both.
+        let packed = crate::kernels::params::packed_name(&name);
+        kernels
+            .load_pipeline_with_constants(&device, Source::Sdpa, packed.clone(), constants())
+            .unwrap_or_else(|e| panic!("{packed:?} must exist alongside {name:?}: {e:?}"));
+    }
+
+    // The other half of the claim: Rust cannot ask for them. Asserted against
+    // the error rather than by reading the match, so a fix that widens the
+    // table turns this red.
+    let err = call_sdpa_vector(
+        &device,
+        &commands(&device).command_encoder().unwrap(),
+        &kernels,
+        0,
+        &[1, 1, 1, 72],
+        &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
+        0,
+        &[1, 1, 1, 72],
+        &[72, 72, 72, 1],
+        &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
+        0,
+        &[72, 72, 72, 1],
+        &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
+        &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
+        1.0,
+        1.0,
+        SdpaDType::F16,
+    )
+    .expect_err(
+        "head_dim 72 is instantiated in the metallib; if call_sdpa_vector now \
+         accepts it, the name table was widened and this test has done its job \
+         -- update it rather than relaxing it",
+    );
+    assert!(
+        matches!(err, MetalKernelError::SdpaHeadSizeMismatch { got: 72, .. }),
+        "expected the head-size mismatch that records the gap, got {err:?}"
+    );
+}
+
+/// `sdpa_vector_float16_t_64` — LFM2's decode attention, 8 dispatches per token
+/// and the whole reason this family is on the ICB path (`DESIGN.md` §6.2a).
+///
+/// Bit-identical rather than approximately equal, for the reason every other
+/// family's arms give: the two entry points come from one body, so any
+/// difference means the binding style changed what the kernel computed.
+///
+/// **LFM2's own geometry**: 32 query heads over 8 KV heads (GQA 4:1) at
+/// head_dim 64 (`DESIGN.md` §5.2). `gqa_factor` is therefore 4 rather than 1,
+/// which matters — #97 found that all five pre-existing arms in
+/// `candle-nn/tests/sdpa.rs` set q heads == kv heads, so a kernel ignoring
+/// `gqa_factor` entirely left every one of them green (§6.2a correction 3).
+/// An arm at `gqa_factor == 1` would be the same blind spot in a new place.
+#[test]
+fn sdpa_packed_matches_split_for_sdpa_vector() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // LFM2: 32 q heads, 8 kv heads, head_dim 64. A short kv_len keeps the test
+    // fast; the kernel loops `for (i = simd_gid; i < N; i += BN)` with BN = 32,
+    // so 40 keys exercises both the first pass and the wrap.
+    let (n_q_heads, n_kv_heads, head_dim, kv_len) = (32usize, 8usize, 64usize, 40usize);
+
+    let q: Vec<f16> = (0..n_q_heads * head_dim)
+        .map(|i| f16::from_f32(((i * 37 % 71) as f32 - 35.0) / 64.0))
+        .collect();
+    // **K and V are given different per-head strides**, and that is deliberate
+    // rather than incidental. `k_stride` and `v_stride` are two adjacent
+    // `size_t` fields of `SdpaVectorParams`, so a layout error that transposes
+    // them is exactly the silent case
+    // `sdpa_params_layout_check_detects_a_moved_field` mutates for — and an arm
+    // where the two strides are *equal* cannot see it, however faithfully it
+    // compares. That is #81's finding 3 in a new form: it warns that a
+    // mutation must swap fields that are both *read*, and this is the sharper
+    // version — both read **and carrying different values**. Checked by
+    // applying that mutation to production source: with equal strides the
+    // parity arm passes under it.
+    //
+    // V therefore gets 8 elements of padding per head. The kernel takes
+    // `k_stride` and `v_stride` separately, so this is a configuration it
+    // supports rather than an abuse of it.
+    const V_HEAD_PAD: usize = 8;
+    let k: Vec<f16> = (0..n_kv_heads * kv_len * head_dim)
+        .map(|i| f16::from_f32(((i * 53 % 97) as f32 - 48.0) / 96.0))
+        .collect();
+    let v_head_stride = kv_len * head_dim + V_HEAD_PAD;
+    let v: Vec<f16> = (0..n_kv_heads * v_head_stride)
+        .map(|i| f16::from_f32(((i * 29 % 83) as f32 - 41.0) / 48.0))
+        .collect();
+
+    let q_shape = [1usize, n_q_heads, 1, head_dim];
+    let kv_shape = [1usize, n_kv_heads, kv_len, head_dim];
+    // `call_sdpa_vector` reads index 1 of each — the per-head stride, which is
+    // what the kernel adds `kv_head_idx *` to.
+    let k_strides = [
+        n_kv_heads * kv_len * head_dim,
+        kv_len * head_dim,
+        head_dim,
+        1,
+    ];
+    let v_strides = [n_kv_heads * v_head_stride, v_head_stride, head_dim, 1];
+    assert_ne!(
+        k_strides[1], v_strides[1],
+        "the strides must differ, or transposing them in the packed struct is \
+         invisible and this arm cannot see the mutation it exists to catch"
+    );
+    let out_el = n_q_heads * head_dim;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let q_buf = new_buffer(&device, &q);
+        let k_buf = new_buffer(&device, &k);
+        let v_buf = new_buffer(&device, &v);
+        let output = device
+            .new_buffer(out_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_sdpa_vector_with(
+            &device,
+            &encoder,
+            &kernels,
+            0,
+            &q_shape,
+            &q_buf,
+            0,
+            &kv_shape,
+            &k_strides,
+            &k_buf,
+            0,
+            &v_strides,
+            &v_buf,
+            &output,
+            scale,
+            1.0,
+            SdpaDType::F16,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, out_el));
+    }
+    assert_packed_matches_split("sdpa_vector_float16_t_64", &outs[0], &outs[1]);
+}
+
+/// The layout check must be able to fail, and must fail on *the silent case*.
+///
+/// `DESIGN.md` §15.1 #1 and `CONTRIBUTING.md` §3.1 #2: a test that cannot fail
+/// is not a test. The mutation **swaps two adjacent same-typed fields** —
+/// `SdpaVectorParams.k_stride` and `.v_stride`, both `size_t`. That case is
+/// chosen over inserting or removing a field because it is the one nothing else
+/// catches:
+///
+/// * `sizeof` is unchanged at 32, so the `static_assert` in
+///   `scaled_dot_product_attention.metal` still passes;
+/// * both fields are `size_t`, so the classical wrapper's brace initializer
+///   still type-checks — C++11 narrowing rejects a *differently typed*
+///   insertion or reorder before it reaches a GPU, which is a real layer of
+///   defence but not this one;
+/// * the kernel runs and reads keys at the values' stride, producing a
+///   plausible wrong answer rather than a crash.
+///
+/// **Both swapped fields are read**, which is the condition #81's finding 3
+/// makes explicit: `left_size` in `indexing.metal` is bound by all five kernels
+/// and read by none, so a mutation swapping it proves nothing. `k_stride` and
+/// `v_stride` are each dereferenced in `sdpa_vector_body`'s pointer adjustment.
+///
+/// It is mutated on **production source** — `crate::source::SDPA` is the same
+/// `include_str!` the library is compiled from — rather than on a copy.
+///
+/// # What each guard actually catches, measured rather than assumed
+///
+/// Four mutations were applied to production source and each test re-run. Two
+/// of them **survive the parity arm**, and saying which is more useful than the
+/// two that do not:
+///
+/// | mutation | layout check | parity arm | #53 guard |
+/// |---|---|---|---|
+/// | 1. swap `k_stride`/`v_stride` in the **struct declaration** | **kills** | survives | — |
+/// | 2. transpose them in the **Rust argument list** | survives | survives | — |
+/// | 3. transpose them in the **packed wrapper only** | survives | **kills** | — |
+/// | 4. `return;` at the top of the shared body | survives | — | **kills** |
+///
+/// **Mutations 1 and 2 are invisible to the parity arm by construction, and
+/// that is the mechanism working rather than failing.** Both live in something
+/// the two styles *share* — the struct's layout, and the single `set_params!`
+/// argument list — so they move both arms identically and the comparison is
+/// between two equally-wrong answers. That is the flip side of the property
+/// `DESIGN.md` §11.3d claims for this whole conversion: because only one
+/// argument list exists, the styles cannot disagree about what is bound *or*
+/// about being wrong together.
+///
+/// So the three guards are genuinely non-overlapping and none subsumes another:
+/// the **layout check** covers what the two sides share about the struct, the
+/// **parity arm** covers what one style does and the other does not, and
+/// **#53's non-vacuity guard** covers a kernel that does nothing at all. A
+/// suite carrying only the parity arm would pass under mutations 1, 2 and 4.
+///
+/// Mutation 3 is also what forced the parity arm's K and V to carry
+/// **different** per-head strides. With the contiguous layout it started with,
+/// `k_stride == v_stride` and transposing them is a no-op — the arm passed
+/// under mutation 3 until the input was fixed. #81's finding 3 says a mutation
+/// must swap two fields that are both *read*; this is the sharper statement:
+/// both read **and holding different values**, or the test proves nothing.
+#[test]
+fn sdpa_params_layout_check_detects_a_moved_field() {
+    use crate::kernels::params::LayoutFamily;
+
+    let descriptor = LayoutFamily::Sdpa.descriptor();
+    let pipeline = mutated_layout_pipeline(
+        crate::source::SDPA,
+        "  size_t k_stride;\n  size_t v_stride;",
+        "  size_t v_stride;\n  size_t k_stride;",
+        descriptor.kernel,
+    );
+    let d = layout_disagreements(&pipeline, &descriptor.expected);
+
+    assert!(
+        d.iter().any(|x| x.starts_with("SdpaVectorParams.k_stride")),
+        "swapping k_stride must be reported; got {d:?}"
+    );
+    assert!(
+        d.iter().any(|x| x.starts_with("SdpaVectorParams.v_stride")),
+        "swapping v_stride must be reported; got {d:?}"
+    );
+    assert!(
+        !d.iter().any(|x| x.starts_with("sizeof(SdpaVectorParams)")),
+        "the swap must not change sizeof, or it is not the silent case; got {d:?}"
     );
 }

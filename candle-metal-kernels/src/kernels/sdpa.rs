@@ -1,9 +1,22 @@
+use crate::kernels::params::{
+    begin_packed_params, finish_packed_params, ParamStyle, SdpaVectorParams,
+};
 use crate::utils::EncoderProvider;
 use crate::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, ConstantValues, Device, EncoderParam,
     Kernels, MetalKernelError, Output, Source, Value,
 };
 use objc2_metal::MTLSize;
+
+/// Trailing alignment of the packed block, so its length matches the `sizeof`
+/// the kernel sees. Taken from the Rust mirror rather than written as a
+/// literal, and `every_family_params_layout_matches_metal` is what proves that
+/// mirror agrees with `scaled_dot_product_attention.metal`.
+///
+/// This one does work rather than being a formality: the fields sum to 28 and
+/// the struct is 32, because two 4-byte `int`s precede a `size_t`. Without the
+/// trailing pad the capture would hand the kernel 28 bytes for a 32-byte read.
+const SDPA_VECTOR_PARAMS_ALIGN: usize = core::mem::align_of::<SdpaVectorParams>();
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SdpaDType {
@@ -18,6 +31,27 @@ pub enum SdpaDType {
 /// - q heads == kv heads
 /// - final type != bf16 (TODO maybe just template this kernel too?)
 /// - q,k,v are contiguous
+///
+/// # No packed sibling, and it needs none — issue #103
+///
+/// This is the prefill path, which #97 deliberately left on the generic route
+/// (`DESIGN.md` §6.2a), so it is on no decode dispatch position. That alone
+/// would make a packed sibling optional rather than required. The stronger
+/// reason is that **it has nothing to promote**: the `attention` kernel takes
+/// `const constant AttnParams* params [[buffer(4)]]` and, when masked,
+/// `const constant AttnMaskParams* mask_params [[buffer(5)]]`. Those are
+/// *pointers*, not `constant &` scalars, so the file's 32 `constant &`
+/// parameters are all on the `sdpa_vector` signatures.
+///
+/// A pointer parameter is bindable by `setKernelBuffer`, which is the only
+/// binding primitive an `MTLIndirectComputeCommand` has (`DESIGN.md` §3.7c) —
+/// the constraint is `setBytes`, not buffer count (§11.3d). So what stands
+/// between this entry point and an ICB is the *host* side: candle reaches
+/// `setBytes` here through `impl EncoderParam for AttnParams`, which writes the
+/// struct inline. Converting it is therefore a change to how the existing
+/// struct is uploaded rather than a second kernel from one body, which is a
+/// different shape of work from every conversion #38 through #103 — and it buys
+/// nothing until prefill is on a replayed position. Recorded rather than done.
 #[allow(clippy::too_many_arguments)]
 pub fn call_sdpa_full(
     device: &Device,
@@ -277,11 +311,89 @@ pub fn call_sdpa_vector(
     softcapping: f32,
     itype: SdpaDType,
 ) -> Result<(), MetalKernelError> {
+    call_sdpa_vector_with(
+        device,
+        ep,
+        kernels,
+        q_offset,
+        q_shape,
+        q_buffer,
+        k_offset,
+        k_shape,
+        k_stride,
+        k_buffer,
+        v_offset,
+        v_stride,
+        v_buffer,
+        output,
+        alpha,
+        softcapping,
+        itype,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_sdpa_vector`], choosing how the scalars are bound.
+///
+/// The classical entry point above delegates here with [`ParamStyle::Split`],
+/// so there is one body rather than two and the styles cannot drift in what
+/// they bind — which is the property that makes the bit-identical test
+/// meaningful.
+///
+/// # Why this family needed converting, and why it did not before
+///
+/// `MTLIndirectComputeCommand` has no `setBytes` in any form (`DESIGN.md`
+/// §3.7c), so every kernel on a replayed dispatch position must bind its
+/// constants from a buffer. §11.3h deferred this family on the ground that
+/// LFM2 dispatched none of it and that Phase 4 was about to rewrite the
+/// signature. #97 (§6.2a) discharged the first half — LFM2 now dispatches
+/// `sdpa_vector_float16_t_64` 8 times per decode token — and discharged the
+/// second half in the opposite direction: it needed **no `.metal` change at
+/// all**, because `call_sdpa_vector` already computed `gqa_factor` and the
+/// kernel already accumulated in F32. So the signature was never moving; it
+/// was already right and merely unused.
+///
+/// # Scope
+///
+/// Every `sdpa_vector` variant carries both styles, not only the one LFM2
+/// dispatches. `call_sdpa_vector_2pass` is **not** converted: it is
+/// FlashDecoding's entry point (`DESIGN.md` §10.4), which is Phase 5 item 16
+/// and does not exist yet, so it is on no dispatch position at all.
+/// `call_sdpa_full` is not converted either, and for a different reason — it
+/// already takes its parameters as a `constant AttnParams*`, which is a
+/// pointer rather than a `setBytes` scalar, so it has no `constant &` to
+/// promote. See the note on that function.
+#[allow(clippy::too_many_arguments)]
+pub fn call_sdpa_vector_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    q_offset: usize,
+    q_shape: &[usize],
+    q_buffer: &Buffer,
+    k_offset: usize,
+    k_shape: &[usize],
+    k_stride: &[usize],
+    k_buffer: &Buffer,
+    v_offset: usize,
+    v_stride: &[usize],
+    v_buffer: &Buffer,
+    output: &Buffer,
+    alpha: f32,
+    softcapping: f32,
+    itype: SdpaDType,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
     let bk = q_shape.last().unwrap();
 
     let gqa_factor = (q_shape[1] / k_shape[1]) as i32;
     let n = k_shape[2] as i32;
     let b = (q_shape[0] * q_shape[1]) as i32;
+    // `usize`, bound against a `constant size_t &` -- 8 bytes on both sides.
+    // The width mismatch #38 found (`usize` against a 4-byte `constant uint &`,
+    // benign under `setBytes` and wrong once packed) does not occur in this
+    // family; `gqa_factor` and `n` are `i32` against `constant int &`, which
+    // also agrees. Checked by enumerating the file's `constant &` parameters.
     let kstride = k_stride[1];
     let vstride = v_stride[1];
 
@@ -319,12 +431,23 @@ pub fn call_sdpa_vector(
         alpha
     };
 
+    // `false` on both styles, and that is what makes the packed variants
+    // reachable at all: the mask arguments are gated on this function constant,
+    // so when it is false they are removed from the signature rather than left
+    // unbound. That is why #41's `()` hazard -- an argument that binds nothing
+    // and consumes no slot, shifting every later binding one low and hanging
+    // the GPU -- cannot arise here.
     let constants = Some(ConstantValues::new(vec![(
         20,
         Value::Bool(/* sdpa_vector_has_mask */ false),
     )]));
 
-    let pipeline = kernels.load_pipeline_with_constants(device, Source::Sdpa, name, constants)?;
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::Sdpa,
+        style.kernel_name(name),
+        constants,
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -333,6 +456,11 @@ pub fn call_sdpa_vector(
     // q = (bs, qhead, seq, hidden)
     // k/v = (bs, kv_head, kv_seq, hidden)
 
+    // The scalars come last in the classical argument list while the packed
+    // struct is bound at slot 0, so the capture renumbers the four buffers to
+    // 1..4 -- which is what `sdpa_vector_packed`'s explicit `[[buffer(N)]]`
+    // attributes declare. The classical entry point keeps 0..3.
+    let _capture = begin_packed_params(encoder, style);
     set_params!(
         encoder,
         (
@@ -348,6 +476,7 @@ pub fn call_sdpa_vector(
             softcapping
         )
     );
+    let _staged = finish_packed_params(device, encoder, style, SDPA_VECTOR_PARAMS_ALIGN)?;
 
     let grid_dims = MTLSize {
         width: 1,

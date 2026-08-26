@@ -305,24 +305,79 @@ struct MLXScaledDotProductAttentionParams {
 
 constant bool sdpa_vector_has_mask [[function_constant(20)]];
 
+// Packed parameter struct, mirrored in `kernels/params.rs` and checked against
+// it by `sdpa_params_layout`.
+//
+// `MTLIndirectComputeCommand` has no `setBytes` in any form (`DESIGN.md`
+// §3.7c), so a kernel taking its scalars as `constant int &` cannot be encoded
+// into an ICB at all. #97 put `sdpa_vector` on 8 decode dispatch positions per
+// token (`DESIGN.md` §6.2a), which made this the one decode-path family
+// without a packed sibling and therefore the ICB path's remaining constants
+// gate (§11.3h).
+//
+// **The width matters here, and it is the trap #38 found.** `k_stride` and
+// `v_stride` are `size_t` — 8 bytes — where `gqa_factor` and `N` are `int`.
+// `call_sdpa_vector` binds them as `usize` and `i32` respectively, so the
+// classical path is already correct; a `usize` bound to a `constant int &`
+// would be benign under `setBytes` (which writes 8 bytes and lets a
+// little-endian 4-byte read take the low half) and **wrong once packed**.
+// Checked by enumerating every `constant &` parameter in this file rather than
+// assumed.
+//
+// The mixed widths are why this struct pads: `{i32, i32, u64, u64, f32, f32}`
+// is 32 bytes where its fields sum to 28, with four bytes of tail padding to
+// the struct's own 8-byte alignment. That number is not obvious by inspection,
+// which is the argument for shipping it across the boundary rather than
+// asserting it on each side.
+//
+// The **mask** arguments are deliberately not fields. They are gated on the
+// `sdpa_vector_has_mask` function constant, so when it is false they do not
+// exist in the signature at all and consume no slot — which is why the `()`
+// hazard #41 found (an unbound argument that binds nothing and consumes no
+// slot, shifting every later binding one low and hanging the GPU) does not
+// arise: nothing passes `()` here, and the function constant removes the
+// parameters rather than leaving them unbound. `call_sdpa_vector` sets the
+// constant to `false` unconditionally, so the packed instantiations below are
+// reachable only in that configuration; a masked packed variant would need
+// `mask_seq_stride` and `mask_head_stride` in the struct and the mask itself
+// left as a buffer binding, which is a change to make when a caller wants it.
+struct SdpaVectorParams {
+  int gqa_factor;
+  int N;
+  size_t k_stride;
+  size_t v_stride;
+  float scale;
+  float softcapping;
+};
+
+// §11.3d's factoring rather than §11.3f's: `sdpa_vector` declares threadgroup
+// memory, and MSL permits a `threadgroup` variable only inside a
+// `[[kernel]]`-qualified function, so the whole-body-plus-two-thin-wrappers
+// shape does not compile. The arrays are declared in each entry point and
+// passed to the shared body as `threadgroup` pointers, which is the same seam
+// `reduce.metal` uses (`reduce()` takes its shared memory as a parameter).
+//
+// The struct is taken by `thread const &` and its fields copied into locals at
+// entry, per `DESIGN.md` §11.3e: one structure load into registers rather than
+// a dereference per use. That matters here — `N` bounds the key loop and
+// `softcapping` is tested inside it — because `constant` is a cached read-only
+// space and `device` is not.
 template <typename T, int D>
-[[kernel]] void sdpa_vector(
-    const device T* queries [[buffer(0)]],
-    const device T* keys [[buffer(1)]],
-    const device T* values [[buffer(2)]],
-    device T* out [[buffer(3)]],
-    const constant int& gqa_factor,
-    const constant int& N,
-    const constant size_t& k_stride,
-    const constant size_t& v_stride,
-    const constant float& scale,
-    const constant float& softcapping,
-    const device bool* mask [[function_constant(sdpa_vector_has_mask)]],
-    const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],
-    const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+METAL_FUNC void sdpa_vector_body(
+    thread const SdpaVectorParams& p,
+    const device T* queries,
+    const device T* keys,
+    const device T* values,
+    device T* out,
+    const device bool* mask,
+    int mask_seq_stride,
+    int mask_head_stride,
+    threadgroup float* outputs,
+    threadgroup float* max_scores,
+    threadgroup float* sum_exp_scores,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
   constexpr int BN = 32;
   constexpr int BD = 32;
   constexpr int elem_per_thread = D / BD;
@@ -330,13 +385,16 @@ template <typename T, int D>
 
   typedef float U;
 
+  const int gqa_factor = p.gqa_factor;
+  const int N = p.N;
+  const size_t k_stride = p.k_stride;
+  const size_t v_stride = p.v_stride;
+  const float scale = p.scale;
+  const float softcapping = p.softcapping;
+
   thread U q[elem_per_thread];
   thread U k[elem_per_thread];
   thread U o[elem_per_thread];
-
-  threadgroup U outputs[BN * BD];
-  threadgroup U max_scores[BN];
-  threadgroup U sum_exp_scores[BN];
 
   // Adjust positions
   const int head_idx = tid.y;
@@ -428,6 +486,92 @@ template <typename T, int D>
       out[i] = static_cast<T>(o[i]);
     }
   }
+}
+
+template <typename T, int D>
+[[kernel]] void sdpa_vector(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    const constant int& gqa_factor,
+    const constant int& N,
+    const constant size_t& k_stride,
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& softcapping,
+    const device bool* mask [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+
+  threadgroup float outputs[BN * BD];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+
+  // Brace-initialized positionally, in the classical argument order. C++11
+  // narrowing on this initializer is a third guard beside the `static_assert`
+  // and the cross-boundary layout check: inserting a field of a different type,
+  // or reordering two fields whose types differ, fails to compile here before
+  // either of the other two runs (`DESIGN.md` §11.3k finding 2).
+  SdpaVectorParams p{gqa_factor, N, k_stride, v_stride, scale, softcapping};
+  sdpa_vector_body<T, D>(
+      p,
+      queries,
+      keys,
+      values,
+      out,
+      sdpa_vector_has_mask ? mask : nullptr,
+      sdpa_vector_has_mask ? mask_seq_stride : 0,
+      sdpa_vector_has_mask ? mask_head_stride : 0,
+      outputs,
+      max_scores,
+      sum_exp_scores,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, int D>
+[[kernel]] void sdpa_vector_packed(
+    const device SdpaVectorParams* pp [[buffer(0)]],
+    const device T* queries [[buffer(1)]],
+    const device T* keys [[buffer(2)]],
+    const device T* values [[buffer(3)]],
+    device T* out [[buffer(4)]],
+    const device bool* mask [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+
+  threadgroup float outputs[BN * BD];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+
+  SdpaVectorParams p = *pp;
+  sdpa_vector_body<T, D>(
+      p,
+      queries,
+      keys,
+      values,
+      out,
+      sdpa_vector_has_mask ? mask : nullptr,
+      sdpa_vector_has_mask ? mask_seq_stride : 0,
+      sdpa_vector_has_mask ? mask_head_stride : 0,
+      outputs,
+      max_scores,
+      sum_exp_scores,
+      tid,
+      simd_gid,
+      simd_lid);
 }
 
 template <typename T, int D>
@@ -2336,7 +2480,55 @@ instantiate_attn(float16,  half,        8, 8, 512, 1, 1, bool_,    bool)
 instantiate_attn(bfloat16, bfloat16_t,  8, 8, 512, 1, 1, bfloat16, bfloat16_t)
 instantiate_attn(bfloat16, bfloat16_t,  8, 8, 512, 1, 1, bool_,    bool)
 
+// ---------------------------------------------------------------------------
+// The layout check (issue #103).
+//
+// A field at the wrong offset does not crash. The kernel reads a well-formed
+// number from the wrong place and computes a plausible wrong answer, which
+// under `HazardTrackingModeUntracked` is the failure mode `DESIGN.md` §3.5 and
+// §15.1 both single out.
+//
+// Only sizes and alignments are `static_assert`ed. Offsets cannot be: MSL has
+// no `<cstddef>` and the null-pointer-member form of `offsetof` is not a
+// constant expression. They are reported by `sdpa_params_layout` below and
+// compared against Rust's `offset_of!`, which is the stronger check regardless
+// -- a `static_assert` on either side proves only that side agrees with itself.
+//
+// `SdpaVectorParams` is 32 rather than the 28 its fields sum to: `size_t`
+// forces 8-byte alignment, `k_stride` cannot start until 8, and the two
+// trailing `float`s leave four bytes of tail padding. Neither number is a field
+// width; both are the padding rule, which is what this kernel exists to ship
+// across the boundary.
+static_assert(sizeof(SdpaVectorParams) == 32, "SdpaVectorParams layout");
+static_assert(alignof(SdpaVectorParams) == 8, "SdpaVectorParams alignment");
+
+// The offset is taken from a real `thread` instance rather than the usual
+// null-pointer form, which MSL rejects in constant evaluation. Measuring it at
+// runtime is what this kernel is for.
+#define sdpa_offsetof_rt(S, F) \
+    ((uint)((thread const char *)&(probe_##S.F) - (thread const char *)&probe_##S))
+
+[[kernel]] void sdpa_params_layout(
+    device uint* out,
+    uint tid [[thread_position_in_grid]]) {
+  if (tid != 0) { return; }
+  SdpaVectorParams probe_SdpaVectorParams;
+
+  out[0] = sizeof(SdpaVectorParams);
+  out[1] = sdpa_offsetof_rt(SdpaVectorParams, gqa_factor);
+  out[2] = sdpa_offsetof_rt(SdpaVectorParams, N);
+  out[3] = sdpa_offsetof_rt(SdpaVectorParams, k_stride);
+  out[4] = sdpa_offsetof_rt(SdpaVectorParams, v_stride);
+  out[5] = sdpa_offsetof_rt(SdpaVectorParams, scale);
+  out[6] = sdpa_offsetof_rt(SdpaVectorParams, softcapping);
+}
+
 // SDPA vector instantiations
+//
+// A second `[[host_name]]` on the same instantiation does not compile -- an
+// explicit instantiation is unique per template-argument list however many
+// names are attached (`DESIGN.md` §11.3g). So the packed sibling is a distinct
+// function template, which is what `sdpa_vector_packed` above is.
 #define instantiate_sdpa_vector(type, head_dim)                              \
   template [[host_name("sdpa_vector_" #type "_" #head_dim)]]                 \
   [[kernel]] void sdpa_vector<type, head_dim>(                               \
@@ -2350,6 +2542,19 @@ instantiate_attn(bfloat16, bfloat16_t,  8, 8, 512, 1, 1, bool_,    bool)
       const constant size_t& v_stride,                                       \
       const constant float& scale,                                           \
       const constant float& softcapping,                                     \
+      const device bool* mask [[function_constant(sdpa_vector_has_mask)]],              \
+      const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],   \
+      const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],  \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]);                          \
+  template [[host_name("sdpa_vector_" #type "_" #head_dim "_packed")]]       \
+  [[kernel]] void sdpa_vector_packed<type, head_dim>(                        \
+      const device SdpaVectorParams* pp [[buffer(0)]],                       \
+      const device type* queries [[buffer(1)]],                              \
+      const device type* keys [[buffer(2)]],                                 \
+      const device type* values [[buffer(3)]],                               \
+      device type* out [[buffer(4)]],                                        \
       const device bool* mask [[function_constant(sdpa_vector_has_mask)]],              \
       const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],   \
       const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],  \
