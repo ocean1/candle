@@ -12,7 +12,7 @@
 //! guard structural for the packed-params arms after 29 of 30 were written
 //! without one; this file is the same discipline in the family that failure mode
 //! was named for.
-use crate::metal::icb::IcbExecutor;
+use crate::metal::icb::{BarrierScope, IcbExecutor};
 use crate::metal::{Commands, ExecutorSlot, ResidencySet};
 use crate::{
     call_unary_contiguous, set_constants_pool_enabled, set_default_param_style,
@@ -337,5 +337,157 @@ fn inline_constant_dispatches_are_excluded_with_a_reason() {
         distinct(&out) > 2,
         "output holds {} distinct value(s), so the fixture did not compute",
         distinct(&out)
+    );
+}
+
+/// A chain of `cos` dispatches, each reading the previous one's output.
+///
+/// Every link is a read-after-write against the same buffer, so a correct
+/// barrier scan must order every command after its predecessor. That makes the
+/// barrier count a function of the scan rule rather than of the fixture's
+/// accidents, which is what lets the two `BarrierScope` arms be compared.
+fn run_cos_chain(
+    steps: usize,
+    links: usize,
+    executor: Option<&Arc<IcbExecutor>>,
+    input: &[f32],
+) -> Vec<f32> {
+    let device = device();
+    let kernels = Kernels::new();
+    let cmds = commands(&device);
+    if let Some(e) = executor {
+        cmds.set_executor(Arc::new(ExecutorSlot::Custom(e.clone())));
+    }
+
+    let options = crate::RESOURCE_OPTIONS;
+    let bytes = std::mem::size_of_val(input);
+    let src = device
+        .new_buffer_with_data(input.as_ptr() as *const std::ffi::c_void, bytes, options)
+        .unwrap();
+    // Two buffers ping-ponged, so consecutive links genuinely conflict: link i
+    // writes what link i+1 reads. Allocated once and reused across steps, so a
+    // replayed command binds the buffer it was encoded against.
+    let a = device.new_buffer(bytes, options).unwrap();
+    let b = device.new_buffer(bytes, options).unwrap();
+
+    for _ in 0..steps {
+        {
+            let guard = cmds.command_encoder().unwrap();
+            for link in 0..links {
+                let (from, to) = match link {
+                    0 => (&src, &a),
+                    _ if link % 2 == 1 => (&a, &b),
+                    _ => (&b, &a),
+                };
+                call_unary_contiguous(
+                    &device,
+                    &guard,
+                    &kernels,
+                    unary::contiguous::cos::FLOAT,
+                    std::mem::size_of::<f32>(),
+                    input.len(),
+                    BufferOffset {
+                        buffer: from,
+                        offset_in_bytes: 0,
+                    },
+                    to,
+                )
+                .unwrap();
+            }
+        }
+        cmds.flush_and_wait().unwrap();
+        if let Some(e) = executor {
+            e.end_step(&device).unwrap();
+        }
+    }
+
+    let last = if links % 2 == 1 { &a } else { &b };
+    let ptr = last.contents() as *const f32;
+    // SAFETY: the command buffer has completed and the buffer holds
+    // `input.len()` f32 in shared storage.
+    unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec()
+}
+
+/// The shipped scan orders every link of a dependency chain, and the reduced one
+/// does not — which is why `RunStart` is the default.
+///
+/// # What this pins, and what it cannot
+///
+/// `DESIGN.md` §11.3l left open whether `setBarrier` is "too coarse": it orders
+/// a command after every command before it in the buffer, where candle's
+/// barrier is per hazard, and 401 of them per replayed step had not been
+/// priced. The answer is that the coarseness is **not** the whole story, and
+/// the reduced arm is the demonstration.
+///
+/// `SinceBarrier` scans back only to the previous barrier, on the reasoning
+/// that `auto_barrier` clears `prev_outputs` when it fires. That is sound for
+/// candle and unsound here, because the two primitives are different objects:
+/// `memoryBarrierWithScope` is a fence *in the stream* and `setBarrier` is a
+/// property of *one command*. A barrier on command `k` orders `k` against its
+/// predecessors and leaves `k+1..` concurrent with them.
+///
+/// On an N-link chain the correct scan therefore emits N-1 barriers — one per
+/// link — and the reduced scan emits far fewer, because after the first it
+/// believes the edge discharged.
+///
+/// **This asserts the counts, not the correctness.** A missing edge is a race
+/// (§3.5), so a unit test that read the right answer would be reporting a
+/// scheduling accident rather than an ordering. The correctness evidence is the
+/// §15.1 #7 digest gate on the real model, where the reduced arm produces a
+/// wrong-but-valid digest on one run and fails sampling on the next.
+#[test]
+fn the_reduced_barrier_scan_drops_edges_a_dependency_chain_needs() {
+    require_icb_support!("the_reduced_barrier_scan_drops_edges_a_dependency_chain_needs");
+    set_default_param_style(ParamStyle::Packed);
+    set_constants_pool_enabled(true);
+
+    const LINKS: usize = 6;
+    let input: Vec<f32> = (0..256).map(|i| i as f32 / 16.0).collect();
+
+    let conservative = IcbExecutor::with_barrier_scope(2, BarrierScope::RunStart);
+    let out_conservative = run_cos_chain(3, LINKS, Some(&conservative), &input);
+    let reduced = IcbExecutor::with_barrier_scope(2, BarrierScope::SinceBarrier);
+    let out_reduced = run_cos_chain(3, LINKS, Some(&reduced), &input);
+
+    let cov = conservative.coverage();
+    assert_eq!(
+        cov.covered, LINKS,
+        "every link should be replayable: {cov:?}"
+    );
+    assert_eq!(
+        conservative.runs(),
+        1,
+        "the chain is contiguous, so it is one run: {cov:?}"
+    );
+
+    // One per link after the first: each reads what its predecessor wrote.
+    assert_eq!(
+        conservative.encoded_barriers(),
+        LINKS - 1,
+        "the shipped scan must order every link of the chain"
+    );
+    // The reduced scan believes an earlier barrier discharged the edge, so it
+    // emits strictly fewer. Asserted as an inequality rather than an exact
+    // figure: the point is that edges are dropped, and pinning the exact count
+    // would make this test a description of the wrong arm's arithmetic.
+    assert!(
+        reduced.encoded_barriers() < conservative.encoded_barriers(),
+        "the reduced scan should drop edges ({} against {}), which is what makes it \
+         the negative control",
+        reduced.encoded_barriers(),
+        conservative.encoded_barriers()
+    );
+
+    // Non-vacuity, per this file's header: both arms must have computed
+    // something, or the counts above describe a fixture that never dispatched.
+    assert!(
+        distinct(&out_conservative) > 2,
+        "conservative arm wrote {} distinct value(s)",
+        distinct(&out_conservative)
+    );
+    assert!(
+        distinct(&out_reduced) > 2,
+        "reduced arm wrote {} distinct value(s)",
+        distinct(&out_reduced)
     );
 }
