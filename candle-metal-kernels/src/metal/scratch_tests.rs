@@ -15,9 +15,10 @@
 //! #70 **deleted `align_up` and its acceptance test still passed**, until a
 //! deliberately unaligned size was added to the fixture.
 //!
-//! The scratch class is the first consumer where this bites -- but only under
-//! one of its two layouts, which is worse than it sounds and is why both exist.
-//! See [`the_planes_layout_is_blind_to_an_alignment_defect`].
+//! The scratch class is the first consumer where this bites -- but **only at one
+//! of two levels**, which is finer than #70 stated it and is the thing that
+//! decides whether a fixture can fail at all. See
+//! [`the_capacity_comparison_is_blind_under_both_layouts_and_the_record_is_not`].
 
 use super::scratch::*;
 use super::ARENA_ALIGNMENT;
@@ -131,35 +132,61 @@ fn the_interleaved_record_is_not_a_multiple_of_the_alignment() {
     );
 }
 
-/// **The blindness, stated as a test rather than as a warning.**
+/// **The blindness has two levels, and only one of them can fail.**
 ///
-/// Under [`ScratchLayout::Planes`] every LFM2 region size is a 128-multiple, so
-/// `bump_capacity` and `arena_bytes` are equal and a mutation to `align_up`
-/// changes nothing. Under [`ScratchLayout::Interleaved`] they differ.
+/// #70's warning says a fixture built from LFM2's own shapes cannot expose an
+/// alignment defect. Running it here sharpens that by one level, and the
+/// distinction is easy to conflate:
 ///
-/// This is #70's finding reproduced one class along: a parity test built only
-/// from the model's own shapes is blind to a whole defect class, and *which*
-/// layout you pick decides whether your fixture can see it at all.
+/// - **region level** -- `bump_capacity` against `arena_bytes`. Blind under
+///   **both** layouts on LFM2's shapes, and the interleaved case is the
+///   surprising half: its region is `32 x 11 x 384`, a 128-multiple, *because
+///   the padding is already inside the region size*. A capacity comparison
+///   therefore cannot see a bad `align_up` under either layout.
+/// - **record level** -- the (head, chunk) stride *within* a region: 264 B
+///   unpadded against 384 padded. This is the level where `align_up` decides
+///   anything at all on shapes our own model produces.
+///
+/// So the useful statement is not "pick the interleaved layout and your fixture
+/// can see it" -- it is "pick the right *level*". This test pins both halves so
+/// the weaker claim cannot creep back in, and the mutation record bears it out:
+/// deleting `align_up` is killed by the record-stride fixtures and by no
+/// capacity comparison anywhere in the suite.
 #[test]
-fn the_planes_layout_is_blind_to_an_alignment_defect() {
+fn the_capacity_comparison_is_blind_under_both_layouts_and_the_record_is_not() {
     let g = lfm2();
-    for kv in [2_720usize, 32_768, 131_072] {
-        let planes = plan_scratch(
-            &g,
-            kv,
-            LFM2_ATTENTION_LAYERS,
-            Sizing::Grow,
-            ScratchLayout::Planes,
-            MAX_CONTEXT,
-        )
-        .expect("plan");
-        assert_eq!(
-            planes.arena_bytes(),
-            planes.bump_capacity(),
-            "planes layout at kv_len {kv} is not alignment-blind after all -- \
-             if this fails the geometry changed and the warning needs rewriting"
-        );
+    for layout in [ScratchLayout::Planes, ScratchLayout::Interleaved] {
+        for kv in [2_720usize, 32_768, 131_072] {
+            let plan = plan_scratch(
+                &g,
+                kv,
+                LFM2_ATTENTION_LAYERS,
+                Sizing::Grow,
+                layout,
+                MAX_CONTEXT,
+            )
+            .expect("plan");
+            assert_eq!(
+                plan.arena_bytes(),
+                plan.bump_capacity(),
+                "{layout:?} at kv_len {kv} is not capacity-blind after all -- if this \
+                 fails the geometry changed and the warning above needs rewriting"
+            );
+        }
     }
+
+    // The level that is not blind, and the only one on LFM2's shapes that is not.
+    assert_ne!(
+        g.interleaved_record_bytes() % ARENA_ALIGNMENT,
+        0,
+        "the interleaved record became a 128-multiple, so nothing in this class \
+         exercises align_up on the model's own shapes any more"
+    );
+    assert_eq!(
+        g.partials_bytes(1) % ARENA_ALIGNMENT,
+        0,
+        "planes plane size"
+    );
 }
 
 /// **`bump_capacity` is not `arena_bytes`** (#70), on a shape where it shows.
