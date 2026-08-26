@@ -41,11 +41,11 @@ pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_with, GemmDType};
 pub use params::{
     AffineParams, AffineStridedParams, BinaryParams, BinaryStridedParams, CastParams,
     CastStridedParams, Col2im1dParams, Conv1dDepthwiseKParams, Conv1dDepthwiseParams,
-    ConvTranspose1dParams, ConvTranspose2dParams, Copy2dParams, GemvParams, Im2col1dParams,
-    Im2colParams, LayoutDescriptor, LayoutFamily, NormParams, ParamStyle, Pool2dParams,
-    ReduceParams, RopeIParams, RopeParams, RopeThdParams, ScaleParams, ScaleStridedParams,
-    SoftmaxParams, UnaryParams, UnaryStridedParams, UpsampleBilinear2dParams,
-    UpsampleNearest2dParams,
+    ConvTranspose1dParams, ConvTranspose2dParams, Copy2dParams, GatherParams, GemvParams,
+    Im2col1dParams, Im2colParams, IndexAddParams, IndexParams, LayoutDescriptor, LayoutFamily,
+    NormParams, ParamStyle, Pool2dParams, ReduceParams, RopeIParams, RopeParams, RopeThdParams,
+    ScaleParams, ScaleStridedParams, ScatterParams, SoftmaxParams, UnaryParams, UnaryStridedParams,
+    UpsampleBilinear2dParams, UpsampleNearest2dParams,
 };
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,
