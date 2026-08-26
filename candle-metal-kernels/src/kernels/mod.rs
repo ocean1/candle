@@ -1,4 +1,5 @@
 pub mod affine;
+pub mod arena_alloc;
 pub mod binary;
 pub mod cast;
 pub mod conv_names;
@@ -20,6 +21,9 @@ pub mod ternary;
 pub mod unary;
 
 pub use affine::*;
+pub use arena_alloc::{
+    call_arena_alloc_report, call_arena_bump, call_arena_bump_concurrent, call_arena_reset,
+};
 pub use binary::{
     call_binary_contiguous, call_binary_contiguous_with, call_binary_strided,
     call_binary_strided_with,

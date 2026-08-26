@@ -1,4 +1,7 @@
 pub mod arena;
+pub mod arena_cursor;
+#[cfg(test)]
+mod arena_gpu_tests;
 pub mod buffer;
 pub mod buffer_pool;
 pub mod command_buffer;
@@ -17,6 +20,7 @@ pub mod residency_set;
 pub mod trace;
 
 pub use arena::*;
+pub use arena_cursor::*;
 pub use buffer::*;
 pub use buffer_pool::*;
 pub use command_buffer::*;

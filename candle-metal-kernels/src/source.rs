@@ -1,4 +1,5 @@
 pub const AFFINE: &str = include_str!("metal_src/affine.metal");
+pub const ARENA_ALLOC: &str = include_str!("metal_src/arena_alloc.metal");
 pub const BINARY: &str = include_str!("metal_src/binary.metal");
 pub const CAST: &str = include_str!("metal_src/cast.metal");
 pub const CONV: &str = include_str!("metal_src/conv.metal");
@@ -18,6 +19,9 @@ pub const SDPA: &str = include_str!("metal_src/scaled_dot_product_attention.meta
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     Affine,
+    /// GPU-side bump allocation over the activation arena (`DESIGN.md` §9.2d,
+    /// issue #70). Not dispatched by any tensor op -- the arena drives it.
+    ArenaAlloc,
     Binary,
     Cast,
     Conv,

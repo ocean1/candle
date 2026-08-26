@@ -12,11 +12,17 @@ pub use kernel::Kernels;
 // `kernels::params` when `conv.metal` followed (issue #42), so it is named
 // explicitly here; the spelling callers use is unchanged.
 pub use kernels::{
-    affine::*, call_binary_contiguous, call_binary_contiguous_with, call_binary_strided,
-    call_binary_strided_with, call_mlx_gemm, call_mlx_gemv_with, cast::*, convolution::*, fill::*,
-    indexing::*, quantized::*, random::*, reduce::*, sdpa::*, sort::*, ternary::*, unary, unary::*,
-    ConvKernel, GemmDType, GgmlDType, IndexingKernel, ParamStyle, ReduceKernel,
+    affine::*, arena_alloc::*, call_binary_contiguous, call_binary_contiguous_with,
+    call_binary_strided, call_binary_strided_with, call_mlx_gemm, call_mlx_gemv_with, cast::*,
+    convolution::*, fill::*, indexing::*, quantized::*, random::*, reduce::*, sdpa::*, sort::*,
+    ternary::*, unary, unary::*, ConvKernel, GemmDType, GgmlDType, IndexingKernel, ParamStyle,
+    ReduceKernel,
 };
+// The arena's GPU-side allocator vocabulary (`DESIGN.md` §9.2d, issue #70).
+// Named rather than arriving through a glob, because `ARENA_DECLINED` is a
+// cross-language constant -- `arena_alloc.metal` writes the same sentinel, and
+// `arena_alloc_reports_alignment` is what checks the two agree.
+pub use metal::{ArenaCursor, ArenaOffsets, ARENA_DECLINED};
 use metal::{
     Buffer, CommandQueue, ComputeCommandEncoder, ComputePipeline, ConstantValues, Device, Function,
     Library, MTLResourceOptions, Value,
