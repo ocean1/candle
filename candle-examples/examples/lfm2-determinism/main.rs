@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{Cache, Config, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -123,6 +123,21 @@ struct Args {
     /// degenerating the way `--ignore-eos` does.
     #[arg(long, default_value_t = 1)]
     turns: usize,
+
+    /// Which attention implementation decode takes: `generic` (the default, and
+    /// the arm that must still reproduce the digests recorded from §8.1b
+    /// through §11.3k) or `sdpa` (the GQA-native `sdpa_vector` kernel, lloom
+    /// issue #97).
+    ///
+    /// The `sdpa` arm is *expected* to produce a different pair, for the reasons
+    /// recorded in `measurements/issue-97-prediction.md` before this was run:
+    /// online softmax rescales the accumulator per key, `fast::exp` is not
+    /// candle's `exp`, and the dot product is a `simd_sum`. What it must not do
+    /// is produce a pair that varies between runs — the kernel walks keys by
+    /// index with no float atomics and no completion-order merge, so §2.3.3 #1
+    /// is satisfied and a varying digest here would mean something else is wrong.
+    #[arg(long, default_value = "generic")]
+    attn: String,
 }
 
 /// Follow-up prompts for multi-turn mode, cycled in order.
@@ -295,7 +310,18 @@ fn main() -> Result<()> {
 
     let config_raw = std::fs::read_to_string(model_dir.join("config.json"))
         .with_context(|| format!("reading {}", model_dir.join("config.json").display()))?;
-    let config = parse_config(&config_raw)?;
+    let mut config = parse_config(&config_raw)?;
+
+    // Refused rather than defaulted. A silent fallback would report the generic
+    // path's digests under the sdpa arm's name, and the whole point of this run
+    // is to tell those two apart -- #69's vacuous determinism run is exactly the
+    // failure this avoids (§2.4).
+    config.attn_impl = match args.attn.as_str() {
+        "generic" => AttnImpl::Generic,
+        "sdpa" => AttnImpl::Sdpa,
+        other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
+    };
+    println!("attention implementation: {:?}", config.attn_impl);
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
