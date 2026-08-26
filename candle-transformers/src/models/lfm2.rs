@@ -109,8 +109,35 @@ impl Lfm2Config {
             bos_token_id: self.bos_token_id,
             eos_token_id: self.eos_token_id,
             use_flash_attn,
+            attn_impl: AttnImpl::default(),
         }
     }
+}
+
+/// Which attention implementation the decode path takes.
+///
+/// A construction-tier axis in `DESIGN.md` §7.1's terms: it selects a kernel at
+/// model-construction time and reaches the GPU as nothing at all. Both arms are
+/// compiled, so the A/B is free and a regression is one field away — the same
+/// discipline as `ParamStyle` and `ArenaLayout`.
+///
+/// This is deliberately *not* a `use_flash_attn`-style bool. A third arm
+/// (`call_sdpa_vector_2pass`, the chunked variant) is a later issue, and a bool
+/// would have to be widened into an enum at that point anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttnImpl {
+    /// `repeat_kv` + F32 upcast + `matmul` + `softmax_last_dim`.
+    ///
+    /// The default, and the correctness bar every other arm is compared
+    /// against. Works on every backend.
+    #[default]
+    Generic,
+    /// `candle_nn::ops::sdpa`, which is GQA-native and accumulates in F32
+    /// internally, so neither `repeat_kv` nor the upcast is needed.
+    ///
+    /// Metal only, and only for `seq_len == 1`; every other case falls back to
+    /// `Generic` rather than failing, so this is safe to set unconditionally.
+    Sdpa,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +158,9 @@ pub struct Config {
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
     pub use_flash_attn: bool,
+    /// Defaults to `Generic`, so `into_config` and every existing caller keep
+    /// the path they had without naming it.
+    pub attn_impl: AttnImpl,
 }
 
 impl Config {
@@ -271,6 +301,7 @@ struct Attention {
     num_key_value_heads: usize,
     head_dim: usize,
     use_flash_attn: bool,
+    attn_impl: AttnImpl,
     span: tracing::Span,
     span_rot: tracing::Span,
 }
@@ -305,9 +336,32 @@ impl Attention {
             num_key_value_heads,
             head_dim,
             use_flash_attn: cfg.use_flash_attn,
+            attn_impl: cfg.attn_impl,
             span: tracing::span!(tracing::Level::TRACE, "attn"),
             span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
         })
+    }
+
+    /// Whether this call can take the fused `sdpa_vector` kernel.
+    ///
+    /// Every condition is one `candle_nn::ops::sdpa` would otherwise `bail!` on
+    /// (`candle-nn/src/ops.rs`, `Sdpa::metal_fwd`), so a false here is a
+    /// fallback and never a failure. They are checked rather than assumed:
+    ///
+    /// * **Metal.** `Sdpa::cpu_fwd` bails outright; there is no CPU arm.
+    /// * **`seq_len == 1`.** `supports_sdpa_vector` requires it. Prefill is
+    ///   `call_sdpa_full`, whose mask handling differs — deliberately out of
+    ///   scope, see the type-level note on `AttnImpl::Sdpa`.
+    /// * **dtype.** The kernel is instantiated for f16/bf16/f32 only.
+    ///
+    /// `head_dim == 64` and `32 % 8 == 0` also hold for LFM2 (§5.2) and are
+    /// checked by `ops::sdpa` itself; they are not re-asserted here, because a
+    /// second copy of a condition is a second thing to keep in sync (§8.1b).
+    fn sdpa_applies(&self, q: &Tensor, seq_len: usize) -> bool {
+        self.attn_impl == AttnImpl::Sdpa
+            && q.device().is_metal()
+            && seq_len == 1
+            && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
@@ -370,17 +424,38 @@ impl Attention {
             cache.kvs[block_idx] = Some((k.clone(), v.clone()));
         }
 
-        // Expand KV heads to match query heads
-        let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
-        let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
-
-        let y = if self.use_flash_attn {
+        // The fused kernel is GQA-native — it derives `gqa_factor` from the head
+        // counts and indexes `kv_head_idx = head_idx / gqa_factor` in registers
+        // — and it accumulates in F32 internally. So on that arm `repeat_kv` and
+        // the F32 upcast below are not merely unnecessary, they are the two
+        // things being removed (`DESIGN.md` §6.2, §8.1 principle 4). Both
+        // therefore have to stay *inside* the arm that needs them.
+        let y = if self.sdpa_applies(&q, seq_len) {
+            // Scale is applied to `q` inside the kernel before the dot product,
+            // matching `att / sqrt(head_dim)` below. No mask: `seq_len == 1`
+            // attends to the whole cache, which is the same reason the generic
+            // arm skips `masked_fill` in that case.
+            candle_nn::ops::sdpa(
+                &q,
+                &k,
+                &v,
+                None,
+                false,
+                1f32 / (self.head_dim as f32).sqrt(),
+                1.0,
+            )?
+        } else if self.use_flash_attn {
+            let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
+            let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
             let q = q.transpose(1, 2)?;
             let k = k.transpose(1, 2)?;
             let v = v.transpose(1, 2)?;
             let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
             flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?.transpose(1, 2)?
         } else {
+            // Expand KV heads to match query heads
+            let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
+            let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
             let in_dtype = q.dtype();
             let q = q.to_dtype(DType::F32)?;
             let k = k.to_dtype(DType::F32)?;

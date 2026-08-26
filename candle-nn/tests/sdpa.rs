@@ -184,4 +184,222 @@ mod metal_sdpa_tests {
         assert!(error <= 0.0013, "{}", error);
         Ok(())
     }
+
+    // ---------------------------------------------------------------------
+    // GQA against the CPU backend, at LFM2's decode shape (lloom issue #97).
+    //
+    // Every test above sets q heads == kv heads, so `gqa_factor` is 1 and the
+    // kernel's `kv_head_idx = head_idx / gqa_factor` is exercised only at its
+    // identity value. LFM2 decode runs it at 4 — 32 q heads over 8 kv heads,
+    // `DESIGN.md` §5.2 — which is the path #97 routes attention onto, so it was
+    // the one case the suite did not cover.
+    //
+    // The reference is the **CPU backend** per `CONTRIBUTING.md` §3.1: it is
+    // bit-stable and upstreamable, where a Metal ground truth shares a backend
+    // with the thing under test. It cannot be "the same call on CPU" —
+    // `Sdpa::cpu_fwd` bails with "SDPA has no cpu impl" — so the reference is
+    // the same *mathematics*: repeat_kv, matmul, softmax, matmul, in f32.
+    // ---------------------------------------------------------------------
+
+    /// LFM2 decode geometry (§5.2): 32 query heads, 8 kv heads, head_dim 64.
+    const LFM2_Q_HEADS: usize = 32;
+    const LFM2_KV_HEADS: usize = 8;
+    const LFM2_HEAD_DIM: usize = 64;
+
+    /// Broadcast each kv head to `repeat` query heads.
+    ///
+    /// Spelled out rather than taken from `candle_transformers::utils`, which
+    /// would make `candle-nn`'s tests depend on a crate above it.
+    fn repeat_kv(x: &Tensor, repeat: usize) -> Result<Tensor> {
+        if repeat == 1 {
+            return Ok(x.clone());
+        }
+        let (b, kv_heads, seq, dim) = x.dims4()?;
+        Tensor::cat(&vec![x; repeat], 2)?.reshape((b, kv_heads * repeat, seq, dim))
+    }
+
+    /// repeat_kv + matmul + softmax + matmul, in f32. Mirrors the arm
+    /// `AttnImpl::Generic` takes in `lfm2.rs`.
+    fn reference_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+        let (_, q_heads, _, _) = q.dims4()?;
+        let (_, kv_heads, _, _) = k.dims4()?;
+        let repeat = q_heads / kv_heads;
+
+        let k = repeat_kv(k, repeat)?;
+        let v = repeat_kv(v, repeat)?;
+
+        let q = q.to_dtype(DType::F32)?;
+        let k = k.to_dtype(DType::F32)?;
+        let v = v.to_dtype(DType::F32)?;
+
+        let att = (q.matmul(&k.t()?.contiguous()?)? * scale)?;
+        let att = candle_nn::ops::softmax_last_dim(&att)?;
+        att.matmul(&v.contiguous()?)
+    }
+
+    /// Asserts agreement *and* that the comparison was not vacuous.
+    ///
+    /// Two tensors of zeros agree perfectly, and `DESIGN.md` §3.7a records
+    /// all-zero output as the signature of a silently-nonfunctional Metal
+    /// pipeline. So the guard lives in the comparison both arms route through
+    /// rather than copied into each (§15.1 #1, lloom issue #53), and it counts
+    /// distinct values rather than testing "not all zero", for #53's reason.
+    fn assert_matches_reference(got: &Tensor, want: &Tensor, tol: f32, what: &str) -> Result<f32> {
+        assert_eq!(got.shape(), want.shape(), "{what}: shape");
+
+        let got_v = got.flatten_all()?.to_vec1::<f32>()?;
+        let distinct = got_v
+            .iter()
+            .map(|f| f.to_bits())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct >= 2,
+            "{what}: vacuous comparison — wrote {distinct} distinct value(s) across {} elements",
+            got_v.len()
+        );
+
+        let want_v = want.flatten_all()?.to_vec1::<f32>()?;
+        let max_abs = got_v
+            .iter()
+            .zip(want_v.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(max_abs <= tol, "{what}: max abs error {max_abs} > {tol}");
+        Ok(max_abs)
+    }
+
+    /// Metal `sdpa` at GQA 4:1 against the CPU backend, f32.
+    ///
+    /// f32 so the comparison is about the *kernel* rather than about f16
+    /// rounding: a disagreement here is the GQA indexing or the online-softmax
+    /// accumulation, not storage precision.
+    #[test]
+    fn sdpa_vector_gqa_matches_cpu_backend_f32() -> Result<()> {
+        const L: usize = 137; // deliberately not a multiple of the kernel's BN=32
+
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(970001);
+
+        let q = randn(&mut rng, (1, LFM2_Q_HEADS, 1, LFM2_HEAD_DIM), &cpu)?;
+        let k = randn(&mut rng, (1, LFM2_KV_HEADS, L, LFM2_HEAD_DIM), &cpu)?;
+        let v = randn(&mut rng, (1, LFM2_KV_HEADS, L, LFM2_HEAD_DIM), &cpu)?;
+
+        let want = reference_attention(&q, &k, &v, scale)?;
+
+        let got = candle_nn::ops::sdpa(
+            &q.to_device(&metal)?,
+            &k.to_device(&metal)?,
+            &v.to_device(&metal)?,
+            None,
+            false,
+            scale as f32,
+            1.,
+        )?
+        .to_device(&cpu)?;
+
+        let err = assert_matches_reference(&got, &want, 2e-5, "gqa f32")?;
+        println!("sdpa_vector_gqa_matches_cpu_backend_f32: max abs error {err:e}");
+        Ok(())
+    }
+
+    /// The same at f16, which is what LFM2 actually decodes in.
+    ///
+    /// The tolerance is looser because the reference upcasts f16 to f32 before
+    /// the multiply where the kernel widens per element, so the two round the
+    /// inputs differently by construction. That difference is *why* #97 predicts
+    /// a changed digest, and this bounds it rather than waving at it.
+    #[test]
+    fn sdpa_vector_gqa_matches_cpu_backend_f16() -> Result<()> {
+        const L: usize = 137;
+
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(970002);
+
+        let q = randn(&mut rng, (1, LFM2_Q_HEADS, 1, LFM2_HEAD_DIM), &cpu)?;
+        let k = randn(&mut rng, (1, LFM2_KV_HEADS, L, LFM2_HEAD_DIM), &cpu)?;
+        let v = randn(&mut rng, (1, LFM2_KV_HEADS, L, LFM2_HEAD_DIM), &cpu)?;
+
+        // Round-trip through f16 on both arms so the inputs are identical bits.
+        let q16 = q.to_dtype(DType::F16)?;
+        let k16 = k.to_dtype(DType::F16)?;
+        let v16 = v.to_dtype(DType::F16)?;
+
+        let want = reference_attention(&q16, &k16, &v16, scale)?;
+
+        let got = candle_nn::ops::sdpa(
+            &q16.to_device(&metal)?,
+            &k16.to_device(&metal)?,
+            &v16.to_device(&metal)?,
+            None,
+            false,
+            scale as f32,
+            1.,
+        )?
+        .to_device(&cpu)?
+        .to_dtype(DType::F32)?;
+
+        let err = assert_matches_reference(&got, &want, 5e-3, "gqa f16")?;
+        println!("sdpa_vector_gqa_matches_cpu_backend_f16: max abs error {err:e}");
+        Ok(())
+    }
+
+    /// The kernel must read the kv head `gqa_factor` selects, not another one.
+    ///
+    /// The two tests above compare against a reference that would disagree only
+    /// numerically if the mapping were wrong, and on random inputs a wrong-head
+    /// read is a plausible-looking tensor. Here every kv head holds a distinct
+    /// constant and `k` is zeros, so softmax is uniform and each query head's
+    /// output is *exactly* the constant of the kv head it read. A wrong mapping
+    /// is then an unmistakable integer-sized error rather than a small one.
+    #[test]
+    fn sdpa_vector_gqa_reads_the_right_kv_head() -> Result<()> {
+        const L: usize = 8;
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+
+        let q = Tensor::ones((1, LFM2_Q_HEADS, 1, LFM2_HEAD_DIM), DType::F32, &cpu)?;
+        let k = Tensor::zeros((1, LFM2_KV_HEADS, L, LFM2_HEAD_DIM), DType::F32, &cpu)?;
+
+        // kv head h is filled with the value (h + 1).
+        let mut v_data = Vec::with_capacity(LFM2_KV_HEADS * L * LFM2_HEAD_DIM);
+        for h in 0..LFM2_KV_HEADS {
+            for _ in 0..(L * LFM2_HEAD_DIM) {
+                v_data.push((h + 1) as f32);
+            }
+        }
+        let v = Tensor::from_vec(v_data, (1, LFM2_KV_HEADS, L, LFM2_HEAD_DIM), &cpu)?;
+
+        let got = candle_nn::ops::sdpa(
+            &q.to_device(&metal)?,
+            &k.to_device(&metal)?,
+            &v.to_device(&metal)?,
+            None,
+            false,
+            1.0,
+            1.,
+        )?
+        .to_device(&cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+        let gqa_factor = LFM2_Q_HEADS / LFM2_KV_HEADS;
+        for qh in 0..LFM2_Q_HEADS {
+            let want_head = qh / gqa_factor;
+            let expected = (want_head + 1) as f32;
+            for d in 0..LFM2_HEAD_DIM {
+                let seen = got[qh * LFM2_HEAD_DIM + d];
+                assert!(
+                    (seen - expected).abs() <= 1e-5,
+                    "q head {qh} lane {d}: read value {seen}, expected {expected} \
+                     (kv head {want_head})"
+                );
+            }
+        }
+        Ok(())
+    }
 }
