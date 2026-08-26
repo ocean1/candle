@@ -24,6 +24,24 @@
 //! A logits digest that is stable across runs is a far stronger claim than a
 //! stable token stream, so both are printed and both are compared.
 //!
+//! # This harness reports no throughput, deliberately
+//!
+//! `lfm2-decode-profile` is the one that measures throughput, and its
+//! `wall_ms_per_token` is a steady-state per-token mean with warmup excluded
+//! under argmax. Nothing here is comparable to it: this runs multi-turn with
+//! sampling on, counts prefill and warmup, and lets `kv_len` grow across turns.
+//!
+//! The `elapsed_ms` below is a duration and not a rate. **Do not divide it by
+//! `generated`** — that reconstructs the whole-generation average
+//! `measurements/issue-7-reconciliation.md` §1 exists to discredit, and it is
+//! what the removed `tok_per_s` field was (lloom #102).
+//!
+//! The reason it cannot be fixed by relabelling is structural: two arms of a
+//! determinism A/B generate different numbers of tokens *by construction*,
+//! because when the digests diverge the arms take different paths and stop at
+//! different points. So `elapsed_ms` is not comparable between arms either, and
+//! neither is anything derived from it.
+//!
 //! ```bash
 //! cargo run --release --example lfm2-determinism -- \
 //!   --model-dir /path/to/LFM2.5-VL-3B --n 500
@@ -777,10 +795,41 @@ fn main() -> Result<()> {
 
     // One machine-greppable line per run, so a batch of runs collapses to a
     // sort|uniq over digests.
+    //
+    // There is deliberately no throughput field here, and `elapsed_ms` is not one
+    // (lloom #102). This harness measures digests; `lfm2-decode-profile` measures
+    // throughput, and only its figure is comparable to anything in `.bench/`.
+    //
+    // A `tok_per_s` was printed until 2026-08-26 and it was a whole-generation
+    // average -- `generated / elapsed` -- so prefill, sampling, warmup and a
+    // `kv_len` that grows across turns were all inside it.
+    // `measurements/issue-7-reconciliation.md` §1 was written to discredit exactly
+    // that shape, and it survived here for another twenty-odd issues and misled two
+    // readers. Worked from one of its own runs: 267 tokens over 8272 ms reads
+    // 32.28 tok/s; backing out three prefills at 90.22 ms leaves 29.97 ms/token
+    // against §6.6's 18.763 ms steady-state decode, a factor of 1.60 that prefill
+    // alone does not explain.
+    //
+    // The trap is not that the number is imprecise, it is that the two arms of a
+    // determinism A/B generate *different numbers of tokens by construction*: when
+    // the digests diverge the arms take different paths and stop at different
+    // points (#97's were 267 and 401). So `elapsed_ms` is incomparable between arms
+    // and any rate derived from it is incomparable too, sitting exactly where a
+    // reader looks for a comparison.
+    //
+    // `elapsed_ms` stays because §2.3.8's evidence is that wall time varied while
+    // the bits did not; it is a duration, not a rate, and dividing it by
+    // `generated` reconstructs the discredited figure. Measured while removing the
+    // field: nine runs of this harness at `--turns 3` produced one digest pair and
+    // wall clocks from 8291 to 20085 ms as the machine's load moved -- a 2.42x
+    // spread on the removed quantity. Sharpest inside one three-run gate on one
+    // binary, minutes apart: 19630, 19894 and 8291 ms, which the field would have
+    // reported as 13.60, 13.42 and 32.20 tok/s
+    // (`measurements/issue-102-tok-per-s-removed.md` §4.1).
     println!(
         "RESULT label={} n={} tokens_sha256={} logits_sha256={} prompt_tokens={} generated={} \
          turns={} final_kv_len={} hit_eos={} dtype={:?} device={} seed={} temp={} top_p={} \
-         elapsed_ms={} tok_per_s={:.2}",
+         elapsed_ms={}",
         args.label,
         args.n,
         token_digest,
@@ -796,7 +845,6 @@ fn main() -> Result<()> {
         args.temperature,
         args.top_p,
         elapsed.as_millis(),
-        tokens.len() as f64 / elapsed.as_secs_f64(),
     );
 
     // The raw stream, so the reported hash is independently checkable with
