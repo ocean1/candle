@@ -6,6 +6,9 @@ pub mod buffer;
 pub mod buffer_pool;
 pub mod command_buffer;
 pub mod commands;
+/// Component digests: one fingerprint per mechanism per variant (#105).
+#[cfg(test)]
+mod component_digest_tests;
 pub mod compute_pipeline;
 pub mod device;
 pub mod encoder;
