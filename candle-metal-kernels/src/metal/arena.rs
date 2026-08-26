@@ -904,7 +904,14 @@ pub fn plan_from_intervals(
     StepPlan::new(slots, by_ordinal)
 }
 
-fn align_up(x: usize, a: usize) -> usize {
+/// Round `x` up to a multiple of `a`.
+///
+/// Shared with [`scratch`](super::scratch) rather than copied into it. A second
+/// spelling of the rounding rule would be the hand-sync §8.1b exists to remove,
+/// one scale down -- and it is the function #70 showed a parity test can delete
+/// without any LFM2-shaped fixture noticing (§9.2c), so two copies would be two
+/// places for that to happen unobserved.
+pub(crate) fn align_up(x: usize, a: usize) -> usize {
     x.div_ceil(a) * a
 }
 

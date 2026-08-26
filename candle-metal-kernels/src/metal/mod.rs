@@ -17,6 +17,11 @@ pub mod fence;
 mod icb_tests;
 pub mod library;
 pub mod residency_set;
+pub mod scratch;
+#[cfg(test)]
+mod scratch_gpu_tests;
+#[cfg(test)]
+mod scratch_tests;
 pub mod trace;
 
 pub use arena::*;
@@ -32,3 +37,4 @@ pub use executor::*;
 pub use fence::*;
 pub use library::*;
 pub use residency_set::*;
+pub use scratch::*;

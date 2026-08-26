@@ -15,6 +15,7 @@ pub mod quantized;
 pub mod random;
 pub mod reduce;
 pub mod reduce_names;
+pub mod scratch;
 pub mod sdpa;
 pub mod sort;
 pub mod ternary;
@@ -37,6 +38,9 @@ pub use fill::*;
 pub use indexing::*;
 pub use indexing_names::IndexingKernel;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_with, GemmDType};
+pub use scratch::{
+    call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,
+};
 // `ParamStyle` is re-exported here rather than from `reduce`, where it was
 // declared when `reduce.metal` was the only family carrying both binding
 // styles. It moved to `params` when `conv.metal` followed (issue #42) so every

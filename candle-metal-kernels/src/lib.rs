@@ -14,15 +14,23 @@ pub use kernel::Kernels;
 pub use kernels::{
     affine::*, arena_alloc::*, call_binary_contiguous, call_binary_contiguous_with,
     call_binary_strided, call_binary_strided_with, call_mlx_gemm, call_mlx_gemv_with, cast::*,
-    convolution::*, fill::*, indexing::*, quantized::*, random::*, reduce::*, sdpa::*, sort::*,
-    ternary::*, unary, unary::*, ConvKernel, GemmDType, GgmlDType, IndexingKernel, ParamStyle,
-    ReduceKernel,
+    convolution::*, fill::*, indexing::*, quantized::*, random::*, reduce::*, scratch::*, sdpa::*,
+    sort::*, ternary::*, unary, unary::*, ConvKernel, GemmDType, GgmlDType, IndexingKernel,
+    ParamStyle, ReduceKernel,
 };
 // The arena's GPU-side allocator vocabulary (`DESIGN.md` §9.2d, issue #70).
 // Named rather than arriving through a glob, because `ARENA_DECLINED` is a
 // cross-language constant -- `arena_alloc.metal` writes the same sentinel, and
 // `arena_alloc_reports_alignment` is what checks the two agree.
 pub use metal::{ArenaCursor, ArenaOffsets, ARENA_DECLINED};
+// The scratch class's vocabulary (`DESIGN.md` §9.1, issue #71). Named rather
+// than arriving through a glob for the same reason as the line above: `Sizing`
+// is a compile-tier policy whose spellings must agree with the `[[host_name]]`
+// instantiations in `scratch.metal`, and `ScratchKernel` is what checks they do.
+pub use metal::scratch::{
+    plan_scratch, CombineOrder, PartialsGeometry, ScratchLayout, ScratchPlan, ScratchRegion,
+    Sizing, BUCKET_LADDER, PARTIAL_ELEM_BYTES, PARTIAL_STATS,
+};
 use metal::{
     Buffer, CommandQueue, ComputeCommandEncoder, ComputePipeline, ConstantValues, Device, Function,
     Library, MTLResourceOptions, Value,
