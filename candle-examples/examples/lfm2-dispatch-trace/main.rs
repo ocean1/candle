@@ -163,6 +163,24 @@ struct Args {
     /// the A/B costs nothing.
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// How every kernel's scalars reach it: `split` (the default) or `packed`
+    /// (one `device const Params*`, issue #115).
+    ///
+    /// This is the axis that decides whether a dispatch position is
+    /// **ICB-encodable at all**, which is a different question from whether it
+    /// is *replayable*. §9.2h and §9.2i classify the stream by what varies
+    /// across steady-state steps -- identity, grid, offset -- and that is the
+    /// right axis for replay. It is not sufficient for encoding: an ICB command
+    /// has no `setBytes` in any form (§3.7c), so a position whose kernel binds
+    /// its constants inline cannot be encoded however stable it is.
+    ///
+    /// Under `packed` every dispatch that has a packed sibling resolves a
+    /// `*_packed` `[[host_name]]`, which is visible in the kernel census this
+    /// harness prints -- so the census is what shows the switch engaged, rather
+    /// than a flag being echoed back (§2.4, §9.2f).
+    #[arg(long, default_value = "split")]
+    param_style: String,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -414,6 +432,25 @@ fn main() -> Result<()> {
         other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
     };
     println!("attention implementation: {:?}", config.attn_impl);
+
+    // The binding-style axis (issue #115), refused rather than defaulted for the
+    // same reason as the arm above. Read back from the crate rather than echoed
+    // from `args`, so the printed line is what the kernels will use.
+    {
+        use candle_metal_kernels::{default_param_style, set_default_param_style, ParamStyle};
+        let want = match args.param_style.as_str() {
+            "split" => ParamStyle::Split,
+            "packed" => ParamStyle::Packed,
+            other => anyhow::bail!("--param-style must be `split` or `packed`, got `{other}`"),
+        };
+        set_default_param_style(want);
+        let got = default_param_style();
+        anyhow::ensure!(
+            got == want,
+            "--param-style {want:?} did not take effect; default_param_style() reports {got:?}"
+        );
+        println!("param style: {got:?}");
+    }
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;

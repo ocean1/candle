@@ -18,6 +18,13 @@ pub use kernels::{
     sort::*, ternary::*, unary, unary::*, ConvKernel, GemmDType, GgmlDType, IndexingKernel,
     ParamStyle, ReduceKernel,
 };
+// The binding-style default, so a harness can reach the packed entry points
+// without every `call_*` growing an argument (issue #115). Named rather than
+// arriving through a glob for the same reason as the lines below: this is the
+// switch that decides whether a decode dispatch is ICB-encodable at all, and
+// `set_default_param_style` says why the choice lives here and not at the call
+// sites.
+pub use kernels::params::{default_param_style, set_default_param_style};
 // The arena's GPU-side allocator vocabulary (`DESIGN.md` §9.2d, issue #70).
 // Named rather than arriving through a glob, because `ARENA_DECLINED` is a
 // cross-language constant -- `arena_alloc.metal` writes the same sentinel, and

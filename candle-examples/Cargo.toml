@@ -17,6 +17,11 @@ candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 candle-onnx = { workspace = true, optional = true }
+# Metal-only, and optional so the CPU and CUDA builds compile none of it
+# (`DESIGN.md` §14.1). The determinism harness needs it to select the
+# binding-style axis (issue #115), which is a `candle-metal-kernels` switch with
+# no `candle-core` surface.
+candle-metal-kernels = { workspace = true, optional = true }
 
 chrono = "0.4"
 csv = "1.3.0"
@@ -87,7 +92,7 @@ mkl = [
 ]
 nccl = ["cuda", "cudarc/nccl", "dep:half"]
 onnx = ["candle-onnx"]
-metal = ["candle/metal", "candle-nn/metal"]
+metal = ["candle/metal", "candle-nn/metal", "dep:candle-metal-kernels"]
 metal-debug-labels = ["metal", "candle/metal-debug-labels", "candle-nn/metal-debug-labels", "candle-transformers/metal-debug-labels"]
 microphone = ["cpal", "rubato"]
 encodec = ["cpal", "symphonia", "rubato"]

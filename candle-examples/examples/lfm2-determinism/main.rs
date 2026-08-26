@@ -167,6 +167,31 @@ struct Args {
     /// `Sdpa × arena`, which is why #105's C6 reports counts rather than digests.
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// How every kernel's scalars reach it: `split` (the default, one `setBytes`
+    /// per scalar) or `packed` (one `device const Params*`, issue #115).
+    ///
+    /// The families converted in #38 through #81 each carry both entry points
+    /// from one body, and until now **nothing selected the packed ones** --
+    /// `candle-core` calls only the classical `call_*`, which pass
+    /// `ParamStyle::default()`. So the packed variants were compiled, checked by
+    /// their own parity arms, and never dispatched by the model.
+    ///
+    /// This flag makes them reachable, and the digest is why it exists. Packing
+    /// moves a scalar from an inline `setBytes` into a struct field at a
+    /// computed offset, and §11.3d records that a field at the wrong offset does
+    /// not crash -- the kernel reads a well-formed number from the wrong place
+    /// and computes a plausible wrong answer. The per-family layout checks
+    /// compare `sizeof` and every offset across the language boundary; what they
+    /// cannot show is that the *whole decode path* still computes the same thing
+    /// when every family switches at once. Only the §15.1 #7 gate does that.
+    ///
+    /// Expected result is therefore **bit-identical**, not merely stable. Both
+    /// styles are instantiated from the same kernel body and differ only in how
+    /// the arguments arrive, so unlike `--attn` this changes no arithmetic: a
+    /// digest that moves here is a defect, not a variant (§2.3.5a).
+    #[arg(long, default_value = "split")]
+    param_style: String,
 }
 
 /// Follow-up prompts for multi-turn mode, cycled in order.
@@ -351,6 +376,42 @@ fn main() -> Result<()> {
         other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
     };
     println!("attention implementation: {:?}", config.attn_impl);
+
+    // The binding-style axis (issue #115). Set before any dispatch, and read
+    // back from the crate rather than echoed from `args`, so the line printed is
+    // what the kernels will actually use: an A/B behind a switch owes a check
+    // that the two arms differ in something observable (§2.4, §9.2f).
+    #[cfg(feature = "metal")]
+    {
+        use candle_metal_kernels::{default_param_style, set_default_param_style, ParamStyle};
+        let want = match args.param_style.as_str() {
+            "split" => ParamStyle::Split,
+            "packed" => ParamStyle::Packed,
+            other => anyhow::bail!("--param-style must be `split` or `packed`, got `{other}`"),
+        };
+        set_default_param_style(want);
+        let got = default_param_style();
+        // Not `assert_eq!` against `want` alone: that would pass if the setter
+        // and the getter agreed with each other while neither reached the
+        // kernels. The load-bearing evidence that this arm engaged is the
+        // kernel-name census `lfm2-dispatch-trace` prints -- every packed
+        // dispatch resolves a `*_packed` `[[host_name]]` -- and this is the
+        // cheap precondition for it.
+        anyhow::ensure!(
+            got == want,
+            "--param-style {want:?} did not take effect; default_param_style() reports {got:?}"
+        );
+        println!("param style: {got:?}");
+    }
+    // Refused rather than ignored off Metal: silently accepting `--param-style
+    // packed` on a CPU build and reporting a passing digest for the default path
+    // is #69's vacuous run exactly (§2.4).
+    #[cfg(not(feature = "metal"))]
+    anyhow::ensure!(
+        args.param_style == "split",
+        "--param-style {:?} needs the `metal` feature; this binary has no packed entry points",
+        args.param_style
+    );
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;

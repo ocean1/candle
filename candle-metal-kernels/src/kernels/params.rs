@@ -1226,13 +1226,77 @@ pub fn expected_affine_layout() -> Vec<(&'static str, u32)> {
 /// selects a `[[host_name]]` and nothing more — a compile-tier variant axis in
 /// the sense of `DESIGN.md` §7.1, alongside dtype. Keeping both is what makes
 /// the A/B free: same inputs, two pipelines, compare outputs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParamStyle {
     /// Inline constants via `setBytes`. The default and the correctness bar.
-    #[default]
     Split,
     /// One `device const Params*`, bindable by `setKernelBuffer`.
     Packed,
+}
+
+/// Whether [`ParamStyle::default`] yields `Packed` rather than `Split`.
+///
+/// `false` is `Split`, which is what shipped, so an unconfigured process is
+/// byte-for-byte what it was.
+static DEFAULT_PACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Select the style the classical entry points will use (issue #115).
+///
+/// # Why this is a process switch and not a parameter
+///
+/// Every `call_*` entry point delegates to its `call_*_with` sibling passing
+/// `ParamStyle::default()`, and `candle-core` calls only the classical ones --
+/// checked by grep, no `_with` entry point is reached from outside this crate.
+/// So the style a decode dispatch uses is decided *inside*
+/// `candle-metal-kernels`, at some thirty call sites, and there is no argument
+/// to thread down from the model.
+///
+/// That matters for the ICB path specifically. An ICB command has no `setBytes`
+/// in any form (`DESIGN.md` §3.7c), so a dispatch that binds its scalars inline
+/// cannot be encoded into one *however stable its buffers and grid are*. The
+/// arena (#68/#69) and GQA-native attention (#97) made the operands stable; they
+/// did not make the constants bindable, because nothing selects the packed entry
+/// points. This switch is what does, and without it the packed variants every
+/// family gained in #38-#81 are unreachable on the decode path.
+///
+/// # Why not edit the call sites instead
+///
+/// Passing `ParamStyle::Packed` explicitly at each `call_*` would change the
+/// kernel *every* caller gets, not just the executor's -- a default change
+/// wearing a refactor's clothes. Overriding `default()` leaves every signature
+/// and the classical behaviour exactly as they are, and moves the choice to one
+/// place an executor can set and unset. That is `HazardKey`'s shape (§9.2f) and
+/// it is chosen for the same reason: a harness that cannot select the mode
+/// cannot gate it.
+///
+/// Takes effect at the next dispatch. Call sites that pass a style explicitly
+/// are unaffected, which is what keeps the parity arms -- which name both
+/// styles -- measuring what they claim to.
+pub fn set_default_param_style(style: ParamStyle) {
+    DEFAULT_PACKED.store(
+        style == ParamStyle::Packed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The style [`ParamStyle::default`] currently yields.
+pub fn default_param_style() -> ParamStyle {
+    if DEFAULT_PACKED.load(std::sync::atomic::Ordering::Relaxed) {
+        ParamStyle::Packed
+    } else {
+        ParamStyle::Split
+    }
+}
+
+impl Default for ParamStyle {
+    /// `Split` unless [`set_default_param_style`] says otherwise.
+    ///
+    /// One relaxed load per `call_*`, on a path that already takes a mutex per
+    /// bind for hazard state -- so this is not the shape §15.2 #10 is about. It
+    /// is read once per dispatch, not once per binding.
+    fn default() -> Self {
+        default_param_style()
+    }
 }
 
 impl ParamStyle {
