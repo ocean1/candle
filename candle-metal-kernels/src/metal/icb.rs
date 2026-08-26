@@ -147,6 +147,53 @@ impl StepDispatch {
     }
 }
 
+/// How far back a command's barrier scan looks, i.e. what "ordered already"
+/// means when deciding whether this command needs a `setBarrier`.
+///
+/// This is the axis `DESIGN.md` §11.3l's open question 3 asks about. An ICB's
+/// `setBarrier` orders its command after **every** command before it in the
+/// buffer, where candle's `auto_barrier` is per hazard -- so the ICB primitive
+/// is strictly stronger and can only over-order. What was not priced is *how
+/// much*, and the answer turns on how far back the conflict scan runs rather
+/// than on the primitive's coarseness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BarrierScope {
+    /// Scan to the head of the run. Conservative, and the shipped default.
+    #[default]
+    RunStart,
+    /// Scan back only to the previous barrier in this run.
+    ///
+    /// **Measured wrong, and kept as the negative control that shows why**
+    /// (issue #115 follow-up). It halves the barrier count — 401 → 204 — and
+    /// it corrupts, which is the outcome that answers open question 3.
+    ///
+    /// The reasoning it was built on: `auto_barrier` emits one barrier and then
+    /// *replaces* `prev_outputs` with what followed it, so an edge an earlier
+    /// barrier already covers is not re-ordered. That is sound for candle and
+    /// does **not** transfer, because the two primitives are different objects:
+    ///
+    /// * `memoryBarrierWithScope` is a **fence in the stream**. It sits between
+    ///   two dispatches, so everything encoded before it is ordered against
+    ///   everything encoded after it. Clearing the pending set is therefore
+    ///   correct — the edge really is discharged for every later dispatch.
+    /// * `setBarrier` is a **property of one command**. It orders *that command*
+    ///   after the commands before it and says nothing about its successors. So
+    ///   a barrier on command `k` does not discharge an edge from `k-2` to
+    ///   `k+3`: commands `k+1..` are still concurrent with `k-2`.
+    ///
+    /// Observed on LFM2, three runs: one produced a wrong-but-valid digest
+    /// (`590dd18e…`, 8 tokens against the canonical 82), and two failed
+    /// sampling outright with *"A weight is negative, too large or not a valid
+    /// number"* — the same signature §11.3l records for replaying with no
+    /// barriers at all. **Nondeterministic across runs**, which is §3.5's
+    /// missing-edge class rather than a different arithmetic.
+    ///
+    /// Kept compiled, as #70 keeps its concurrent bump allocator, so the check
+    /// has something to reject: a test asserting the shipped scan is necessary
+    /// over a one-variant type asserts very little.
+    SinceBarrier,
+}
+
 /// Why a position is not replayed, kept so the executor can report coverage
 /// with the reasons attached rather than as a bare count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +284,8 @@ struct Inner {
     run_in_flight: usize,
     /// Dispatch index within the step being executed.
     position: usize,
+    /// How far back a barrier scan looks. See [`BarrierScope`].
+    barrier_scope: BarrierScope,
 }
 
 /// One maximal run of consecutive covered positions.
@@ -301,6 +350,16 @@ unsafe impl Sync for Plan {}
 impl IcbExecutor {
     /// Record `record_steps` decode steps, then replay what was stable.
     pub fn new(record_steps: usize) -> Arc<IcbExecutor> {
+        Self::with_barrier_scope(record_steps, BarrierScope::default())
+    }
+
+    /// As [`IcbExecutor::new`], choosing how far back a barrier scan looks.
+    ///
+    /// The axis exists so the cost of the conservative scan can be *measured*
+    /// rather than argued: both arms are built, both are gated on the digest,
+    /// and the barrier count moves between them, which is the quantity that
+    /// shows the switch engaged (§2.4, §9.2f).
+    pub fn with_barrier_scope(record_steps: usize, barrier_scope: BarrierScope) -> Arc<IcbExecutor> {
         assert!(
             record_steps >= 2,
             "recording fewer than two steps cannot distinguish a stable position from one \
@@ -319,6 +378,7 @@ impl IcbExecutor {
                 suppress_until: 0,
                 run_in_flight: 0,
                 position: 0,
+                barrier_scope,
             }),
         })
     }
@@ -548,7 +608,13 @@ impl Inner {
         let plan = if covered_positions.is_empty() {
             None
         } else {
-            Some(encode_plan(device, &steps[0], &covered_positions, n)?)
+            Some(encode_plan(
+                device,
+                &steps[0],
+                &covered_positions,
+                n,
+                self.barrier_scope,
+            )?)
         };
         self.range = plan.as_ref().map(|p| {
             Arc::new(IcbRange {
@@ -574,6 +640,7 @@ fn encode_plan(
     step: &[StepDispatch],
     covered: &[usize],
     positions: usize,
+    barrier_scope: BarrierScope,
 ) -> Result<Plan, crate::MetalKernelError> {
     // Trap 1 (§3.7d). Checked here rather than trusted, because the failure is a
     // segfault inside `setComputePipelineState:` a few lines below and there is
@@ -637,10 +704,16 @@ fn encode_plan(
     // inside it. Positions are ascending, so a run continues while the position
     // is one past the previous.
     let mut run_first_cmd = 0usize;
+    // The last command in this run that carried a barrier, for
+    // `BarrierScope::SinceBarrier`. Per run, not per buffer: a run is executed
+    // by its own `executeCommandsInBuffer`, so a barrier in an earlier run says
+    // nothing about ordering inside this one.
+    let mut last_barrier_cmd: Option<usize> = None;
 
     for (cmd_index, &pos) in covered.iter().enumerate() {
         if cmd_index > 0 && covered[cmd_index - 1] + 1 != pos {
             run_first_cmd = cmd_index;
+            last_barrier_cmd = None;
         }
         let d = &step[pos];
         // SAFETY: `cmd_index < covered.len()`, the count the ICB was created
@@ -668,9 +741,14 @@ fn encode_plan(
         //
         // `setBarrier` is one of the eleven methods §3.7c enumerates on
         // `MTLIndirectComputeCommand`, and it orders this command after every
-        // command before it in the buffer. That is coarser than candle's
-        // per-hazard barrier and strictly stronger, so it can only over-order:
-        // the cost is concurrency, and the alternative is a wrong answer.
+        // command before it in the buffer.
+        //
+        // **It is coarser than candle's barrier per command and weaker than it
+        // per stream, and the second half is what was not obvious.** #115
+        // recorded it as "strictly stronger, so it can only over-order"; that
+        // reads the coarseness and misses that the ordering attaches to one
+        // command rather than to a point in the stream. Measured: the arm that
+        // exploited the assumed transitivity corrupts (`BarrierScope`).
         //
         // Emitted only where a conflict actually exists, using the same
         // read/write/overlap test candle uses, so a run of independent
@@ -687,13 +765,45 @@ fn encode_plan(
         //
         // O(run length squared) at plan time, once -- not on the per-token path,
         // so §15.2 #10 is not engaged. Runs are 12 to 17 commands.
-        let run_start_cmd = run_first_cmd;
-        let needs_barrier = covered[run_start_cmd..cmd_index]
+        // **How far back to scan answers #115's open question 3, and the answer
+        // is that the conservative scan is not conservatism.** Both arms emit a
+        // barrier only where a conflict exists; they differ in what "already
+        // ordered" means, and measuring the difference is what showed the
+        // reduced arm to be wrong rather than cheap:
+        //
+        // * `RunStart` scans to the head of the run. Shipped, and correct.
+        // * `SinceBarrier` scans back only to the previous barrier, on the
+        //   reasoning that `auto_barrier` clears `prev_outputs` when it fires.
+        //   **401 -> 204 barriers, and it corrupts** -- see `BarrierScope`.
+        //
+        // The two primitives are not the same object, which is the whole of it.
+        // `memoryBarrierWithScope` is a *fence in the stream*: it separates
+        // everything encoded before it from everything after, so discharging
+        // the pending set is sound. `setBarrier` is a *property of one command*:
+        // it orders that command against its predecessors and says nothing
+        // about its successors, so a barrier on `k` leaves `k+1..` concurrent
+        // with everything `k` was ordered against. An edge from `k-2` to `k+3`
+        // is therefore **not** discharged by a barrier at `k`.
+        //
+        // So the 401 are not 401 redundant orderings with a cheaper equivalent
+        // available. Scanning the whole run is what the primitive requires.
+        //
+        // O(run length squared) at plan time, once -- not on the per-token path,
+        // so §15.2 #10 is not engaged. Runs are 12 to 17 commands.
+        let scan_from = match barrier_scope {
+            BarrierScope::RunStart => run_first_cmd,
+            // Everything at or before the last barrier is already ordered
+            // against this command by that barrier, exactly as candle's
+            // `prev_outputs` replacement expresses.
+            BarrierScope::SinceBarrier => last_barrier_cmd.map_or(run_first_cmd, |b| b + 1),
+        };
+        let needs_barrier = covered[scan_from..cmd_index]
             .iter()
             .any(|&earlier| d.conflicts_with(&step[earlier]));
         if needs_barrier {
             cmd.setBarrier();
             barriers += 1;
+            last_barrier_cmd = Some(cmd_index);
         }
 
         for (b, buf) in d.bindings.iter().zip(d.retained.iter()) {

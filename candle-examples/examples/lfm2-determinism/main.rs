@@ -213,6 +213,24 @@ struct Args {
     /// would gate an executor that replayed nothing.
     #[arg(long)]
     icb: bool,
+
+    /// How far back an ICB command's barrier scan looks: `run-start` or
+    /// `since-barrier`.
+    ///
+    /// `DESIGN.md` §11.3l's open question 3. `run-start` (the default, and what
+    /// #115 shipped) emits a barrier wherever a command conflicts with anything
+    /// earlier in its run. `since-barrier` scans back only to the previous
+    /// barrier, which is what candle's `auto_barrier` does -- it emits one and
+    /// then *replaces* `prev_outputs`, so an edge an earlier barrier already
+    /// covers is not re-ordered.
+    ///
+    /// Both must produce the same digest: `setBarrier` orders a command after
+    /// every command before it, so the transitive order is identical and only
+    /// the number of commands carrying the flag differs. A moved digest here is
+    /// a defect (§2.3.5a) and, per §3.5, the barrier count cannot detect one --
+    /// which is why this is gated on the digest and not on the count.
+    #[arg(long, default_value = "run-start")]
+    icb_barrier_scope: String,
 }
 
 /// Follow-up prompts for multi-turn mode, cycled in order.
@@ -571,9 +589,17 @@ fn main() -> Result<()> {
     #[cfg(feature = "metal")]
     const ICB_RECORD_STEPS: usize = 3;
     #[cfg(feature = "metal")]
-    let icb_executor = args
-        .icb
-        .then(|| candle_metal_kernels::IcbExecutor::new(ICB_RECORD_STEPS));
+    let icb_barrier_scope = match args.icb_barrier_scope.as_str() {
+        "run-start" => candle_metal_kernels::BarrierScope::RunStart,
+        "since-barrier" => candle_metal_kernels::BarrierScope::SinceBarrier,
+        other => anyhow::bail!(
+            "--icb-barrier-scope must be `run-start` or `since-barrier`, got `{other}`"
+        ),
+    };
+    #[cfg(feature = "metal")]
+    let icb_executor = args.icb.then(|| {
+        candle_metal_kernels::IcbExecutor::with_barrier_scope(ICB_RECORD_STEPS, icb_barrier_scope)
+    });
     #[cfg(feature = "metal")]
     let icb_installed_at = if args.arena { ARENA_RECORD_STEPS } else { 0 };
 
@@ -760,6 +786,16 @@ fn main() -> Result<()> {
             cov.varies,
             cov.inline_constants,
         );
+        println!("ICB barrier scope: {icb_barrier_scope:?}");
+        // Per kernel, with the reason attached, because the totals above cannot
+        // distinguish a position that became *covered* from one that merely
+        // changed which bucket excludes it. #103 gave `sdpa_vector` a packed
+        // sibling and `excluded_inline_consts` went 8 -> 0 while `covered`
+        // stayed at 433: the 8 moved to `varies`. A reader comparing only the
+        // totals would read the first half as a win and never see the second.
+        for ((kernel, reason), n) in &cov.excluded_by_kernel {
+            println!("ICB excluded {n:4} {kernel:<40} {reason}");
+        }
         anyhow::ensure!(
             exec.is_replaying() && cov.covered > 0,
             "--icb was passed but nothing was replayed ({} covered of {}), so the digest below \
