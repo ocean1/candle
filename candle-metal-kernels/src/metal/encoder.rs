@@ -1,13 +1,13 @@
 use crate::metal::{
     arena,
-    executor::{DispatchRecord, ExecutorSlot, Grid},
+    executor::{DispatchAction, DispatchRecord, ExecutorSlot, Grid},
     trace, Buffer, ComputePipeline, Fence,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
-    MTLComputeCommandEncoder, MTLSize,
+    MTLComputeCommandEncoder, MTLResourceUsage, MTLSize,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -437,11 +437,54 @@ impl ComputeCommandEncoder {
             return true;
         }
         let kernel = self.state.lock().unwrap().current_pipeline.clone();
-        self.executor.dispatch(&DispatchRecord {
+        match self.executor.dispatch_action(&DispatchRecord {
             kernel,
             grid,
             threads_per_threadgroup: threads_per_threadgroup.into(),
-        })
+        }) {
+            DispatchAction::Encode => true,
+            DispatchAction::Suppress => false,
+            DispatchAction::ExecuteIcb {
+                icb,
+                location,
+                length,
+            } => {
+                self.execute_icb_range(&icb, location, length);
+                false
+            }
+        }
+    }
+
+    /// Run `length` pre-encoded ICB commands from `location`, here.
+    ///
+    /// Called at the position where a run of replayed dispatches begins, so the
+    /// commands land between the same two classically-encoded neighbours the
+    /// originals had. `metal::icb::Run` carries why that placement is the whole
+    /// of the correctness argument.
+    fn execute_icb_range(
+        &self,
+        range: &crate::metal::executor::IcbRange,
+        location: usize,
+        length: usize,
+    ) {
+        // SAFETY: every resource an encoded command binds is in `resident` --
+        // the plan collects them as it encodes, so the set cannot fall behind
+        // the commands -- and residency has to be declared on *this* encoder,
+        // which is why it is done at every execute rather than once at install.
+        // Omitting it is silent corruption rather than an error (`DESIGN.md`
+        // §3.7), and unified memory can mask the omission.
+        unsafe {
+            for buf in &range.resident {
+                self.raw.useResource_usage(
+                    ProtocolObject::from_ref(buf.as_ref()),
+                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                );
+            }
+            self.raw.executeCommandsInBuffer_withRange(
+                &range.icb,
+                objc2_foundation::NSRange { location, length },
+            );
+        }
     }
 
     /// Attribute this dispatch to the currently bound pipeline, when profiling.

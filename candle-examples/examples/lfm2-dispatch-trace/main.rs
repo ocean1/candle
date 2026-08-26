@@ -163,6 +163,40 @@ struct Args {
     /// the A/B costs nothing.
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// How every kernel's scalars reach it: `split` (the default) or `packed`
+    /// (one `device const Params*`, issue #115).
+    ///
+    /// This is the axis that decides whether a dispatch position is
+    /// **ICB-encodable at all**, which is a different question from whether it
+    /// is *replayable*. §9.2h and §9.2i classify the stream by what varies
+    /// across steady-state steps -- identity, grid, offset -- and that is the
+    /// right axis for replay. It is not sufficient for encoding: an ICB command
+    /// has no `setBytes` in any form (§3.7c), so a position whose kernel binds
+    /// its constants inline cannot be encoded however stable it is.
+    ///
+    /// Under `packed` every dispatch that has a packed sibling resolves a
+    /// `*_packed` `[[host_name]]`, which is visible in the kernel census this
+    /// harness prints -- so the census is what shows the switch engaged, rather
+    /// than a flag being echoed back (§2.4, §9.2f).
+    #[arg(long, default_value = "split")]
+    param_style: String,
+
+    /// Replay the stable, packed subset of a decode step from an
+    /// `MTLIndirectCommandBuffer` (`DESIGN.md` §17 Phase 2 item 10, issue #115).
+    ///
+    /// Records the first few decode steps, encodes the positions that were
+    /// invariant across them, and executes those by range on later steps with
+    /// the classical dispatch suppressed. **Partial by construction**: what it
+    /// covers is reported, and what it does not is attributed to a reason rather
+    /// than left as a remainder.
+    ///
+    /// Needs `--param-style packed`, and says so rather than covering nothing:
+    /// an ICB command cannot carry an inline constant (§3.7c), so under `split`
+    /// every position is excluded and the run would report a working executor
+    /// that replayed zero dispatches.
+    #[arg(long)]
+    icb: bool,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -415,6 +449,49 @@ fn main() -> Result<()> {
     };
     println!("attention implementation: {:?}", config.attn_impl);
 
+    // The binding-style axis (issue #115), refused rather than defaulted for the
+    // same reason as the arm above. Read back from the crate rather than echoed
+    // from `args`, so the printed line is what the kernels will use.
+    {
+        use candle_metal_kernels::{default_param_style, set_default_param_style, ParamStyle};
+        let want = match args.param_style.as_str() {
+            "split" => ParamStyle::Split,
+            "packed" => ParamStyle::Packed,
+            other => anyhow::bail!("--param-style must be `split` or `packed`, got `{other}`"),
+        };
+        set_default_param_style(want);
+        let got = default_param_style();
+        anyhow::ensure!(
+            got == want,
+            "--param-style {want:?} did not take effect; default_param_style() reports {got:?}"
+        );
+        println!("param style: {got:?}");
+    }
+
+    // ICB replay (issue #115). Both switches have to be thrown *here*, before
+    // the first pipeline is built:
+    //
+    // * `supportIndirectCommandBuffers` is a property of a pipeline and
+    //   pipelines are cached per process, so one built earlier keeps the old
+    //   setting -- and encoding that into an ICB is §3.7d's segfault at encode
+    //   time, with no error to catch. `set_pipelines_support_icb` refuses to
+    //   change under an existing pipeline rather than flipping and hoping.
+    // * the constants pool has to be serving before the recorded steps run, or
+    //   the params buffer is a fresh allocation per dispatch and every packed
+    //   position varies (§11.3d).
+    if args.icb {
+        anyhow::ensure!(
+            args.param_style == "packed",
+            "--icb needs --param-style packed: an ICB command cannot carry an inline constant \
+             (DESIGN.md §3.7c), so under `split` every position is excluded and the run would \
+             report a working executor that replayed nothing"
+        );
+        candle_metal_kernels::set_pipelines_support_icb(true)
+            .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
+        candle_metal_kernels::set_constants_pool_enabled(true);
+        println!("icb: enabled (pipelines support ICBs, constants pooled)");
+    }
+
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
 
@@ -573,6 +650,29 @@ fn main() -> Result<()> {
     // the pool, since the arena does not exist until its plan does.
     let record_steps = 2usize;
 
+    // Steps the ICB executor records before deciding what is replayable.
+    //
+    // Three rather than the minimum of two: a position that happens to agree
+    // between two consecutive steps but drifts on the third would be admitted by
+    // a two-step window, and admitting one wrongly is silent corruption under
+    // `HazardTrackingModeUntracked` (§3.5) rather than a visible failure. Three
+    // is cheap -- the cost is three classically-dispatched steps at the head of
+    // the run, which are not measured anyway.
+    const ICB_RECORD_STEPS: usize = 3;
+
+    // The ICB executor records *after* the arena is installed, when one is.
+    //
+    // Recording earlier would capture the pool's buffer identities, which vary
+    // per step by construction -- so every position would be excluded as
+    // `varies` and the run would report zero coverage for a reason that has
+    // nothing to do with the executor. The arena is what makes identity stable
+    // (§9.2c), so it has to be in place before there is anything worth
+    // recording.
+    let icb_executor = args
+        .icb
+        .then(|| candle_metal_kernels::IcbExecutor::new(ICB_RECORD_STEPS));
+    let icb_installed_at = if args.arena { record_steps } else { 0 };
+
     let mut tokens: Vec<u32> = Vec::new();
     for step in 0..args.n {
         let next = logits_processor.sample(&logits).context("sampling")?;
@@ -605,6 +705,15 @@ fn main() -> Result<()> {
             dev.begin_decode_step();
         }
 
+        // Install once, at the first step whose operands are stable.
+        if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+            if step == icb_installed_at {
+                dev.set_executor(std::sync::Arc::new(
+                    candle_metal_kernels::metal::ExecutorSlot::Custom(exec.clone()),
+                ));
+            }
+        }
+
         let label = format!("decode[{step}] kv_len={kv_len}");
         trace::set_region(Some(label.clone()));
         trace::set_recording(true);
@@ -614,6 +723,28 @@ fn main() -> Result<()> {
             .squeeze(0)?;
         trace_window(&device)?;
         trace::set_recording(false);
+
+        // Close the ICB step here: after the forward pass has drained and
+        // *before* the next iteration samples, so an ICB step is exactly the
+        // traced forward pass and nothing else.
+        //
+        // The placement is load-bearing and the obvious alternatives are both
+        // wrong. Closing at the top of the loop puts the previous iteration's
+        // `logits_processor.sample` inside the window -- measured, that made a
+        // step 556 dispatches against another's 554, because sampling adds a
+        // `softmax_f32` and an `affine_f32`. Positions are compared by index, so
+        // a two-dispatch shift pairs unrelated dispatches and *every* position
+        // reads as varying: the run reported 548 of 556 excluded as `varies`,
+        // for kernels the same trace classifies as stable. The executor's own
+        // dispatch-count guard is what turned the first form into an error
+        // rather than a plausible zero-coverage result, and the second form is
+        // what the count alone would not have caught.
+        if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+            if step >= icb_installed_at {
+                exec.end_step(dev.metal_device())
+                    .map_err(|e| anyhow::anyhow!("closing ICB step {step}: {e}"))?;
+            }
+        }
 
         if let (true, Some(dev)) = (args.arena, metal_device.as_ref()) {
             dev.end_decode_step();
@@ -976,6 +1107,59 @@ fn main() -> Result<()> {
         }
         std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
         println!("full trace written to {}", path.display());
+    }
+
+    // What the ICB executor covered, with the exclusions attributed.
+    //
+    // A bare count would not be reportable: "431 of 554" says nothing about
+    // *why* the rest were left, and §9.2h's lesson is that the reason decides
+    // which phase removes them. An exclusion for `inline-constants` is §3.7c and
+    // wants a packed sibling; one for `varies` is §6.2's population and wants
+    // in-place KV append or indirect dispatch. They are different work.
+    if let Some(exec) = icb_executor.as_ref() {
+        let cov = exec.coverage();
+        println!("\n== icb replay ==");
+        println!("replaying:                {}", exec.is_replaying());
+        println!("positions per decode step: {}", cov.positions);
+        println!(
+            "covered:                  {} ({:.1} %)",
+            cov.covered,
+            if cov.positions == 0 {
+                0.0
+            } else {
+                100.0 * cov.covered as f64 / cov.positions as f64
+            }
+        );
+        println!("execute calls per step:   {} (one per run)", exec.runs());
+        println!("excluded, varies:         {}", cov.varies);
+        println!("excluded, inline consts:  {}", cov.inline_constants);
+        println!("excluded, no pipeline:    {}", cov.no_pipeline);
+        // Zero is the expected value. Nonzero means a replayed position stopped
+        // matching its recording mid-run, so coverage is lower than the plan
+        // claims and the figure above overstates what ran.
+        println!("stale positions:          {}", exec.stale_positions());
+        println!("poisoned runs:            {}", exec.poisoned_runs());
+        // One is expected: the window opened at install time is partial.
+        println!("discarded windows:        {}", exec.discarded_windows());
+        // The ordering auto_barrier would have emitted between replayed
+        // dispatches, re-expressed on the commands themselves.
+        println!("barriers encoded in icb:  {}", exec.encoded_barriers());
+        if !cov.covered_by_kernel.is_empty() {
+            println!("  covered, by kernel:");
+            let mut rows: Vec<_> = cov.covered_by_kernel.iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(a.1));
+            for (name, n) in rows {
+                println!("    {n:5}  {name}");
+            }
+        }
+        if !cov.excluded_by_kernel.is_empty() {
+            println!("  excluded, by kernel and reason:");
+            let mut rows: Vec<_> = cov.excluded_by_kernel.iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(a.1));
+            for ((name, reason), n) in rows {
+                println!("    {n:5}  {name:<48} {reason}");
+            }
+        }
     }
 
     // The token stream, so two runs can be compared by *what they computed*

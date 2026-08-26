@@ -29,6 +29,52 @@ pub enum MetalDeviceType {
     Medium,
 }
 
+/// Whether new pipelines are built with `supportIndirectCommandBuffers`.
+static PIPELINES_SUPPORT_ICB: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any pipeline has been built yet, so the switch above can refuse to
+/// change under one.
+static ANY_PIPELINE_BUILT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Build subsequent pipelines with `supportIndirectCommandBuffers` (issue #115).
+///
+/// Must be called before any pipeline is built. `Kernels` caches pipelines per
+/// `(Source, name, constants)` and hands the cached one back forever, so a
+/// pipeline created before this switch is set stays unsupported for the life of
+/// the process -- and encoding *that* into an ICB is §3.7d's segfault, at encode
+/// time, with no error to catch. Returns an error rather than flipping the
+/// switch and hoping, because "the flag was set but some pipelines predate it"
+/// is indistinguishable from success until the crash.
+pub fn set_pipelines_support_icb(enabled: bool) -> Result<(), MetalKernelError> {
+    use std::sync::atomic::Ordering;
+    if ANY_PIPELINE_BUILT.load(Ordering::Relaxed)
+        && PIPELINES_SUPPORT_ICB.load(Ordering::Relaxed) != enabled
+    {
+        return Err(MetalKernelError::FailedToCreatePipeline(
+            "supportIndirectCommandBuffers must be selected before any pipeline is built: \
+             pipelines are cached per (Source, name, constants) and the ones already built \
+             would keep the old setting, which is DESIGN.md §3.7d's segfault rather than a \
+             wrong answer"
+                .to_string(),
+        ));
+    }
+    PIPELINES_SUPPORT_ICB.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Whether new pipelines will carry `supportIndirectCommandBuffers`.
+pub fn pipelines_support_icb() -> bool {
+    PIPELINES_SUPPORT_ICB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record that a pipeline exists, so [`set_pipelines_support_icb`] can refuse to
+/// change afterwards.
+pub(crate) fn note_pipeline_built() {
+    ANY_PIPELINE_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[derive(Clone, Debug)]
 pub struct Device {
     raw: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -118,9 +164,54 @@ impl Device {
         &self,
         function: &Function,
     ) -> Result<ComputePipeline, MetalKernelError> {
+        note_pipeline_built();
+        if pipelines_support_icb() {
+            return self.new_compute_pipeline_state_supporting_icb(function);
+        }
         let raw = self
             .as_ref()
             .newComputePipelineStateWithFunction_error(function.as_ref())
+            .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
+        Ok(ComputePipeline::new(raw))
+    }
+
+    /// As above, but built through a descriptor with
+    /// `supportIndirectCommandBuffers` set.
+    ///
+    /// # Why this is not simply always on
+    ///
+    /// The flag is a property of the *pipeline*, so it has to be decided when
+    /// the pipeline is built, which is long before anyone knows whether a given
+    /// kernel will be encoded into an ICB. Setting it unconditionally would
+    /// change every pipeline in every process on the strength of an opt-in path
+    /// nothing takes by default, and Apple documents it as a constraint the
+    /// compiler may honour by generating different code. So it follows the same
+    /// discipline as every other axis here: off unless asked for.
+    ///
+    /// # Why forgetting it is not a graceful failure
+    ///
+    /// `DESIGN.md` §3.7d, measured on this machine: a pipeline without the flag,
+    /// encoded into an ICB by the CPU-side route this executor uses, **segfaults
+    /// inside `setComputePipelineState:`** at encode time. Issue #32 originally
+    /// recorded it as silent all-zero output; #35 measured otherwise, and the
+    /// GPU-side route hangs the device instead. None of the three is an error
+    /// return, so there is nothing to propagate and no test that can survive
+    /// getting this wrong -- which is why the ICB executor refuses to install
+    /// unless this switch was set before any pipeline was built.
+    fn new_compute_pipeline_state_supporting_icb(
+        &self,
+        function: &Function,
+    ) -> Result<ComputePipeline, MetalKernelError> {
+        let desc = objc2_metal::MTLComputePipelineDescriptor::new();
+        desc.setComputeFunction(Some(function.as_ref()));
+        desc.setSupportIndirectCommandBuffers(true);
+        let raw = self
+            .as_ref()
+            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                &desc,
+                objc2_metal::MTLPipelineOption::None,
+                None,
+            )
             .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
         Ok(ComputePipeline::new(raw))
     }
