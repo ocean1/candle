@@ -558,6 +558,219 @@ pub fn expected_conv_layout() -> Vec<(&'static str, u32)> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// `indexing.metal` (issue #81).
+//
+// Five families, 28 `constant &` parameters across five kernel signatures. The
+// last decode-path family to carry both styles: `is_u32_f16` is the LFM2
+// embedding lookup, one dispatch per token (`DESIGN.md` §11.3h).
+//
+// **This is the family where the `bool` hazard fires.** `DESIGN.md` §11.3b
+// names two layout hazards -- vector types over-aligning, and `bool` at 1 byte
+// -- and #40 recorded the second as not firing in any of the four elementwise
+// families, checked by enumerating their parameters rather than assumed.
+// `index` takes a `constant bool &contiguous` between five `size_t` and a
+// sixth, so [`IndexParams`] is **56 bytes where its fields sum to 49**, with
+// seven bytes of padding after the `bool`. `conv.metal`'s
+// `UpsampleBilinear2dParams` is the only other struct in the crate with a
+// `bool` in it, and it is off the decode path entirely.
+//
+// A width mismatch of the kind #38 found (`usize` bound to a `constant uint &`,
+// benign under `setBytes` and wrong once packed) **does not occur here**,
+// checked rather than assumed: `indexing.metal` declares 29 `constant size_t &`
+// and one `constant bool &`, `indexing.rs` binds `usize` and `bool`
+// respectively, and there is no `uint` in the file. The `()` hazard #41 found
+// -- an unbound argument consuming no slot and shifting every later binding --
+// does not occur either: none of the four `call_*` passes `()`.
+//
+// Field order mirrors each kernel's classical argument list exactly. That is
+// load-bearing rather than stylistic: the packed block is built by letting the
+// existing `set_params!` call run and diverting each scalar as it passes, so a
+// struct whose order differs from the argument list would silently misread
+// every field after the first divergence.
+// ---------------------------------------------------------------------------
+
+/// Scalars bound by `index` — `index_select`, and the family containing
+/// `is_u32_f16`, the LFM2 embedding lookup.
+///
+/// **56 bytes, not 49.** `contiguous` is a `bool` at offset 40 and
+/// `src_num_dims` is a `size_t`, so it cannot start until 48. Neither number is
+/// obvious by inspection, which is the argument for shipping them across the
+/// boundary rather than asserting them on each side.
+///
+/// `src_dims` and `src_strides` are deliberately absent: their length is a
+/// property of the tensor's layout, not of the struct, so they stay separate
+/// bindings. An ICB can express that — `setKernelBuffer` binds a buffer of any
+/// length — since the constraint is `setBytes`, not buffer count (`DESIGN.md`
+/// §11.3d).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexParams {
+    pub dst_size: u64,
+    pub left_size: u64,
+    pub src_dim_size: u64,
+    pub right_size: u64,
+    pub ids_size: u64,
+    pub contiguous: bool,
+    pub src_num_dims: u64,
+}
+
+/// Scalars bound by `gather`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatherParams {
+    pub dst_size: u64,
+    pub left_size: u64,
+    pub src_dim_size: u64,
+    pub right_size: u64,
+    pub ids_size: u64,
+}
+
+/// Scalars bound by `scatter` and `scatter_add`.
+///
+/// One struct for both because they bind the same five scalars; they differ in
+/// whether the destination is assigned or accumulated into, which is the kernel
+/// body rather than the binding. The same reasoning as [`NormParams`] serving
+/// both norms and [`Pool2dParams`] serving both pools.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScatterParams {
+    pub dst_size: u64,
+    pub left_size: u64,
+    pub src_dim_size: u64,
+    pub right_size: u64,
+    pub dst_dim_size: u64,
+}
+
+/// Scalars bound by `index_add`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexAddParams {
+    pub dst_size: u64,
+    pub left_size: u64,
+    pub src_dim_size: u64,
+    pub right_size: u64,
+    pub dst_dim_size: u64,
+    pub ids_dim_size: u64,
+}
+
+/// The kernel in `indexing.metal` that reports the device-side layout.
+pub const INDEXING_LAYOUT_KERNEL: &str = "indexing_params_layout";
+
+/// What each slot of [`INDEXING_LAYOUT_KERNEL`]'s output means, and what Rust
+/// computes for it.
+///
+/// As [`expected_reduce_layout`], for `indexing.metal`. The interesting rows
+/// are [`IndexParams`]'s: `contiguous` at 40 and `src_num_dims` at 48 with a
+/// `sizeof` of 56, which is the padding rule rather than any field width.
+pub fn expected_indexing_layout() -> Vec<(&'static str, u32)> {
+    use core::mem::{align_of, offset_of, size_of};
+
+    debug_assert_eq!(align_of::<IndexParams>(), 8);
+    debug_assert_eq!(align_of::<GatherParams>(), 8);
+    debug_assert_eq!(align_of::<ScatterParams>(), 8);
+    debug_assert_eq!(align_of::<IndexAddParams>(), 8);
+
+    vec![
+        ("sizeof(IndexParams)", size_of::<IndexParams>() as u32),
+        (
+            "IndexParams.dst_size",
+            offset_of!(IndexParams, dst_size) as u32,
+        ),
+        (
+            "IndexParams.left_size",
+            offset_of!(IndexParams, left_size) as u32,
+        ),
+        (
+            "IndexParams.src_dim_size",
+            offset_of!(IndexParams, src_dim_size) as u32,
+        ),
+        (
+            "IndexParams.right_size",
+            offset_of!(IndexParams, right_size) as u32,
+        ),
+        (
+            "IndexParams.ids_size",
+            offset_of!(IndexParams, ids_size) as u32,
+        ),
+        (
+            "IndexParams.contiguous",
+            offset_of!(IndexParams, contiguous) as u32,
+        ),
+        (
+            "IndexParams.src_num_dims",
+            offset_of!(IndexParams, src_num_dims) as u32,
+        ),
+        ("sizeof(GatherParams)", size_of::<GatherParams>() as u32),
+        (
+            "GatherParams.dst_size",
+            offset_of!(GatherParams, dst_size) as u32,
+        ),
+        (
+            "GatherParams.left_size",
+            offset_of!(GatherParams, left_size) as u32,
+        ),
+        (
+            "GatherParams.src_dim_size",
+            offset_of!(GatherParams, src_dim_size) as u32,
+        ),
+        (
+            "GatherParams.right_size",
+            offset_of!(GatherParams, right_size) as u32,
+        ),
+        (
+            "GatherParams.ids_size",
+            offset_of!(GatherParams, ids_size) as u32,
+        ),
+        ("sizeof(ScatterParams)", size_of::<ScatterParams>() as u32),
+        (
+            "ScatterParams.dst_size",
+            offset_of!(ScatterParams, dst_size) as u32,
+        ),
+        (
+            "ScatterParams.left_size",
+            offset_of!(ScatterParams, left_size) as u32,
+        ),
+        (
+            "ScatterParams.src_dim_size",
+            offset_of!(ScatterParams, src_dim_size) as u32,
+        ),
+        (
+            "ScatterParams.right_size",
+            offset_of!(ScatterParams, right_size) as u32,
+        ),
+        (
+            "ScatterParams.dst_dim_size",
+            offset_of!(ScatterParams, dst_dim_size) as u32,
+        ),
+        ("sizeof(IndexAddParams)", size_of::<IndexAddParams>() as u32),
+        (
+            "IndexAddParams.dst_size",
+            offset_of!(IndexAddParams, dst_size) as u32,
+        ),
+        (
+            "IndexAddParams.left_size",
+            offset_of!(IndexAddParams, left_size) as u32,
+        ),
+        (
+            "IndexAddParams.src_dim_size",
+            offset_of!(IndexAddParams, src_dim_size) as u32,
+        ),
+        (
+            "IndexAddParams.right_size",
+            offset_of!(IndexAddParams, right_size) as u32,
+        ),
+        (
+            "IndexAddParams.dst_dim_size",
+            offset_of!(IndexAddParams, dst_dim_size) as u32,
+        ),
+        (
+            "IndexAddParams.ids_dim_size",
+            offset_of!(IndexAddParams, ids_dim_size) as u32,
+        ),
+    ]
+}
+
 /// The kernel in `reduce.metal` that reports the device-side layout.
 pub const REDUCE_LAYOUT_KERNEL: &str = "reduce_params_layout";
 
@@ -1217,6 +1430,9 @@ pub enum LayoutFamily {
     Gemv,
     /// `conv.metal` — issue #42. The mixed-width structs.
     Conv,
+    /// `indexing.metal` — issue #81. The last decode-path family, and the one
+    /// where the `bool` hazard §11.3b names finally fires.
+    Indexing,
 }
 
 /// Everything the layout check needs to know about one family.
@@ -1265,6 +1481,7 @@ impl LayoutFamily {
         LayoutFamily::Affine,
         LayoutFamily::Gemv,
         LayoutFamily::Conv,
+        LayoutFamily::Indexing,
     ];
 
     /// The name of the `.metal` file this family lives in, for error messages.
@@ -1277,6 +1494,7 @@ impl LayoutFamily {
             LayoutFamily::Affine => "affine.metal",
             LayoutFamily::Gemv => "gemv.metal",
             LayoutFamily::Conv => "conv.metal",
+            LayoutFamily::Indexing => "indexing.metal",
         }
     }
 
@@ -1322,6 +1540,11 @@ impl LayoutFamily {
                 crate::Source::Conv,
                 CONV_LAYOUT_KERNEL,
                 expected_conv_layout(),
+            ),
+            LayoutFamily::Indexing => (
+                crate::Source::Indexing,
+                INDEXING_LAYOUT_KERNEL,
+                expected_indexing_layout(),
             ),
         };
         LayoutDescriptor {

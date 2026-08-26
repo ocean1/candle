@@ -3000,8 +3000,8 @@ fn every_parity_arm_routes_through_the_helper() {
     // failure too -- the same argument `packed_names_resolve` makes for
     // checking 90 rather than "some".
     assert_eq!(
-        arms, 30,
-        "expected 30 parity arms, found {arms}; if a family was added or \
+        arms, 36,
+        "expected 36 parity arms, found {arms}; if a family was added or \
          removed, update this count deliberately rather than relaxing it"
     );
 }
@@ -5091,6 +5091,7 @@ fn every_family_params_layout_matches_metal() {
         ("affine.metal", 16),
         ("gemv.metal", 8),
         ("conv.metal", 65),
+        ("indexing.metal", 27),
     ];
 
     let mut failures = Vec::new();
@@ -5135,8 +5136,8 @@ fn every_family_params_layout_matches_metal() {
     assert_eq!(
         observed,
         EXPECTED_SLOTS.to_vec(),
-        "family or slot count changed. Seven families and their slot counts were \
-         the state at issue #58; update this only alongside a deliberate addition."
+        "family or slot count changed. Eight families and their slot counts are \
+         the state at issue #81; update this only alongside a deliberate addition."
     );
 }
 
@@ -5166,6 +5167,7 @@ fn layout_registry_covers_every_family() {
             LayoutFamily::Affine => "affine",
             LayoutFamily::Gemv => "gemv",
             LayoutFamily::Conv => "conv",
+            LayoutFamily::Indexing => "indexing",
         }
     }
 
@@ -5177,6 +5179,7 @@ fn layout_registry_covers_every_family() {
         LayoutFamily::Affine,
         LayoutFamily::Gemv,
         LayoutFamily::Conv,
+        LayoutFamily::Indexing,
     ];
 
     for family in expected {
@@ -5393,5 +5396,481 @@ fn indexing_undeclared_pair_has_no_name() {
     assert_eq!(
         IndexingKernel::INDEX_SELECT.name("i64", "u32"),
         Some("is_i64_u32")
+    );
+}
+
+/// Every classical indexing name has a `_packed` counterpart in the compiled
+/// library.
+///
+/// The same argument as `packed_names_resolve` and `conv_packed_names_resolve`:
+/// an absent instantiation is not a compile error on either side, and the first
+/// symptom would be a `LoadFunctionError` inside a forward pass. This family in
+/// particular has already shipped exactly that — `is_i64_u8` and `is_i64_u32`
+/// were named by `candle-core` and declared nowhere until #64 (`DESIGN.md`
+/// §8.1e), which is the fourth firing of the class §8.1b tracks.
+#[test]
+fn indexing_packed_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let mut checked = 0usize;
+    for family in IndexingKernel::ALL {
+        for ((index_suffix, value_suffix), name) in family.variants() {
+            let packed = crate::kernels::params::packed_name(name);
+            kernels
+                .load_pipeline(&device, Source::Indexing, packed.clone())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "indexing.metal has no kernel named {packed:?} \
+                         (the packed form of {name:?}, IndexingKernel::{} for \
+                         ({index_suffix:?}, {value_suffix:?})): {e:?}",
+                        family.stem(),
+                    )
+                });
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked, 72,
+        "expected a packed counterpart for all 72 declared indexing variants, \
+         found {checked}"
+    );
+}
+
+/// `is_u32_f16` — the LFM2 embedding lookup, and the whole reason this family
+/// is on the ICB path at all (`DESIGN.md` §11.2: 1 dispatch of 674 per token).
+///
+/// Bit-identical rather than approximately equal, for the reason every other
+/// family's arms give: the two entry points come from one body, so any
+/// difference means the binding style changed what the kernel computed.
+///
+/// The **contiguous** arm, which is the one LFM2 takes.
+#[test]
+fn indexing_packed_matches_split_for_index_select() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // [8, 4] source, six ids: dst is 6 x 4. Values vary per element so the
+    // non-vacuity guard in `assert_packed_matches_split` has something to see.
+    let (rows, cols) = (8usize, 4usize);
+    let src: Vec<f16> = (0..rows * cols)
+        .map(|i| f16::from_f32(((i * 37 % 71) as f32 - 35.0) / 9.0))
+        .collect();
+    let ids: Vec<u32> = vec![5, 0, 7, 2, 2, 6];
+    let shape = vec![rows, cols];
+    let strides = vec![cols, 1];
+    let dst_el = ids.len() * cols;
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let ids_buf = new_buffer(&device, &ids);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_index_select_with(
+            &device,
+            &encoder,
+            &kernels,
+            "is_u32_f16",
+            &shape,
+            ids.len(),
+            0,
+            true,
+            &shape,
+            &strides,
+            BufferOffset::zero_offset(&src_buf),
+            BufferOffset::zero_offset(&ids_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f16>(&output, dst_el));
+    }
+    assert_packed_matches_split("is_u32_f16", &outs[0], &outs[1]);
+}
+
+/// `is_u32_f32` on a **strided** source — the arm that reads `src_num_dims`,
+/// `src_dims` and `src_strides`.
+///
+/// A second `index_select` arm rather than a redundant one, because the
+/// contiguous arm above never reaches any of those three: it takes the
+/// `contiguous ? src_i` fast path and the two arrays are bound but unread. So
+/// this is the arm that would catch a packed struct whose `contiguous` or
+/// `src_num_dims` landed at the wrong offset — which is precisely where this
+/// family's padding is (`DESIGN.md` §11.3b's `bool` hazard, firing here for the
+/// first time).
+///
+/// The layout is rank 3 with `rank != dims[dim]`, the shape #82's fix is about.
+#[test]
+fn indexing_packed_matches_split_for_index_select_strided() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // A [2, 3, 5] source read through a transposed layout, so `src_strides` is
+    // not the contiguous one and the strided arm genuinely differs from the
+    // fast path. rank 3, dims[0] = 2 -- `rank != dims[dim]`.
+    let dims = vec![2usize, 3, 5];
+    let n = dims.iter().product::<usize>();
+    let src: Vec<f32> = (0..n)
+        .map(|i| ((i * 53 % 97) as f32 - 48.0) / 7.0)
+        .collect();
+    // Strides of a [5, 3, 2] tensor viewed as [2, 3, 5] -- i.e. reversed.
+    let strides = vec![1usize, 2, 6];
+    let ids: Vec<u32> = vec![1, 0, 1, 1, 0];
+    let dim = 0usize;
+    let right_size: usize = dims[dim + 1..].iter().product();
+    let left_size: usize = dims[..dim].iter().product();
+    let dst_el = ids.len() * left_size * right_size;
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let ids_buf = new_buffer(&device, &ids);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_index_select_with(
+            &device,
+            &encoder,
+            &kernels,
+            "is_u32_f32",
+            &dims,
+            ids.len(),
+            dim,
+            false,
+            &dims,
+            &strides,
+            BufferOffset::zero_offset(&src_buf),
+            BufferOffset::zero_offset(&ids_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_packed_matches_split("is_u32_f32 (strided)", &outs[0], &outs[1]);
+}
+
+/// `gather_u32_f32`.
+#[test]
+fn indexing_packed_matches_split_for_gather() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (rows, cols) = (4usize, 6usize);
+    let src: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i * 31 % 89) as f32 - 44.0) / 5.0)
+        .collect();
+    // gather's ids are dst-shaped: one index per output element.
+    let ids: Vec<u32> = (0..rows * cols).map(|i| ((i * 7) % cols) as u32).collect();
+    let shape = vec![rows, cols];
+    let dst_el = ids.len();
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let ids_buf = new_buffer(&device, &ids);
+        let output = device
+            .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+            .unwrap();
+        call_gather_with(
+            &device,
+            &encoder,
+            &kernels,
+            "gather_u32_f32",
+            &shape,
+            cols,
+            1,
+            BufferOffset::zero_offset(&src_buf),
+            BufferOffset::zero_offset(&ids_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_packed_matches_split("gather_u32_f32", &outs[0], &outs[1]);
+}
+
+/// `s_u32_f32` — `scatter`, which **assigns**.
+///
+/// Its sibling `sa_u32_f32` accumulates and is the arm below; they share
+/// `ScatterParams`, so both are checked rather than one standing in for the
+/// other. A struct shared by two kernels is exactly the case where a parity arm
+/// on one leaves the other unproven.
+#[test]
+fn indexing_packed_matches_split_for_scatter() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (rows, src_cols, dst_cols) = (3usize, 4usize, 6usize);
+    let src: Vec<f32> = (0..rows * src_cols)
+        .map(|i| ((i * 41 % 83) as f32 - 41.0) / 6.0)
+        .collect();
+    let ids: Vec<u32> = (0..rows * src_cols)
+        .map(|i| ((i * 5) % dst_cols) as u32)
+        .collect();
+    let src_shape = vec![rows, src_cols];
+    let dst_shape = vec![rows, dst_cols];
+    let dst_el = rows * dst_cols;
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let ids_buf = new_buffer(&device, &ids);
+        // Seeded rather than zeroed: `scatter` writes only the destinations the
+        // ids name, so a zeroed output would leave the untouched elements at 0
+        // on both arms and prove nothing about them.
+        let seed: Vec<f32> = (0..dst_el).map(|i| (i as f32) * -0.25 - 1.0).collect();
+        let output = new_buffer(&device, &seed);
+        call_scatter_with(
+            &device,
+            &encoder,
+            &kernels,
+            "s_u32_f32",
+            &src_shape,
+            &dst_shape,
+            1,
+            BufferOffset::zero_offset(&src_buf),
+            BufferOffset::zero_offset(&ids_buf),
+            BufferOffset::zero_offset(&output),
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_packed_matches_split("s_u32_f32", &outs[0], &outs[1]);
+}
+
+/// `sa_u32_f32` — `scatter_add`, which **accumulates**.
+///
+/// Shares [`crate::ScatterParams`] with `scatter` above; see that arm's note on
+/// why both are checked.
+#[test]
+fn indexing_packed_matches_split_for_scatter_add() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (rows, src_cols, dst_cols) = (3usize, 4usize, 6usize);
+    let src: Vec<f32> = (0..rows * src_cols)
+        .map(|i| ((i * 43 % 79) as f32 - 39.0) / 4.0)
+        .collect();
+    // Repeats on purpose: two src elements landing on one destination is what
+    // makes `+=` differ from `=`, so this arm exercises the accumulation.
+    let ids: Vec<u32> = (0..rows * src_cols)
+        .map(|i| ((i * 2) % dst_cols) as u32)
+        .collect();
+    let src_shape = vec![rows, src_cols];
+    let dst_shape = vec![rows, dst_cols];
+    let dst_el = rows * dst_cols;
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let ids_buf = new_buffer(&device, &ids);
+        let seed: Vec<f32> = (0..dst_el).map(|i| (i as f32) * 0.5 + 2.0).collect();
+        let output = new_buffer(&device, &seed);
+        call_scatter_with(
+            &device,
+            &encoder,
+            &kernels,
+            "sa_u32_f32",
+            &src_shape,
+            &dst_shape,
+            1,
+            BufferOffset::zero_offset(&src_buf),
+            BufferOffset::zero_offset(&ids_buf),
+            BufferOffset::zero_offset(&output),
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_packed_matches_split("sa_u32_f32", &outs[0], &outs[1]);
+}
+
+/// `ia_u32_f32` — `index_add`, the sixth-scalar family.
+///
+/// [`crate::IndexAddParams`] is the only indexing struct with six fields, so
+/// this is the arm that would catch `ids_dim_size` landing at the wrong offset.
+#[test]
+fn indexing_packed_matches_split_for_index_add() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (rows, src_cols, dst_cols) = (3usize, 4usize, 6usize);
+    let src: Vec<f32> = (0..rows * src_cols)
+        .map(|i| ((i * 47 % 73) as f32 - 36.0) / 3.0)
+        .collect();
+    // index_add's ids are one-dimensional: one destination index per source
+    // column, read as `input_ids[j]` for j in 0..ids_dim_size.
+    let ids: Vec<u32> = vec![4, 1, 1, 5];
+    let src_shape = vec![rows, src_cols];
+    let dst_shape = vec![rows, dst_cols];
+    let ids_shape = vec![ids.len()];
+    let dst_el = rows * dst_cols;
+
+    let mut outs = Vec::new();
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let src_buf = new_buffer(&device, &src);
+        let ids_buf = new_buffer(&device, &ids);
+        let seed: Vec<f32> = (0..dst_el).map(|i| (i as f32) * 0.75 - 3.0).collect();
+        let output = new_buffer(&device, &seed);
+        call_index_add_with(
+            &device,
+            &encoder,
+            &kernels,
+            "ia_u32_f32",
+            &src_shape,
+            &dst_shape,
+            &ids_shape,
+            1,
+            BufferOffset::zero_offset(&src_buf),
+            BufferOffset::zero_offset(&ids_buf),
+            &output,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        outs.push(read_to_vec::<f32>(&output, dst_el));
+    }
+    assert_packed_matches_split("ia_u32_f32", &outs[0], &outs[1]);
+}
+
+/// The indexing layout check must be able to fail, and must fail on *the silent
+/// case*.
+///
+/// `DESIGN.md` §15.1 #1 and `CONTRIBUTING.md` §3.1 #2: a test that cannot fail
+/// is not a test. Applied to **production source** — `crate::source::INDEXING`
+/// is the `include_str!`'d text the GPU is actually asked to compile, not a
+/// copy written for the test.
+///
+/// The mutation **swaps `IndexParams.dst_size` and `.left_size`**, two adjacent
+/// `size_t`. That case is chosen over inserting or removing a field because it
+/// is the one nothing else catches:
+///
+/// * `sizeof` is unchanged at 56, so the `static_assert` in `indexing.metal`
+///   still passes;
+/// * both fields are `size_t`, so the brace initializer in the classical
+///   wrapper still type-checks — inserting a field of a *different* type is
+///   rejected by C++11 narrowing before it ever reaches a GPU, which is a real
+///   layer of defence but not this one;
+/// * the kernel runs and bounds-checks against the wrong number, producing a
+///   plausible wrong answer rather than a crash.
+///
+/// This is `DESIGN.md` §8.1c's warning about `im2col`'s eight consecutive
+/// `constant size_t` parameters, in the family that has five.
+#[test]
+fn indexing_params_layout_check_detects_a_moved_field() {
+    use crate::kernels::params::LayoutFamily;
+
+    let descriptor = LayoutFamily::Indexing.descriptor();
+    let pipeline = mutated_layout_pipeline(
+        crate::source::INDEXING,
+        "struct IndexParams {\n    size_t dst_size;\n    size_t left_size;",
+        "struct IndexParams {\n    size_t left_size;\n    size_t dst_size;",
+        descriptor.kernel,
+    );
+    let d = layout_disagreements(&pipeline, &descriptor.expected);
+
+    assert!(
+        d.iter().any(|x| x.starts_with("IndexParams.dst_size")),
+        "swapping dst_size must be reported; got {d:?}"
+    );
+    assert!(
+        d.iter().any(|x| x.starts_with("IndexParams.left_size")),
+        "swapping left_size must be reported; got {d:?}"
+    );
+    assert!(
+        !d.iter().any(|x| x.starts_with("sizeof(IndexParams)")),
+        "the swap must not change sizeof, or it is not the silent case; got {d:?}"
+    );
+}
+
+/// Moving the `bool` in [`crate::IndexParams`] is rejected at compile time —
+/// and **not by the check this test was written expecting**.
+///
+/// This is the second mutation rather than a duplicate of the one above, and it
+/// documents a defence the other converted families cannot demonstrate because
+/// none of their structs has a `bool` on a path a test reaches. #40 recorded
+/// the `bool` hazard as "real for a future family; absent here"; this is that
+/// family.
+///
+/// # What was expected, and what happens
+///
+/// Moving `contiguous` from between two `size_t` to the end changes
+/// `sizeof(IndexParams)` from 56 to 48, so the expectation was that
+/// `indexing.metal`'s own `static_assert(sizeof(IndexParams) == 56)` rejects
+/// the mutant. **It never gets that far.** The classical `index` wrapper builds
+/// the struct with a brace initializer in the same order as its argument list,
+/// so reordering the fields makes it try to initialize a `bool` from a
+/// `size_t`, and **C++11 narrowing rejects that first**:
+///
+/// ```text
+/// error: non-constant-expression cannot be narrowed from type 'size_t'
+///        (aka 'unsigned long') to 'bool' in initializer list [-Wc++11-narrowing]
+/// ```
+///
+/// That is the layer `DESIGN.md` §11.3d names in passing — "inserting a field of
+/// a *different* type is caught at compile time by C++11 narrowing on the brace
+/// initializer, which is a layer of defence §11.3b does not mention" — firing
+/// on a *reorder* rather than an insertion, because a `bool` beside `size_t`
+/// makes any reorder a type change. It is strictly earlier and louder than the
+/// `static_assert`, and it exists only because the classical wrapper builds the
+/// struct positionally.
+///
+/// So the ordering of defences for this family is: narrowing (compile, if the
+/// reorder crosses the `bool`), then `static_assert` (compile, if it changes
+/// `sizeof`), then the cross-boundary layout check (runtime, for a reorder that
+/// changes neither — which is the case the test above covers). None subsumes
+/// another, and the first is free.
+#[test]
+fn indexing_moving_the_bool_is_rejected_at_compile_time() {
+    let original = "    size_t ids_size;\n    bool contiguous;\n    size_t src_num_dims;\n};";
+    let mutated = "    size_t ids_size;\n    size_t src_num_dims;\n    bool contiguous;\n};";
+    assert!(
+        crate::source::INDEXING.contains(original),
+        "the struct this test mutates has been reworded; update the mutation"
+    );
+    let mutant = crate::source::INDEXING.replace(original, mutated);
+
+    let device = device();
+    let err = device.new_library_with_source(&mutant, None).expect_err(
+        "moving `contiguous` past `src_num_dims` makes the classical wrapper's \
+         brace initializer narrow a size_t to a bool, and changes \
+         sizeof(IndexParams) from 56 to 48. If this compiles, both of those \
+         guards are gone.",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("c++11-narrowing"),
+        "the mutant must be rejected by C++11 narrowing on the classical \
+         wrapper's brace initializer -- the earliest of the three guards. If \
+         this stops firing, check whether the wrapper still builds the struct \
+         positionally; got: {msg}"
     );
 }
