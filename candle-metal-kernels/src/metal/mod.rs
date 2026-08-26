@@ -16,6 +16,7 @@ pub mod fence;
 #[cfg(test)]
 mod icb_tests;
 pub mod library;
+pub mod profile;
 pub mod residency_set;
 pub mod scratch;
 #[cfg(test)]

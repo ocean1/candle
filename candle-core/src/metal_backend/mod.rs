@@ -34,6 +34,14 @@ pub use candle_metal_kernels::metal::{
 /// dependency on `candle-metal-kernels`. Inert unless `CANDLE_METAL_TRACE=1`.
 pub use candle_metal_kernels::metal::trace;
 
+/// Opt-in GPU-time and dispatch-count profiling of the Metal submission path.
+///
+/// Re-exported so a consumer that already depends on `candle-core` can read the
+/// counters without taking a direct dependency on `candle-metal-kernels`, which
+/// sits outside the workspace and is not otherwise in an example's dependency
+/// graph.
+pub use candle_metal_kernels::metal::profile;
+
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {
         buffer,
