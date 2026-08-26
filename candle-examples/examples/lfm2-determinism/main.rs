@@ -192,6 +192,27 @@ struct Args {
     /// digest that moves here is a defect, not a variant (§2.3.5a).
     #[arg(long, default_value = "split")]
     param_style: String,
+
+    /// Replay the stable, packed subset of a decode step from an
+    /// `MTLIndirectCommandBuffer` (issue #115, `DESIGN.md` §17 Phase 2 item 10).
+    ///
+    /// **This flag is why the gate exists for this axis.** Replay suppresses a
+    /// classical dispatch and runs a pre-encoded command in its place, and an
+    /// ICB's commands are `ConcurrentDispatch` with no barrier between them
+    /// (§3.5) -- so the ordering candle's `auto_barrier` emits has to be
+    /// re-expressed on the commands themselves. A missing edge there is silent
+    /// corruption rather than an error, and no barrier count can detect it: the
+    /// count would simply be lower and still look plausible.
+    ///
+    /// Expected result is **bit-identical to the same configuration without
+    /// `--icb`**. Replay changes where a dispatch is encoded, not what it
+    /// computes, so a moved digest is a defect and not a variant (§2.3.5a).
+    ///
+    /// Needs `--param-style packed`: an ICB command cannot carry an inline
+    /// constant (§3.7c), so under `split` every position is excluded and the run
+    /// would gate an executor that replayed nothing.
+    #[arg(long)]
+    icb: bool,
 }
 
 /// Follow-up prompts for multi-turn mode, cycled in order.
@@ -403,6 +424,27 @@ fn main() -> Result<()> {
         );
         println!("param style: {got:?}");
     }
+
+    // ICB replay (issue #115). Both switches have to be thrown before the first
+    // pipeline is built: `supportIndirectCommandBuffers` is a property of a
+    // pipeline and pipelines are cached per process, so one built earlier keeps
+    // the old setting -- and encoding that into an ICB is §3.7d's segfault at
+    // encode time, with no error to catch.
+    #[cfg(feature = "metal")]
+    if args.icb {
+        anyhow::ensure!(
+            args.param_style == "packed",
+            "--icb needs --param-style packed: an ICB command cannot carry an inline constant \
+             (DESIGN.md §3.7c), so under `split` every position is excluded and this would \
+             gate an executor that replayed nothing"
+        );
+        candle_metal_kernels::set_pipelines_support_icb(true)
+            .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
+        candle_metal_kernels::set_constants_pool_enabled(true);
+        println!("icb: enabled");
+    }
+    #[cfg(not(feature = "metal"))]
+    anyhow::ensure!(!args.icb, "--icb needs the `metal` feature");
     // Refused rather than ignored off Metal: silently accepting `--param-style
     // packed` on a CPU build and reporting a passing digest for the default path
     // is #69's vacuous run exactly (§2.4).
@@ -520,6 +562,21 @@ fn main() -> Result<()> {
     /// Decode steps recorded before the arena is installed. Two, because
     /// comparing two is what separates an activation from session state.
     const ARENA_RECORD_STEPS: usize = 2;
+
+    // Steps the ICB executor records before deciding what is replayable. Three
+    // rather than the minimum of two: a position that happens to agree between
+    // two consecutive steps but drifts on the third would be admitted by a
+    // two-step window, and admitting one wrongly is silent corruption (§3.5)
+    // rather than a visible failure.
+    #[cfg(feature = "metal")]
+    const ICB_RECORD_STEPS: usize = 3;
+    #[cfg(feature = "metal")]
+    let icb_executor = args
+        .icb
+        .then(|| candle_metal_kernels::IcbExecutor::new(ICB_RECORD_STEPS));
+    #[cfg(feature = "metal")]
+    let icb_installed_at = if args.arena { ARENA_RECORD_STEPS } else { 0 };
+
     let mut decode_steps = 0usize;
 
     'turns: for turn in 0..args.turns.max(1) {
@@ -593,10 +650,38 @@ fn main() -> Result<()> {
                 dev.begin_decode_step();
             }
 
+            // Install the ICB executor once the operands are stable. Under
+            // `--arena` that is after its recording steps: recording earlier
+            // would capture the pool's per-step buffer identities and exclude
+            // every position as varying, for a reason that is not the
+            // executor's.
+            #[cfg(feature = "metal")]
+            if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+                if decode_steps == icb_installed_at {
+                    dev.set_executor(std::sync::Arc::new(
+                        candle_metal_kernels::metal::ExecutorSlot::Custom(exec.clone()),
+                    ));
+                }
+            }
+
             logits = model
                 .forward(&input, kv_len, &mut cache)
                 .context("decode forward pass")?
                 .squeeze(0)?;
+
+            // Close the ICB step here: after the forward pass and before the
+            // next iteration samples, so a step is exactly the forward pass.
+            // Sampling adds a `softmax_f32` and an `affine_f32`, and including
+            // them in some windows and not others makes position N a different
+            // dispatch in different steps -- which reads as "everything varies"
+            // rather than as a misaligned boundary.
+            #[cfg(feature = "metal")]
+            if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+                if decode_steps >= icb_installed_at {
+                    exec.end_step(dev.metal_device())
+                        .map_err(|e| anyhow::anyhow!("closing ICB step {decode_steps}: {e}"))?;
+                }
+            }
 
             if let (true, Some(dev)) = (args.arena, metal_device.as_ref()) {
                 dev.end_decode_step();
@@ -648,6 +733,46 @@ fn main() -> Result<()> {
         for (i, (tok, digest, kv)) in per_step.iter().enumerate() {
             println!("step {i} token {tok} kv_len {kv} logits {digest}");
         }
+    }
+
+    // What the ICB executor actually replayed.
+    //
+    // The digest below is only evidence about replay if replay *happened*, and a
+    // flag being passed does not establish that -- #69's determinism run under a
+    // new hazard key reported a passing digest for the unchanged path, and was
+    // caught by checking that a quantity had moved rather than by trusting the
+    // flag (§2.4, §9.2f). A nonzero `covered` here is that quantity: it is the
+    // number of dispatches this run did *not* encode classically.
+    #[cfg(feature = "metal")]
+    if let Some(exec) = icb_executor.as_ref() {
+        let cov = exec.coverage();
+        println!(
+            "ICB replaying={} covered={} of {} runs={} barriers_encoded={} stale={} \
+             poisoned_runs={} discarded_windows={} excluded_varies={} excluded_inline_consts={}",
+            exec.is_replaying(),
+            cov.covered,
+            cov.positions,
+            exec.runs(),
+            exec.encoded_barriers(),
+            exec.stale_positions(),
+            exec.poisoned_runs(),
+            exec.discarded_windows(),
+            cov.varies,
+            cov.inline_constants,
+        );
+        anyhow::ensure!(
+            exec.is_replaying() && cov.covered > 0,
+            "--icb was passed but nothing was replayed ({} covered of {}), so the digest below \
+             would be the classical path's wearing this arm's name",
+            cov.covered,
+            cov.positions
+        );
+        anyhow::ensure!(
+            exec.stale_positions() == 0,
+            "{} replayed positions went stale, so coverage is lower than reported and the \
+             digest describes a partially-classical run",
+            exec.stale_positions()
+        );
     }
 
     // One machine-greppable line per run, so a batch of runs collapses to a

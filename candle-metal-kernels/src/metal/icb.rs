@@ -58,6 +58,20 @@ pub struct BindingRecord {
     /// reissued. The `Buffer` itself is held separately, in `retained`.
     pub ptr: usize,
     pub offset: usize,
+    /// How long the handle addresses from `offset`, so two bindings can be
+    /// tested for overlap rather than only for sharing an allocation.
+    ///
+    /// Under an arena every activation shares one pointer (§9.2e), so a
+    /// pointer-only test would call every pair inside the arena a conflict and
+    /// emit a barrier before nearly every command.
+    pub len: usize,
+    /// Whether the dispatch writes this binding.
+    ///
+    /// Needed to decide which replayed commands require a barrier: an ICB's
+    /// commands are `ConcurrentDispatch` and the GPU does not drain between
+    /// them (§3.5), so the read-after-write edges candle's `auto_barrier` emits
+    /// classically have to be re-expressed on the commands themselves.
+    pub is_output: bool,
 }
 
 /// One dispatch, with everything an ICB command must carry.
@@ -85,7 +99,39 @@ pub struct StepDispatch {
     pub retained: Vec<Buffer>,
 }
 
+impl BindingRecord {
+    /// Whether two bindings can touch the same byte.
+    ///
+    /// Mirrors `encoder::BoundRange::overlaps`, including its rule that a zero
+    /// length covers the whole allocation: an unknown extent must fail toward
+    /// ordering, because a spurious barrier costs throughput and a missing one
+    /// is silent corruption (§3.5).
+    fn overlaps(&self, other: &BindingRecord) -> bool {
+        if self.ptr != other.ptr {
+            return false;
+        }
+        if self.len == 0 || other.len == 0 {
+            return true;
+        }
+        self.offset < other.offset + other.len && other.offset < self.offset + self.len
+    }
+}
+
 impl StepDispatch {
+    /// Whether this dispatch must be ordered after `earlier`.
+    ///
+    /// Read-after-write, write-after-write and write-after-read against the same
+    /// bytes -- the three candle's `auto_barrier` detects, applied to the same
+    /// binding records rather than to a second notion of a hazard.
+    fn conflicts_with(&self, earlier: &StepDispatch) -> bool {
+        self.bindings.iter().any(|b| {
+            earlier
+                .bindings
+                .iter()
+                .any(|e| (b.is_output || e.is_output) && b.overlaps(e))
+        })
+    }
+
     /// Whether two recordings of the same position agree in everything an ICB
     /// command freezes.
     ///
@@ -125,6 +171,13 @@ struct Recording {
     pending: Vec<BindingRecord>,
     pending_retained: Vec<Buffer>,
     pending_pipeline: Option<ComputePipeline>,
+    /// Dispatch count the recorded windows agree on, once two have.
+    expected_len: Option<usize>,
+    /// Windows dropped for disagreeing with what followed, reported rather than
+    /// absorbed: a nonzero count means the caller's step boundary and the
+    /// executor's did not line up at first, which is worth knowing even when the
+    /// recording recovers.
+    discarded: usize,
 }
 
 /// The executor's phase. Recording, then replaying, and never back.
@@ -232,6 +285,9 @@ struct Plan {
     reference: Vec<StepDispatch>,
     /// Every buffer any encoded command binds, retained and made resident.
     resident: Vec<Buffer>,
+    /// Barriers encoded on commands, so the ordering re-expressed inside the ICB
+    /// is a reported quantity rather than an assumed one.
+    barriers: usize,
 }
 
 // SAFETY: `Plan` holds Metal objects, which are internally thread-safe for the
@@ -294,10 +350,56 @@ impl IcbExecutor {
         match inner.phase {
             Phase::Recording => {
                 let step = std::mem::take(&mut inner.recording.current);
-                inner.recording.steps.push(step);
                 inner.recording.pending.clear();
                 inner.recording.pending_retained.clear();
                 inner.recording.pending_pipeline = None;
+
+                // The first window an executor sees is partial by construction:
+                // it opens wherever the caller installed the executor, which is
+                // mid-step unless the caller happened to install exactly at a
+                // boundary. Measured on LFM2, installing after the arena's
+                // recording steps gives a first window of 554 dispatches and a
+                // second of 556 -- the two extra being the `softmax_f32` and
+                // `affine_f32` that sampling contributes, which the first window
+                // opened too late to see.
+                //
+                // Discarding a window whose length differs from its predecessor,
+                // rather than requiring the caller to install at the right
+                // instant, keeps that timing out of the harness. `record_steps`
+                // counts *usable* windows, so this cannot silently shorten the
+                // recording: a discarded window does not count toward it.
+                //
+                // A window is only discarded while there is nothing to compare
+                // against or it disagrees with what came before. Two consecutive
+                // agreeing windows start the recording proper, and a later
+                // disagreement is a genuine non-steady-state step -- which
+                // `build_plan` refuses rather than aligning, because positions
+                // are compared by index and a shifted window pairs unrelated
+                // dispatches.
+                let len = step.len();
+                match inner.recording.expected_len {
+                    None => {
+                        // Nothing to compare against yet: remember the shape and
+                        // keep the window as a candidate.
+                        inner.recording.expected_len = Some(len);
+                        inner.recording.steps.push(step);
+                    }
+                    Some(expected) if expected == len => {
+                        inner.recording.steps.push(step);
+                    }
+                    Some(expected) => {
+                        // Disagreement. The earlier windows are the suspect ones
+                        // -- a partial first window is the common case and a
+                        // model that changes shape mid-run is not -- so restart
+                        // from this one rather than discarding it.
+                        inner.recording.discarded += inner.recording.steps.len();
+                        inner.recording.steps.clear();
+                        inner.recording.expected_len = Some(len);
+                        inner.recording.steps.push(step);
+                        let _ = expected;
+                    }
+                }
+
                 if inner.recording.steps.len() >= inner.record_steps {
                     inner.build_plan(device)?;
                     inner.phase = Phase::Replaying;
@@ -347,6 +449,33 @@ impl IcbExecutor {
     /// Runs that went stale and are no longer replayed.
     pub fn poisoned_runs(&self) -> usize {
         self.inner.lock().unwrap().poisoned.len()
+    }
+
+    /// Barriers encoded onto ICB commands.
+    ///
+    /// The ordering candle's `auto_barrier` would have emitted between the
+    /// replayed dispatches, re-expressed inside the buffer -- see `encode_plan`
+    /// for why executing a run without these is silent corruption. Reported
+    /// rather than assumed, because it is the quantity whose absence produced
+    /// the only wrong answer this work has seen.
+    pub fn encoded_barriers(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .plan
+            .as_ref()
+            .map_or(0, |p| p.barriers)
+    }
+
+    /// Recording windows discarded for disagreeing in dispatch count with what
+    /// followed.
+    ///
+    /// One is the expected value: the window an executor opens at install time
+    /// is partial unless the caller installed exactly at a step boundary. More
+    /// than one, or a nonzero count on a caller that *does* install at a
+    /// boundary, means the boundary is in the wrong place.
+    pub fn discarded_windows(&self) -> usize {
+        self.inner.lock().unwrap().recording.discarded
     }
 }
 
@@ -501,8 +630,18 @@ fn encode_plan(
     let mut reference = Vec::with_capacity(covered.len());
     let mut resident: Vec<Buffer> = Vec::new();
     let mut seen_resident = std::collections::HashSet::new();
+    // Barriers encoded on commands, reported so the count is observed rather
+    // than inferred -- §9.2f's rule, applied to the quantity this file adds.
+    let mut barriers = 0usize;
+    // First command index of the run being encoded, so a barrier scan stays
+    // inside it. Positions are ascending, so a run continues while the position
+    // is one past the previous.
+    let mut run_first_cmd = 0usize;
 
     for (cmd_index, &pos) in covered.iter().enumerate() {
+        if cmd_index > 0 && covered[cmd_index - 1] + 1 != pos {
+            run_first_cmd = cmd_index;
+        }
         let d = &step[pos];
         // SAFETY: `cmd_index < covered.len()`, the count the ICB was created
         // with -- the loop is over exactly that slice.
@@ -512,6 +651,51 @@ fn encode_plan(
             .as_ref()
             .expect("covered positions have a pipeline; checked in build_plan");
         cmd.setComputePipelineState(pipeline_raw(pipeline));
+
+        // Re-express the ordering candle's `auto_barrier` emits classically.
+        //
+        // **This is the correctness centre of the whole file.** An ICB's
+        // commands are `MTLIndirectCommandType::ConcurrentDispatch` and the GPU
+        // does not drain between them (§3.5), so executing a run as one range
+        // runs its members concurrently -- while classically each was separated
+        // from its neighbour by a barrier wherever they touched the same bytes.
+        // Measured on LFM2: 384 of the 431 covered positions have an earlier
+        // write inside their own run that a later member reads, the very first
+        // being `rmsnorm_f16` writing what the next `gemv` reads. Replaying
+        // without this loses every one of those edges, and §3.5 says a missing
+        // barrier is silent corruption rather than an error -- observed, as
+        // logits so corrupt that sampling refused them.
+        //
+        // `setBarrier` is one of the eleven methods §3.7c enumerates on
+        // `MTLIndirectComputeCommand`, and it orders this command after every
+        // command before it in the buffer. That is coarser than candle's
+        // per-hazard barrier and strictly stronger, so it can only over-order:
+        // the cost is concurrency, and the alternative is a wrong answer.
+        //
+        // Emitted only where a conflict actually exists, using the same
+        // read/write/overlap test candle uses, so a run of independent
+        // dispatches still runs concurrently.
+        //
+        // Scanned back to the start of *this run* rather than of the buffer.
+        // Commands in an earlier run were executed by an earlier
+        // `executeCommandsInBuffer` on the same encoder, and the classical
+        // dispatches between the two runs carry candle's own barriers, so the
+        // cross-run edge is already ordered by the encoder. Scanning the whole
+        // buffer would additionally be wrong in the other direction: command
+        // indices are contiguous across runs, so it would order a command
+        // against one that does not precede it in this execution at all.
+        //
+        // O(run length squared) at plan time, once -- not on the per-token path,
+        // so §15.2 #10 is not engaged. Runs are 12 to 17 commands.
+        let run_start_cmd = run_first_cmd;
+        let needs_barrier = covered[run_start_cmd..cmd_index]
+            .iter()
+            .any(|&earlier| d.conflicts_with(&step[earlier]));
+        if needs_barrier {
+            cmd.setBarrier();
+            barriers += 1;
+        }
+
         for (b, buf) in d.bindings.iter().zip(d.retained.iter()) {
             // SAFETY: the buffer outlives the ICB -- it is retained in
             // `resident` below and the plan owns both -- and the index is under
@@ -588,6 +772,7 @@ fn encode_plan(
         run_at,
         reference,
         resident,
+        barriers,
     })
 }
 
@@ -709,12 +894,14 @@ impl Executor for IcbExecutor {
         }
     }
 
-    fn will_bind_buffer(&self, index: usize, buffer: &Buffer, offset: usize, _is_output: bool) {
+    fn will_bind_buffer(&self, index: usize, buffer: &Buffer, offset: usize, is_output: bool) {
         let mut inner = self.inner.lock().unwrap();
         inner.recording.pending.push(BindingRecord {
             index,
             ptr: buffer.raw_addr(),
             offset,
+            len: buffer.length(),
+            is_output,
         });
         inner.recording.pending_retained.push(buffer.clone());
     }

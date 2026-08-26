@@ -193,6 +193,17 @@ impl MetalDevice {
         Ok(command_encoder)
     }
 
+    /// Submit dispatches through `executor` (`DESIGN.md` §11.1, issue #115).
+    ///
+    /// Narrow on purpose: `commands` is `pub(crate)` and stays that way, so a
+    /// harness can install an executor without reaching the command-buffer
+    /// lifecycle around it. `ExecutorSlot::Classical` is the default and is the
+    /// same code that ran before the seam existed (§11.1b), so *not* calling
+    /// this leaves the path unchanged rather than equivalent.
+    pub fn set_executor(&self, executor: Arc<candle_metal_kernels::metal::ExecutorSlot>) {
+        self.commands.set_executor(executor);
+    }
+
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>> {
         let command_encoder = self
             .commands
