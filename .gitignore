@@ -48,3 +48,6 @@ bria.mp3
 bria.safetensors
 bria.wav
 bench_results/
+
+# Build dirs used by agents with a custom CARGO_TARGET_DIR
+target-*/
