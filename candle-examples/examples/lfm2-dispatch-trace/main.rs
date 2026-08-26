@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{Cache, Config, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -151,6 +151,18 @@ struct Args {
     /// GPU path's name -- which is #69's vacuous determinism run exactly (§2.4).
     #[arg(long, default_value = "cpu")]
     arena_offsets: String,
+
+    /// Which attention implementation decode takes: `generic` (the default, and
+    /// what every trace before lloom #97 recorded) or `sdpa` (the GQA-native
+    /// `sdpa_vector` kernel).
+    ///
+    /// The claim under test is that `sdpa` removes 24 varying-grid positions --
+    /// 16 `cast_f16_f32` from the F32 upcast of K and V, and 8 `affine_f32` from
+    /// the softmax scale over a growing `kv_len` (`DESIGN.md` §11.1a.1). Both
+    /// arms are compiled, so this selects between them at model construction and
+    /// the A/B costs nothing.
+    #[arg(long, default_value = "generic")]
+    attn: String,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -391,7 +403,17 @@ fn main() -> Result<()> {
 
     let config_raw = std::fs::read_to_string(model_dir.join("config.json"))
         .with_context(|| format!("reading {}", model_dir.join("config.json").display()))?;
-    let config = parse_config(&config_raw)?;
+    let mut config = parse_config(&config_raw)?;
+
+    // Unknown values are refused rather than defaulted: a silent fallback would
+    // report the generic path's dispatch counts under the sdpa arm's name, which
+    // is #69's vacuous determinism run in another quantity (§2.4).
+    config.attn_impl = match args.attn.as_str() {
+        "generic" => AttnImpl::Generic,
+        "sdpa" => AttnImpl::Sdpa,
+        other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
+    };
+    println!("attention implementation: {:?}", config.attn_impl);
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
