@@ -1564,7 +1564,33 @@ impl BackendStorage for MetalStorage {
     }
 
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
-        if !ids_l.is_contiguous() {
+        // `src_l` is checked as well as `ids_l`, and that check is the fix for
+        // #87. `gather` was the only op in this family guarding one operand:
+        // `scatter_set`, `scatter_add_set` and `index_add` all check every
+        // operand they take.
+        //
+        // The kernel it dispatches computes a flat contiguous offset --
+        // `(left_rank_i * src_dim_size + input_i) * right_size + right_rank_i`
+        // -- and receives neither `src_dims` nor `src_strides`, so it has no way
+        // to address a strided source. Guarding `ids_l` alone therefore accepted
+        // a non-contiguous source and read it as though it were contiguous,
+        // returning a plausible wrong tensor where an error belongs.
+        //
+        // **Both reference backends decline this**, which is what makes the
+        // guard the fix rather than a strided arm. The CPU bails in
+        // `cpu_backend/mod.rs`'s `Gather::f`, and so does CUDA:
+        // `cuda_backend/mod.rs`'s `Gather::f` has a second `RequiresContiguous`
+        // on the source, distinct from the one on the ids, and `indexing.cu`'s
+        // `gather` takes no `num_dims`/`info` and computes the same flat offset
+        // this kernel does. Accepting a strided source would make Metal the only
+        // backend that does.
+        //
+        // Note the contrast with `index_select` below, which *does* carry a
+        // strided arm. CUDA's `index_select` kernel takes `num_dims` and
+        // branches on `is_contiguous`, so there the reference computes and
+        // matching it was correct (#82). `gather` is the opposite case, and the
+        // two fixes point in opposite directions for that reason.
+        if !ids_l.is_contiguous() || !src_l.is_contiguous() {
             return Err(crate::Error::RequiresContiguous { op: "gather" }.bt());
         };
         let ids_el = ids_l.dims()[dim];

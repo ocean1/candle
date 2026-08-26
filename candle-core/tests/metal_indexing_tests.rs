@@ -1,8 +1,7 @@
-//! `indexing.metal`'s four op families must agree with the CPU backend, and
-//! every `(index dtype, value dtype)` pair `candle-core` can ask for must
-//! exist.
+//! `indexing.metal`'s op families must agree with the CPU backend, and every
+//! `(index dtype, value dtype)` pair `candle-core` can ask for must exist.
 //!
-//! Two distinct things are checked here, and they fail for different reasons.
+//! Three distinct things are checked here, and they fail for different reasons.
 //!
 //! **Parity** — the kernels compute the same values as the CPU backend. This is
 //! the check a templating conversion needs: `indexing.metal`'s macro form
@@ -18,6 +17,14 @@
 //! `is_i64_u8` and `is_i64_u32`, and `indexing.metal` declared neither. That is
 //! the third and fourth name in the absent-variant class `DESIGN.md` §8.1b
 //! tracks, after #26's 48 reduce variants and `conv`'s.
+//!
+//! **Agreement on what is refused** — the backends decline the same calls, not
+//! only compute the same answers. A backend that accepts an input its reference
+//! rejects returns a *plausible wrong tensor* where an error belongs, which is
+//! the worse failure direction because nothing announces it.
+//! `gather_declines_a_strided_source_like_cpu_and_cuda` is that check (#87) and
+//! `cpu_declines_strided_index_select_source` records the one place the three
+//! backends still legitimately differ.
 //!
 //! The reference is the **CPU backend**, per `CONTRIBUTING.md` §3.1 and the
 //! standing guidance in `DESIGN.md` §2.3.8a: it is bit-stable, and a Metal-side
@@ -513,89 +520,116 @@ fn embedding_lookup_shape_matches_cpu() -> Result<()> {
     Ok(())
 }
 
-/// `gather` accepts a non-contiguous **source** and reads it as if contiguous.
+/// `gather` must **decline** a non-contiguous source, as the CPU and CUDA do.
 ///
-/// **This documents a pre-existing defect rather than asserting correctness**,
-/// in the same shape and for the same reason `index_select_strided_source_is_\
-/// known_wrong` did before this change replaced it: written to pass *while the
-/// bug is present*, so the behaviour is on the record and turns red the moment
-/// it is corrected.
+/// This replaces `gather_strided_source_is_known_wrong`, which asserted the
+/// *inequality* the defect produced — written to pass while the bug was present
+/// so the behaviour stayed on the record, and to turn red the moment it was
+/// corrected. It has been corrected, so the assertion is now that the call is
+/// refused. The old test is named here deliberately: it is the record that this
+/// was known, pinned, and then fixed rather than silently changed. Same
+/// mechanism `index_select_strided_source_matches_cpu` carries above.
 ///
-/// Found while building the CPU reference for
-/// `index_select_strided_source_matches_cpu`, and **it is a different defect
-/// from the one this change fixes**. That one passed the wrong *argument* to
-/// `get_strided_index`; this one has no strided path at all —
-/// `indexing.metal`'s `gather` computes
+/// **The defect it pinned.** `MetalStorage::gather` checked
+/// `ids_l.is_contiguous()` and never `src_l`, where `scatter_set`,
+/// `scatter_add_set` and `index_add` all check every operand they take. The
+/// kernel it dispatches computes
 ///
 /// ```text
 /// src_i = (left_rank_i * src_dim_size + input_i) * right_size + right_rank_i
 /// ```
 ///
-/// which is a flat contiguous offset, and the kernel receives neither
-/// `src_dims` nor `src_strides` to do anything else with.
+/// a flat contiguous offset, and receives neither `src_dims` nor `src_strides`
+/// to do anything else with — so a strided source was read as though it were
+/// contiguous and produced a plausible wrong tensor.
 ///
-/// **It is reachable because the guard is on the wrong operand.**
-/// `MetalStorage::gather` checks `ids_l.is_contiguous()` and never checks
-/// `src_l`, where `scatter_set`, `scatter_add_set` and `index_add` all check
-/// every operand they take. The CPU backend rejects it
-/// (`gather only supports contiguous tensors`), so this is a second Metal-only
-/// divergence in this file, of the same class and a larger kind.
+/// **Why a guard and not a strided arm, which is the opposite of #82's fix.**
+/// Both reference backends decline this call. The CPU bails in
+/// `cpu_backend/mod.rs`'s `Gather::f`, and **so does CUDA** —
+/// `cuda_backend/mod.rs`'s `Gather::f` carries a second `RequiresContiguous` on
+/// the source, distinct from the one on the ids, and `indexing.cu`'s `gather`
+/// kernel takes no `num_dims`/`info` at all. So the guard makes Metal agree with
+/// both references, where a strided arm would have made it the only backend that
+/// computes. #82 faced the mirror image — CUDA's `index_select` *does* take
+/// `num_dims` and branch on `is_contiguous`, so there only the CPU declined and
+/// making Metal's strided arm correct was right. Read from those two sources
+/// rather than inferred from the symptom.
 ///
-/// **Not fixed here, deliberately.** This change is a one-argument numerics fix
-/// to `index_select` with a bisectable footprint; `gather` needs either a
-/// contiguity guard (a behaviour change — it would turn silently-wrong results
-/// into errors for any caller relying on the current path) or a strided arm
-/// with the parameters to support it (a signature change to a second family).
-/// Both are a separate concern with a separate failure mode, which is the same
-/// reasoning #64 applied when it left the `index_select` defect to this change.
+/// **What is asserted, and why each part is here.** That Metal declines; that it
+/// declines *for the contiguity reason* rather than incidentally; that the
+/// contiguous arm still computes and still agrees with the CPU, so the guard
+/// rejected only what it should; and that all three backends now behave alike.
 #[test]
-fn gather_strided_source_is_known_wrong() -> Result<()> {
+fn gather_declines_a_strided_source_like_cpu_and_cuda() -> Result<()> {
     let Some((cpu, metal)) = cpu_and_metal() else {
         return Ok(());
     };
 
-    let base: Vec<f32> = (0..12).map(|i| i as f32).collect();
-    let idx: Vec<u32> = (0..12).map(|i| (i % 3) as u32).collect();
+    // Several shapes and both `dim` values, so this does not encode one lucky
+    // layout. `(shape, dim)`; each is transposed on its last two axes to make
+    // the source non-contiguous.
+    let cases: &[(&[usize], usize)] = &[(&[3, 4], 0), (&[3, 4], 1), (&[4, 7], 1), (&[2, 3, 4], 2)];
 
-    // (3,4) transposed to a non-contiguous (4,3).
-    let t = Tensor::from_vec(base.clone(), (3, 4), &metal)?;
-    let strided = t.t()?;
-    assert!(
-        !strided.is_contiguous(),
-        "the transposed source must be non-contiguous, or this tests nothing"
-    );
-    let ids = Tensor::from_vec(idx.clone(), (4, 3), &metal)?;
+    let mut checked = 0usize;
+    for &(shape, dim) in cases {
+        let n: usize = shape.iter().product();
+        let raw = values(n);
+        let rank = shape.len();
 
-    let via_strided = strided.gather(&ids, 1)?;
-    let via_contiguous = strided.contiguous()?.gather(&ids, 1)?;
+        let build = |dev: &Device| -> Result<(Tensor, Tensor)> {
+            let t = Tensor::from_vec(raw.clone(), shape, dev)?.to_dtype(DType::F32)?;
+            let strided = t.transpose(rank - 2, rank - 1)?;
+            // `gather`'s ids must have the source's shape outside `dim`, so they
+            // are built against the transposed view.
+            let ids_shape = strided.dims().to_vec();
+            let extent = ids_shape[dim];
+            let total: usize = ids_shape.iter().product();
+            let ids_v: Vec<u32> = (0..total).map(|i| ((i * 3) % extent) as u32).collect();
+            let ids = Tensor::from_vec(ids_v, ids_shape, dev)?;
+            Ok((strided, ids))
+        };
 
-    // The contiguous arm is correct, anchored on the CPU rather than on itself.
-    let cpu_t = Tensor::from_vec(base, (3, 4), &cpu)?.t()?.contiguous()?;
-    let cpu_ids = Tensor::from_vec(idx, (4, 3), &cpu)?;
-    assert_same(
-        &via_contiguous,
-        &cpu_t.gather(&cpu_ids, 1)?,
-        "gather contiguous arm vs cpu",
-    );
+        let (m_strided, m_ids) = build(&metal)?;
+        assert!(
+            !m_strided.is_contiguous(),
+            "shape={shape:?} dim={dim}: the source must be non-contiguous, or this tests nothing"
+        );
 
-    // The CPU declines the strided source outright, which is the divergence.
-    let cpu_strided =
-        Tensor::from_vec((0..12).map(|i| i as f32).collect::<Vec<_>>(), (3, 4), &cpu)?.t()?;
-    assert!(
-        cpu_strided.gather(&cpu_ids, 1).is_err(),
-        "the CPU backend is expected to decline a strided gather source"
-    );
+        // 1. Metal declines it now.
+        let err = m_strided.gather(&m_ids, dim).expect_err(&format!(
+            "shape={shape:?} dim={dim}: Metal is expected to decline a strided gather source"
+        ));
+        // 2. And for the contiguity reason -- not, say, a shape complaint that
+        //    would pass this test while the defect was still reachable by
+        //    another route.
+        assert!(
+            err.to_string().contains("contiguous"),
+            "shape={shape:?} dim={dim}: expected a contiguity complaint, got: {err}"
+        );
 
-    // And Metal's strided arm disagrees with the correct answer. Asserted as
-    // inequality so this turns red when `gather` is fixed, at which point it
-    // should become an equality against the CPU -- the same reminder mechanism
-    // that brought the `index_select` defect to this change.
-    let s = via_strided.flatten_all()?.to_vec1::<f32>()?;
-    let c = via_contiguous.flatten_all()?.to_vec1::<f32>()?;
-    assert_ne!(
-        s, c,
-        "the strided gather defect appears to be fixed -- if so, replace this \
-         test with an equality assertion against the CPU backend"
-    );
+        // 3. The contiguous arm still computes, and still agrees with the CPU.
+        //    Without this the guard could reject everything and stay green.
+        let (c_strided, c_ids) = build(&cpu)?;
+        assert_same(
+            &m_strided.contiguous()?.gather(&m_ids, dim)?,
+            &c_strided.contiguous()?.gather(&c_ids, dim)?,
+            &format!("gather contiguous arm shape={shape:?} dim={dim}"),
+        );
+
+        // 4. The CPU declines the same call, which is the agreement this fix
+        //    establishes. (CUDA also declines -- `cuda_backend/mod.rs`'s
+        //    `Gather::f` -- but is not compiled here, so it is cited rather
+        //    than exercised.)
+        assert!(
+            c_strided.gather(&c_ids, dim).is_err(),
+            "shape={shape:?} dim={dim}: the CPU backend is expected to decline it too"
+        );
+
+        checked += 1;
+    }
+
+    // Non-vacuity, per the guard the other tests in this file carry: a loop that
+    // ran zero iterations would otherwise be green.
+    assert_eq!(checked, 4, "expected 4 strided gather cases, ran {checked}");
     Ok(())
 }
