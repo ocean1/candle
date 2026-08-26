@@ -134,6 +134,23 @@ struct Args {
     /// that way.
     #[arg(long)]
     hazard_key: Option<String>,
+
+    /// Where arena offsets are computed: `cpu` (#69's path, the default) or
+    /// `gpu` (issue #70 -- a kernel bump-allocates them over the arena).
+    ///
+    /// The GPU table is verified element-wise against the CPU plan before it is
+    /// adopted, and the arena refuses to switch if they disagree. So this flag
+    /// selects *which allocator computed the offsets*, never a different set of
+    /// bytes: bit-identical activations follow by construction rather than by
+    /// measurement (`DESIGN.md` §9.2d).
+    ///
+    /// Requires `--arena`, and `--arena-layout non-aliasing`: a packed plan
+    /// reuses slots, so its offsets are not monotone and no forward-only cursor
+    /// can reproduce them. Both are refused loudly rather than silently falling
+    /// back, because a silent fallback reports the CPU path's numbers under the
+    /// GPU path's name -- which is #69's vacuous determinism run exactly (§2.4).
+    #[arg(long, default_value = "cpu")]
+    arena_offsets: String,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -479,6 +496,28 @@ fn main() -> Result<()> {
         "non-aliasing" | "nonaliasing" | "reference" => ArenaLayout::NonAliasing,
         other => anyhow::bail!("unknown --arena-layout {other:?}; want packed or non-aliasing"),
     };
+    // Issue #70. Validated here rather than at the install site so an
+    // unsatisfiable combination fails before the model runs, not after.
+    let gpu_offsets = match args.arena_offsets.as_str() {
+        "cpu" => false,
+        "gpu" => true,
+        other => anyhow::bail!("unknown --arena-offsets {other:?}; want cpu or gpu"),
+    };
+    if gpu_offsets {
+        if !args.arena {
+            anyhow::bail!("--arena-offsets gpu needs --arena: there is nothing to allocate over");
+        }
+        if layout != ArenaLayout::NonAliasing {
+            // Refused rather than downgraded. A packed plan reuses slots, so its
+            // offsets are not monotone and a forward-only cursor cannot
+            // reproduce them; falling back to the CPU here would report #69's
+            // numbers under this flag's name.
+            anyhow::bail!(
+                "--arena-offsets gpu needs --arena-layout non-aliasing: a packed plan reuses \
+                 slots, so its offsets are not monotone and no bump allocator can reproduce them"
+            );
+        }
+    }
     // Set before any encoder session opens, since the keying is read once per
     // session rather than per bind.
     // An explicit flag wins; otherwise leave the selector alone so that
@@ -590,8 +629,36 @@ fn main() -> Result<()> {
                 for (i, s) in plan.slots().iter().enumerate() {
                     eprintln!("  slot {i:>2}  offset {:>7}  size {:>7}", s.offset, s.size);
                 }
+                let monotone = plan.is_bump_reproducible();
                 dev.install_arena(plan, layout)
                     .context("installing the arena")?;
+
+                if gpu_offsets {
+                    // Checked against the plan that was actually recorded, not
+                    // against the layout's name: the property a cursor needs is
+                    // that the offsets increase, and asserting it here means a
+                    // plan that somehow is not monotone fails before a wrong
+                    // offset can be bound rather than after (`DESIGN.md` §9.3 --
+                    // there is no other detector).
+                    if !monotone {
+                        anyhow::bail!(
+                            "the recorded plan's offsets are not monotone, so a bump allocator \
+                             cannot reproduce them"
+                        );
+                    }
+                    let served = dev
+                        .install_gpu_arena_offsets()
+                        .context("computing arena offsets on the GPU")?;
+                    // The engagement check §2.4 requires. `arena_offsets()`
+                    // reads `Gpu` only after the table was verified equal to the
+                    // plan element-wise, so this line is evidence that the GPU
+                    // allocator ran and agreed -- not that a flag was passed.
+                    eprintln!(
+                        "arena: offsets computed on the GPU and verified against the plan \
+                         ({served} ordinals); source now {:?}",
+                        dev.arena_offsets()
+                    );
+                }
             }
         }
 
@@ -603,7 +670,12 @@ fn main() -> Result<()> {
     if let (true, Some(dev)) = (args.arena, metal_device.as_ref()) {
         if let Some(c) = dev.arena_counters() {
             println!(
-                "\n== arena ==\nsteps {}  offers {}  hits {}  declined(session) {}  declined(size) {}  declined(past plan) {}",
+                "\n== arena ==\noffset source {:?}  gpu_verified {}",
+                dev.arena_offsets().unwrap_or_default(),
+                c.gpu_verified
+            );
+            println!(
+                "steps {}  offers {}  hits {}  declined(session) {}  declined(size) {}  declined(past plan) {}",
                 c.steps, c.offers, c.hits, c.declined_session, c.declined_size, c.declined_exhausted
             );
             let (_, private) = dev.pool_counters();

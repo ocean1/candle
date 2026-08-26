@@ -77,7 +77,7 @@
 //! *execution* comparison rather than a size comparison: both layouts run the
 //! real model and their outputs are compared.
 
-use super::{Buffer, BufferPool, PooledBuffer};
+use super::{ArenaOffsets, Buffer, BufferPool, PooledBuffer};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -246,12 +246,117 @@ impl StepPlan {
             .unwrap_or(0)
     }
 
+    /// Bytes a **bump allocator** must be given to reproduce this plan.
+    ///
+    /// Not the same number as [`Self::arena_bytes`], and the difference is a
+    /// real one rather than a rounding preference (issue #70).
+    ///
+    /// `arena_bytes` reports `max(offset + size)` -- where the last *value*
+    /// ends. A cursor rounds **every** request up to [`ARENA_ALIGNMENT`],
+    /// including the final one, so it ends where the last *slot* ends. For a
+    /// plan whose last size is not a multiple of 128 those differ, and the
+    /// cursor's figure is the larger:
+    ///
+    /// ```text
+    /// sizes [100, 300, 5000]  ->  slots at 0, 128, 512
+    ///   arena_bytes    = 512 + 5000 = 5512   (where the value ends)
+    ///   bump_capacity  = 512 + 5120 = 5632   (where the slot ends)
+    /// ```
+    ///
+    /// Handing a bump allocator `arena_bytes` would make it decline the last
+    /// ordinal -- an allocation that fits the plan perfectly, refused because
+    /// the capacity it was checked against measured something else. That is a
+    /// silent loss of arena coverage rather than a corruption, since a declined
+    /// ordinal falls through to the pool, but it would have shown up as "the
+    /// GPU path serves fewer ordinals than the CPU path" with no obvious cause.
+    ///
+    /// `arena_bytes` is deliberately left alone: it decides how large an
+    /// `MTLBuffer` #69 allocates, and changing that for every existing arena is
+    /// a wider blast radius than this issue's evidence covers. The extra bytes
+    /// are tail padding on one slot.
+    pub fn bump_capacity(&self) -> usize {
+        self.slots
+            .iter()
+            .map(|s| s.offset + align_up(s.size, ARENA_ALIGNMENT))
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn slots(&self) -> &[Slot] {
         &self.slots
     }
 
     pub fn allocations(&self) -> usize {
         self.by_ordinal.len()
+    }
+
+    /// The request sizes a GPU bump allocator must walk to reproduce this plan.
+    ///
+    /// One entry per allocation ordinal, in ordinal order: the byte size that
+    /// ordinal requests, or **0** where the arena declines it. Zero is the
+    /// spelling `arena_alloc.metal` reads as "not mine", and it consumes no
+    /// bytes -- so a declined ordinal keeps its position without shifting the
+    /// offsets of those after it, which is the same property `by_ordinal`'s
+    /// `None` gives the CPU path (§9.1, issue #70).
+    ///
+    /// # Why the sizes and not the offsets
+    ///
+    /// Handing the kernel the *offsets* would make the comparison against the
+    /// CPU plan vacuous -- it would check that the GPU can copy an array.
+    /// Handing it the sizes makes it re-derive the layout, so agreement is
+    /// evidence that the two allocators compute the same thing.
+    pub fn request_sizes(&self) -> Vec<u32> {
+        self.by_ordinal
+            .iter()
+            .map(|e| e.map_or(0, |(_, size)| size as u32))
+            .collect()
+    }
+
+    /// The offset each ordinal must receive, or `None` where it is declined.
+    ///
+    /// The oracle `ArenaCursor::verify_against` compares a GPU run against.
+    /// Derived from the same `by_ordinal` the CPU path binds through, so the
+    /// two cannot drift apart.
+    ///
+    /// **This equals a bump allocator's output only when the plan is itself a
+    /// bump layout** -- one slot per ordinal, laid out in ordinal order. A
+    /// *packed* plan reuses slots, so ordinal 7 may resolve to an offset
+    /// earlier than ordinal 3's, which no forward-only cursor can produce. That
+    /// is not a defect in either allocator; it is why the GPU path serves
+    /// [`ArenaLayout::NonAliasing`] and declines `Packed` rather than silently
+    /// disagreeing. See [`Self::is_bump_reproducible`].
+    pub fn expected_offsets(&self) -> Vec<Option<usize>> {
+        self.by_ordinal
+            .iter()
+            .map(|e| e.map(|(slot, _)| self.slots[slot].offset))
+            .collect()
+    }
+
+    /// Whether these offsets are reproducible by a forward-only bump allocator.
+    ///
+    /// True when each served ordinal's offset is strictly greater than the
+    /// previous served ordinal's, which is all a cursor that only increases can
+    /// produce. A packed plan is not, by construction: reusing a slot means
+    /// revisiting an offset.
+    ///
+    /// Checked rather than inferred from the layout enum, because the property
+    /// that matters is the *shape of the offsets*, not the name of the layout
+    /// that produced them. A future layout that happened to be monotone would
+    /// be served correctly, and a `NonAliasing` plan that somehow was not would
+    /// be caught here rather than at a wrong bind -- which under
+    /// `HazardTrackingModeUntracked` is silent (§3.5).
+    pub fn is_bump_reproducible(&self) -> bool {
+        let mut previous: Option<usize> = None;
+        for entry in self.by_ordinal.iter().flatten() {
+            let offset = self.slots[entry.0].offset;
+            if let Some(p) = previous {
+                if offset <= p {
+                    return false;
+                }
+            }
+            previous = Some(offset);
+        }
+        true
     }
 
     /// Every slot is 128 B aligned and no two slots overlap.
@@ -316,11 +421,27 @@ pub struct ArenaCounters {
     pub declined_exhausted: u64,
     /// Decode steps begun.
     pub steps: u64,
+    /// Times a GPU-computed offset table was verified equal to the plan and
+    /// adopted (issue #70).
+    ///
+    /// Zero on a run that asked for GPU offsets means the switch never engaged,
+    /// which §2.4 says must be distinguishable from a run where it did: #69's
+    /// first determinism gate was vacuous precisely because a flag was believed
+    /// rather than checked against a quantity it should have moved.
+    pub gpu_verified: u64,
 }
 
 struct ArenaState {
     plan: StepPlan,
     layout: ArenaLayout,
+    /// Where the offsets this arena binds through came from (issue #70).
+    ///
+    /// `Cpu` until [`Arena::adopt_gpu_offsets`] verifies a GPU-computed table
+    /// against the plan. It is a *recorded* fact rather than a behavioural
+    /// switch, because adoption only happens when the two agree element-wise --
+    /// so the bytes bound are identical either way, and what this names is
+    /// which allocator computed them.
+    offsets: ArenaOffsets,
     /// One handle per slot, created once and held for the plan's lifetime.
     ///
     /// **This is what makes the arena layer 3.** The handles never drop while
@@ -392,6 +513,8 @@ impl Arena {
                 state: Mutex::new(ArenaState {
                     plan,
                     layout,
+                    // #69's path until a GPU table is verified against the plan.
+                    offsets: ArenaOffsets::Cpu,
                     slot_handles,
                     counters: ArenaCounters::default(),
                 }),
@@ -399,6 +522,85 @@ impl Arena {
                 active: AtomicU64::new(0),
             }),
         })
+    }
+
+    /// Adopt GPU-computed offsets for this arena (`DESIGN.md` §9.2d, issue #70).
+    ///
+    /// `gpu_offsets[i]` is the offset a kernel bump-allocated for ordinal `i`,
+    /// or [`ARENA_DECLINED`](super::ARENA_DECLINED) where the plan declines it.
+    ///
+    /// # This verifies before it adopts, and that ordering is the whole point
+    ///
+    /// The offsets are checked element-wise against the plan **first**, and the
+    /// arena refuses to switch if they disagree. So a GPU offset can never reach
+    /// a bind unless it is the byte the CPU path would have chosen -- which
+    /// makes bit-identical activations a structural property rather than
+    /// something measured afterwards and hoped for.
+    ///
+    /// That matters more here than the usual "validate your inputs", because
+    /// §9.3 is explicit that aliasing correctness rests entirely on this
+    /// module's offset arithmetic and that `HazardTrackingModeUntracked` gives
+    /// no safety net: an offset that is wrong by 128 bytes does not fail, it
+    /// silently overlaps another value and corrupts intermittently. Refusing is
+    /// the only safe response to a disagreement, and falling back to the CPU
+    /// path costs nothing -- it is the default anyway.
+    ///
+    /// Returns the number of ordinals now served from GPU-computed offsets.
+    pub fn adopt_gpu_offsets(&self, gpu_offsets: &[u32]) -> Result<usize, String> {
+        let mut state = self.inner.state.lock().map_err(|_| "arena lock poisoned")?;
+
+        let expected = state.plan.expected_offsets();
+        if gpu_offsets.len() != expected.len() {
+            return Err(format!(
+                "GPU produced {} offsets, the plan has {} ordinals",
+                gpu_offsets.len(),
+                expected.len()
+            ));
+        }
+        for (i, (&got, want)) in gpu_offsets.iter().zip(expected.iter()).enumerate() {
+            match want {
+                Some(w) if got as usize == *w => {}
+                Some(w) => {
+                    return Err(format!("ordinal {i}: GPU offset {got}, plan offset {w}"));
+                }
+                None if got == super::ARENA_DECLINED => {}
+                None => {
+                    return Err(format!("ordinal {i}: plan declines it, GPU offset {got}"));
+                }
+            }
+        }
+
+        // Equality held, so adopting changes no byte any dispatch will bind.
+        // The switch is recorded rather than being a no-op with a nice comment:
+        // `offsets_are_gpu` is what lets a harness report that the GPU path was
+        // actually engaged, and §2.4's lesson from #69's vacuous determinism run
+        // is that an instrument which cannot be shown to have engaged has not
+        // measured anything.
+        state.offsets = ArenaOffsets::Gpu;
+        state.counters.gpu_verified += 1;
+        Ok(expected.iter().filter(|e| e.is_some()).count())
+    }
+
+    /// A copy of the plan this arena serves.
+    ///
+    /// Cloned rather than borrowed because the plan lives behind the arena's
+    /// mutex, and a caller that wants to derive the GPU allocator's request
+    /// sizes from it must not hold that lock across a dispatch.
+    pub fn plan_snapshot(&self) -> StepPlan {
+        self.inner
+            .state
+            .lock()
+            .map(|s| s.plan.clone())
+            .unwrap_or_default()
+    }
+
+    /// Where this arena's offsets come from.
+    pub fn offsets(&self) -> ArenaOffsets {
+        self.inner
+            .state
+            .lock()
+            .map(|s| s.offsets)
+            .unwrap_or_default()
     }
 
     /// The single underlying allocation, for residency registration.
