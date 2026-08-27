@@ -211,7 +211,10 @@ impl Axes {
             },
             match self.conv_state {
                 ConvState::Shuffle => "Shuffle".to_string(),
-                ConvState::Ring { k, slack } => format!("Ring(k={k},slack={slack})"),
+                ConvState::SlidingRing { k, slack } => {
+                    format!("SlidingRing(k={k},slack={slack})")
+                }
+                ConvState::RotatingRing { k } => format!("RotatingRing(k={k})"),
             },
         )
     }
@@ -329,7 +332,8 @@ struct Args {
     attn: String,
 
     /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
-    /// the default) or `ring[:K[:slack]]` (§10.2a/§10.2b, issue #141).
+    /// the default), `ring[:K[:slack]]` (the sliding window, §10.2e) or
+    /// `rotating[:K]` (§10.2a's rotating index, §10.2g).
     #[arg(long, default_value = "shuffle")]
     conv_state: String,
 

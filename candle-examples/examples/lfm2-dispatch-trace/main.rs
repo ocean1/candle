@@ -165,8 +165,13 @@ struct Args {
     attn: String,
 
     /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
-    /// the default) or `ring:<K>` (a rotating write index into an
-    /// `l_cache + K`-wide buffer, §10.2a/§10.2b; `ring` alone means `ring:0`).
+    /// the default), `ring[:K[:slack]]` (the sliding window, §10.2e) or
+    /// `rotating[:K]` (§10.2a's rotating index, §10.2g).
+    ///
+    /// The two rings differ on exactly the axes this harness measures: `ring`
+    /// compacts, so its per-token dispatch count is non-constant and its write
+    /// offsets slide; `rotating` never compacts, so its count is constant and
+    /// its offsets take one of `l_cache + K` fixed values.
     #[arg(long, default_value = "shuffle")]
     conv_state: String,
 

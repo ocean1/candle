@@ -189,8 +189,13 @@ struct Args {
     attn: String,
 
     /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
-    /// the default) or `ring:<K>` (a rotating write index into an
-    /// `l_cache + K`-wide buffer, §10.2a/§10.2b; `ring` alone means `ring:0`).
+    /// the default), `ring[:K[:slack]]` (the sliding window, §10.2e) or
+    /// `rotating[:K]` (§10.2a's rotating index, §10.2g).
+    ///
+    /// **This gate is what the digests cannot say for the rotating arm.** Its
+    /// digests move by construction, so §15.1 #7 can only report that they are
+    /// stable; whether the model still answers questions is this harness's
+    /// question and nothing else's (§2.3.8d).
     #[arg(long, default_value = "shuffle")]
     conv_state: String,
 
