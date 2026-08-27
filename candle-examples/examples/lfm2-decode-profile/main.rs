@@ -47,7 +47,7 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{Cache, Config, LayerType, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{Cache, Config, ConvState, LayerType, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -103,6 +103,8 @@ struct Axes {
     gpu_offsets: bool,
     /// The attention arm, echoed for the run line.
     attn: String,
+    /// The conv-state arm (#141), echoed for the run line.
+    conv_state: ConvState,
 }
 
 impl Axes {
@@ -172,6 +174,7 @@ impl Axes {
             layout,
             gpu_offsets,
             attn: args.attn.clone(),
+            conv_state: ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?,
         })
     }
 
@@ -183,7 +186,7 @@ impl Axes {
         // line states every axis §7.1 has.
         format!(
             "ParamStyle=Split ArenaLayout={} ArenaOffsets={} HazardKey={} AttnImpl={} \
-             ScratchSizing=none",
+             ConvState={} ScratchSizing=none",
             if self.arena {
                 #[cfg(feature = "metal")]
                 {
@@ -205,6 +208,10 @@ impl Axes {
                 "Sdpa"
             } else {
                 "Generic"
+            },
+            match self.conv_state {
+                ConvState::Shuffle => "Shuffle".to_string(),
+                ConvState::Ring { k, slack } => format!("Ring(k={k},slack={slack})"),
             },
         )
     }
@@ -320,6 +327,11 @@ struct Args {
     /// GQA-native `sdpa_vector`).
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
+    /// the default) or `ring[:K[:slack]]` (§10.2a/§10.2b, issue #141).
+    #[arg(long, default_value = "shuffle")]
+    conv_state: String,
 
     /// Decode steps recorded before the arena is installed.
     ///
@@ -523,6 +535,7 @@ fn main() -> Result<()> {
 
     // `AttnImpl` is a construction-tier axis on the config (§7.1, #97), so it
     // is selected before the model is built and both arms stay compiled.
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     config.attn_impl = match args.attn.as_str() {
         "generic" => candle_transformers::models::lfm2::AttnImpl::Generic,
         "sdpa" => candle_transformers::models::lfm2::AttnImpl::Sdpa,
