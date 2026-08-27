@@ -60,7 +60,7 @@ use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, ConvState, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -185,6 +185,19 @@ struct Args {
     /// `Sdpa × arena`, which is why #105's C6 reports counts rather than digests.
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// How decode writes conv state: `shuffle` (the default, §6.1's
+    /// `narrow` + `Tensor::cat`) or `ring:<K>` (a rotating write index into an
+    /// `l_cache + K`-wide buffer, §10.2a/§10.2b; `ring` alone means `ring:0`).
+    ///
+    /// **Unlike `--attn`, this arm must reproduce the digests it replaces.** The
+    /// ring changes *where* each tap is loaded from and not the order of the
+    /// three-term sum, so §2.3.3 #1 is not engaged and §17 Phase 4 item 12 (c)
+    /// is explicit: a digest that moves here is a **defect**, not a legitimate
+    /// variant. That is the opposite of #97, where a moved pair was the expected
+    /// consequence and was predicted in advance.
+    #[arg(long, default_value = "shuffle")]
+    conv_state: String,
 
     /// How every kernel's scalars reach it: `split` (the default, one `setBytes`
     /// per scalar) or `packed` (one `device const Params*`, issue #115).
@@ -433,6 +446,9 @@ fn main() -> Result<()> {
         other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
     };
     println!("attention implementation: {:?}", config.attn_impl);
+
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    println!("conv state: {:?}", config.conv_state);
 
     // The binding-style axis (issue #115). Set before any dispatch, and read
     // back from the crate rather than echoed from `args`, so the line printed is

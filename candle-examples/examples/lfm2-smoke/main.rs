@@ -110,7 +110,7 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, ConvState, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -187,6 +187,12 @@ struct Args {
     /// cannot tell you the second thing.
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
+    /// the default) or `ring:<K>` (a rotating write index into an
+    /// `l_cache + K`-wide buffer, §10.2a/§10.2b; `ring` alone means `ring:0`).
+    #[arg(long, default_value = "shuffle")]
+    conv_state: String,
 
     /// Print each turn's prompt and completion. On by default; `--quiet`
     /// leaves only the verdict lines, for a scripted gate.
@@ -362,6 +368,8 @@ fn main() -> Result<()> {
         "sdpa" => AttnImpl::Sdpa,
         other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
     };
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    println!("conv state: {:?}", config.conv_state);
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
