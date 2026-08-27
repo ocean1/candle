@@ -30,8 +30,149 @@ impl DeviceId {
     }
 }
 
+/// Runs the residency-set teardown when the **last** [`MetalDevice`] handle
+/// drops (`DESIGN.md` §6.3c, issue #163).
+///
+/// # Why this is a separate type rather than `impl Drop for MetalDevice`
+///
+/// `MetalDevice` is `Clone` and every field is shared, so every `Tensor` holds a
+/// clone through its `MetalStorage`. A `Drop` written on `MetalDevice` itself
+/// would therefore fire on **every tensor drop** -- hundreds of times per decode
+/// token -- and each firing would wait for the GPU. That is not a teardown
+/// guard, it is a synchronize on the hot path, and §11.2's 6.1 % non-GPU budget
+/// makes it a regression rather than a subtlety.
+///
+/// Holding the guard behind an `Arc` moves the trigger to the instant the last
+/// handle goes, which is what the panic log shows actually happening:
+/// `main+5200` -> `drop_in_place<MetalDevice>` -> `Arc::drop_slow`, on the main
+/// thread past the `RESULT` line.
+///
+/// # Why it is declared first
+///
+/// Fields drop in declaration order, and this must run **before** `commands`,
+/// `buffers` and `private_buffers` -- the pools are what free the `MTLBuffer`s
+/// the set still lists, and removing an object that is already gone is what
+/// `IOGPUGroupMemory::remove_memory_object()` aborts the machine over. The
+/// original defect *is* a declaration-order property, so the fix has to be one
+/// too.
+pub(crate) struct DeviceTeardown {
+    commands: Arc<Commands>,
+    residency_set: Arc<ResidencySet>,
+}
+
+/// Retires an evicted buffer's key from the residency set's membership record,
+/// so a later remove cannot name an allocation that is gone
+/// (`DESIGN.md` §6.3c).
+///
+/// The pool bounds its free list by **destroying** buffers whose size will not
+/// be asked for again (§6.3b), which is a second place a buffer's existence
+/// ends -- and unlike a trim, nothing was telling the residency set about it.
+///
+/// # Why this retires the key rather than calling `removeAllocation`
+///
+/// Because the eager form is a measurable decode-path regression and this one
+/// is free, and because the guard does not need the eager form to be correct.
+///
+/// Measured on LFM2 decode, `--n 200`, quiet machine, non-GPU ms/token:
+///
+/// ```text
+///   baseline                                        0.928  0.936  0.932
+///   unregister eagerly, one call per buffer         1.009  1.016  1.050   +0.087
+///   unregister eagerly, one call per batch          0.993  0.998  0.993   +0.062
+///   retire the key, remove at teardown  (this)      0.941  0.928  0.945    +0.00
+/// ```
+///
+/// The cost is entirely Metal's: an ablation keeping this observer wired and
+/// the `HashSet` work but skipping the Metal call reads 0.938, i.e. baseline.
+/// `removeAllocation` is documented as marking an allocation *"to be removed on
+/// the next commit"*, and decode evicts ~11.6 buffers per token, so any eager
+/// scheme puts a `commit()` on the per-token path. §11.2's whole non-GPU budget
+/// is 6.1 % of a token and #145 has decode at 86 % of a real roofline, so
+/// +0.062 ms is a genuine regression rather than a rounding error.
+///
+/// **What is given up is nothing the guard relies on.** Teardown empties the
+/// set with `removeAllAllocations`, which takes no object argument and so
+/// cannot name a freed one however stale the set has become; and every
+/// per-buffer remove is membership-tested, so retiring the key here is exactly
+/// what makes a later `trim_unused_buffers` or double-unregister a no-op
+/// instead of a call. The residual is that Metal's set holds a reference to an
+/// allocation the pool has dropped until the device goes -- a retention, not a
+/// dangling reference, and the reason the allocation is still safe to name.
+pub(crate) struct ResidencyEvictionObserver {
+    residency_set: Arc<ResidencySet>,
+}
+
+impl ResidencyEvictionObserver {
+    pub(crate) fn new(residency_set: Arc<ResidencySet>) -> Self {
+        Self { residency_set }
+    }
+}
+
+impl candle_metal_kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver {
+    fn on_evict(&self, buffers: &[Buffer]) {
+        self.residency_set.retire_batch(buffers.iter());
+    }
+}
+
+impl DeviceTeardown {
+    pub(crate) fn new(commands: Arc<Commands>, residency_set: Arc<ResidencySet>) -> Self {
+        Self {
+            commands,
+            residency_set,
+        }
+    }
+
+    /// How many `MetalDevice` handles share this guard.
+    ///
+    /// The guard fires when this reaches zero, so a test can assert *when* it
+    /// will run rather than that it did -- the defect's natural expression is a
+    /// machine panic, which is not a testable assertion, so the mechanism is
+    /// what gets tested (issue #166).
+    pub(crate) fn handles(self: &Arc<Self>) -> usize {
+        Arc::strong_count(self)
+    }
+}
+
+impl Drop for DeviceTeardown {
+    fn drop(&mut self) {
+        // 1. Wait. This is the load-bearing step and the one `Drop for Commands`
+        //    does not do: it calls `flush()`, which commits *without* waiting
+        //    (`flush_and_wait` is the one that waits), so without this the pools
+        //    are destroyed while GPU work is still in flight -- §6.3c's
+        //    aggravating condition, and §6.7 L4's rule that a decision about a
+        //    buffer's existence taken on a different clock from the one that
+        //    orders execution is a correctness bug.
+        //
+        //    A failure here is reported and not propagated: this is a
+        //    destructor, and unwinding out of one during teardown would abort.
+        //    Proceeding to unregister after a failed wait is still strictly
+        //    better than not unregistering at all -- the set is emptied either
+        //    way, and it is the *absent object* that panics the kernel, not an
+        //    outstanding command buffer.
+        if let Err(e) = self.commands.wait_until_completed() {
+            // `eprintln!` rather than a panic or a log dependency: candle-core
+            // takes no logger, and a destructor must not unwind.
+            eprintln!("candle: MetalDevice teardown: waiting for GPU work failed: {e}");
+        }
+
+        // 2. Unregister, while the pools still hold the buffers. Emptying the
+        //    set here is what makes the later teardown of the Metal object a
+        //    no-op instead of a removal of objects that no longer exist.
+        self.residency_set.remove_all();
+
+        // 3. The pools drop after this, freeing buffers the set no longer
+        //    lists. That ordering is the whole fix and it is a property of
+        //    where this field is declared, not of anything written here.
+    }
+}
+
 #[derive(Clone)]
 pub struct MetalDevice {
+    /// Empties the residency set, after waiting for the GPU, when the last
+    /// handle to this device drops. Declared **first** so it runs before the
+    /// pools free the buffers the set lists (`DESIGN.md` §6.3c).
+    pub(crate) teardown: Arc<DeviceTeardown>,
+
     /// Unique identifier, the registryID is not sufficient as it identifies the GPU rather than
     /// the device itself.
     pub(crate) id: DeviceId,
@@ -151,6 +292,46 @@ impl MetalDevice {
 
     pub fn metal_device(&self) -> &Device {
         &self.device
+    }
+
+    /// How many allocations the residency set currently holds
+    /// (`DESIGN.md` §6.3c).
+    ///
+    /// Exists so the guard can be observed rather than assumed. The defect it
+    /// prevents is a machine panic, which is not something a test may provoke,
+    /// so the tests assert on membership -- which is exactly this number.
+    pub fn residency_set_len(&self) -> usize {
+        self.residency_set.len()
+    }
+
+    /// A handle to the residency set that outlives this device.
+    ///
+    /// Exists so the teardown guard can be observed from outside: after the
+    /// last `MetalDevice` drops there is no device left to ask, so a test that
+    /// wants to check the set was emptied has to be holding the set itself.
+    pub fn residency_set_handle(&self) -> Arc<ResidencySet> {
+        Arc::clone(&self.residency_set)
+    }
+
+    /// Sets the cap on bytes each pool retains in its free list, evicting
+    /// immediately if the new cap is already exceeded.
+    ///
+    /// Eviction *destroys* buffers, so it unregisters them from the residency
+    /// set on the way (`DESIGN.md` §6.3c).
+    pub fn set_free_budget(&self, bytes: usize) {
+        self.buffers.set_free_budget(bytes);
+        self.private_buffers.set_free_budget(bytes);
+    }
+
+    /// How many `MetalDevice` handles are alive, counted through the teardown
+    /// guard.
+    ///
+    /// The guard runs when this reaches zero. `MetalDevice` is `Clone` and every
+    /// `Tensor` holds a clone, so this is what distinguishes "the last handle
+    /// went" from "a handle went" -- the distinction that keeps the GPU wait off
+    /// the per-tensor path.
+    pub fn device_handles(&self) -> usize {
+        self.teardown.handles()
     }
 
     /// Destroys every buffer currently sitting in a free list.
