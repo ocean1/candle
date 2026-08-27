@@ -402,4 +402,75 @@ mod metal_sdpa_tests {
         }
         Ok(())
     }
+    /// `sdpa_vector` over a **narrowed** K/V, which is the shape an in-place KV
+    /// cache hands it (lloom issue #142).
+    ///
+    /// The cache is pre-allocated to `capacity` and only `live` positions are
+    /// filled, so the kernel receives `n = live` with a head stride still
+    /// spanning `capacity`. Nothing in this suite covered that: every other arm
+    /// passes a tensor whose dim-2 extent *is* its stride, so a kernel that
+    /// ignored `k_stride` and assumed contiguity would pass all of them and
+    /// silently read across head boundaries here.
+    ///
+    /// **Both sides of the two-pass threshold.** `Sdpa::metal_fwd` routes to
+    /// `call_sdpa_vector_2pass` at `k_seq >= 1024` (`candle-nn/src/ops.rs`), so
+    /// the single-pass and chunked kernels are different code over the same
+    /// input. The `live` values below straddle it deliberately, and the padding
+    /// past `live` is filled with a large sentinel rather than zeros: zeros
+    /// would contribute `exp(0)` mass that a wrong length might hide, where a
+    /// sentinel makes an over-read dominate the softmax and show up as a gross
+    /// error.
+    #[test]
+    fn sdpa_vector_over_a_narrowed_kv_matches_cpu_backend() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+
+        // 137 and 1100 sit either side of the 1024 two-pass threshold; 1024
+        // itself is the boundary case, which is the one an off-by-one moves.
+        for &(live, capacity) in &[(137usize, 512usize), (1024, 2048), (1100, 2048)] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(142_000 + live as u64);
+
+            let q = randn(&mut rng, (1, LFM2_Q_HEADS, 1, LFM2_HEAD_DIM), &cpu)?;
+            let k_live = randn(&mut rng, (1, LFM2_KV_HEADS, live, LFM2_HEAD_DIM), &cpu)?;
+            let v_live = randn(&mut rng, (1, LFM2_KV_HEADS, live, LFM2_HEAD_DIM), &cpu)?;
+
+            // The reference sees only the live prefix -- that is the whole claim.
+            let want = reference_attention(&q, &k_live, &v_live, scale)?;
+
+            // Build the padded buffer the way the cache does, then narrow it.
+            let pad_len = capacity - live;
+            let sentinel = 40f32; // exp(40 * scale) dwarfs any live score
+            let k_pad = Tensor::full(sentinel, (1, LFM2_KV_HEADS, pad_len, LFM2_HEAD_DIM), &cpu)?;
+            let v_pad = Tensor::full(sentinel, (1, LFM2_KV_HEADS, pad_len, LFM2_HEAD_DIM), &cpu)?;
+            let k_all = Tensor::cat(&[&k_live, &k_pad], 2)?.contiguous()?;
+            let v_all = Tensor::cat(&[&v_live, &v_pad], 2)?.contiguous()?;
+
+            let k = k_all.to_device(&metal)?.narrow(2, 0, live)?;
+            let v = v_all.to_device(&metal)?.narrow(2, 0, live)?;
+            // A view, not a copy: this is the property that makes it the cache's
+            // shape rather than a re-materialised contiguous tensor.
+            assert!(
+                !k.is_contiguous(),
+                "live={live}: the narrow must stay strided"
+            );
+
+            let got =
+                candle_nn::ops::sdpa(&q.to_device(&metal)?, &k, &v, None, false, scale as f32, 1.)?
+                    .to_device(&cpu)?;
+
+            let err = assert_matches_reference(
+                &got,
+                &want,
+                2e-5,
+                &format!("narrowed kv live={live} cap={capacity}"),
+            )?;
+            println!(
+                "sdpa_vector_over_a_narrowed_kv: live={live} cap={capacity} \
+                 two_pass={} max abs error {err:e}",
+                live >= 1024
+            );
+        }
+        Ok(())
+    }
 }
