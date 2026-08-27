@@ -359,7 +359,10 @@ impl IcbExecutor {
     /// rather than argued: both arms are built, both are gated on the digest,
     /// and the barrier count moves between them, which is the quantity that
     /// shows the switch engaged (§2.4, §9.2f).
-    pub fn with_barrier_scope(record_steps: usize, barrier_scope: BarrierScope) -> Arc<IcbExecutor> {
+    pub fn with_barrier_scope(
+        record_steps: usize,
+        barrier_scope: BarrierScope,
+    ) -> Arc<IcbExecutor> {
         assert!(
             record_steps >= 2,
             "recording fewer than two steps cannot distinguish a stable position from one \

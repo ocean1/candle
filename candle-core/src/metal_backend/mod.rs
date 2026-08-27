@@ -34,6 +34,12 @@ pub use candle_metal_kernels::metal::{
 /// dependency on `candle-metal-kernels`. Inert unless `CANDLE_METAL_TRACE=1`.
 pub use candle_metal_kernels::metal::trace;
 
+/// Cross-encoder fence-wait counting (issue #136).
+///
+/// Re-exported for the same reason `trace` is. Inert unless
+/// `CANDLE_METAL_FENCE_PROBE=1`.
+pub use candle_metal_kernels::metal::fence_probe;
+
 /// Opt-in GPU-time and dispatch-count profiling of the Metal submission path.
 ///
 /// Re-exported so a consumer that already depends on `candle-core` can read the

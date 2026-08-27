@@ -507,6 +507,13 @@ impl Arena {
             .map(|s| pool.adopt(base.view(s.offset, s.size), s.size))
             .collect();
 
+        // Probe-only (#136). Every slot is a view of this one allocation, so
+        // this pointer is what `prev_ce_outputs` keys all of them on -- which is
+        // exactly the question: how many cross-encoder waits are the arena's.
+        // Without it the attribution arm reports zero and cannot be told apart
+        // from a genuine zero (`DESIGN.md` §9.2f's vacuous-arm rule).
+        super::fence_probe::set_arena_ptr(Some(base.raw_ptr() as usize));
+
         Ok(Self {
             inner: Arc::new(ArenaInner {
                 base,

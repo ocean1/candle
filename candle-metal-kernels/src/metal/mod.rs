@@ -16,6 +16,8 @@ pub mod executor;
 #[cfg(test)]
 mod executor_tests;
 pub mod fence;
+/// Cross-encoder fence-wait counting (#136).
+pub mod fence_probe;
 pub mod icb;
 #[cfg(test)]
 mod icb_executor_tests;

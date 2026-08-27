@@ -264,6 +264,9 @@ impl Commands {
             // Hazard state is per encoder, so a barrier count is only
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).
             crate::metal::trace::record_encoder_begin();
+            // The `waited_fences` dedup is per session too, so a wait count is
+            // uninterpretable without the same boundary (#136).
+            crate::metal::fence_probe::note_encoder_begin();
             crate::metal::profile::record_encoder();
             state_guard.current_encoder = Some(enc);
         }
@@ -472,6 +475,14 @@ impl Commands {
 
         let all_outputs = {
             let s = encoder.state.lock().unwrap();
+            // Probe-only (#136): publish the byte ranges this session wrote
+            // before they are lost. `all_outputs` below is a set of *pointers*,
+            // so this is the last point at which a cross-encoder range test is
+            // computable at all -- see `fence_probe`.
+            crate::metal::fence_probe::note_writer_ranges(
+                Arc::as_ptr(&encoder.fence) as usize,
+                &s.written_ranges,
+            );
             s.all_outputs.clone()
         };
 
@@ -523,6 +534,9 @@ impl Commands {
                         }
                     }
                 }
+                // Shadows the map's own lifetime, so the probe's side table
+                // cannot outgrow the thing it describes.
+                crate::metal::fence_probe::forget_writer(ptr);
             });
             unsafe {
                 encoder

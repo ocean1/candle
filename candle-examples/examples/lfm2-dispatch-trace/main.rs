@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-use candle::metal_backend::{set_hazard_key, trace, ArenaLayout, HazardKey};
+use candle::metal_backend::{fence_probe, set_hazard_key, trace, ArenaLayout, HazardKey};
 
 #[derive(Parser, Debug)]
 #[command(about = "LFM2 decode dispatch-sequence probe")]
@@ -317,6 +317,13 @@ fn default_model_dir() -> Option<PathBuf> {
 struct Step {
     label: String,
     dispatches: Vec<trace::Dispatch>,
+    /// Cross-encoder fence waits observed in the same window (#136).
+    ///
+    /// Collected per step rather than in aggregate because the question is
+    /// *per token*, and because the arena is installed part-way through the run
+    /// -- a total over the whole run would mix the pool's steps with the
+    /// arena's and report a number belonging to neither.
+    waits: Vec<fence_probe::WaitEvent>,
 }
 
 impl Step {
@@ -570,6 +577,8 @@ fn main() -> Result<()> {
     if args.include_prefill {
         trace::set_region(Some("prefill".to_string()));
         trace::set_recording(true);
+        fence_probe::set_region(Some("prefill".to_string()));
+        fence_probe::set_recording(true);
     }
     let mut logits = model
         .forward(&input, kv_len, &mut cache)
@@ -578,10 +587,13 @@ fn main() -> Result<()> {
     trace_window(&device)?;
     if args.include_prefill {
         trace::set_recording(false);
+        fence_probe::set_recording(false);
         let dispatches = trace::take_dispatches();
+        let waits = fence_probe::take_events();
         steps.push(Step {
             label: "prefill".to_string(),
             dispatches,
+            waits,
         });
     }
     kv_len += prompt_ids.len();
@@ -717,12 +729,17 @@ fn main() -> Result<()> {
         let label = format!("decode[{step}] kv_len={kv_len}");
         trace::set_region(Some(label.clone()));
         trace::set_recording(true);
+        // Opened and closed with the trace, so a wait and the dispatch that
+        // caused it are attributed to the same step.
+        fence_probe::set_region(Some(label.clone()));
+        fence_probe::set_recording(true);
         logits = model
             .forward(&input, kv_len, &mut cache)
             .context("decode forward pass")?
             .squeeze(0)?;
         trace_window(&device)?;
         trace::set_recording(false);
+        fence_probe::set_recording(false);
 
         // Close the ICB step here: after the forward pass has drained and
         // *before* the next iteration samples, so an ICB step is exactly the
@@ -816,7 +833,12 @@ fn main() -> Result<()> {
         }
 
         let dispatches = trace::take_dispatches();
-        steps.push(Step { label, dispatches });
+        let waits = fence_probe::take_events();
+        steps.push(Step {
+            label,
+            dispatches,
+            waits,
+        });
         kv_len += 1;
     }
 
@@ -910,6 +932,153 @@ fn main() -> Result<()> {
             steady.dispatches.len(),
             100.0 * barriers as f64 / steady.dispatches.len().max(1) as f64
         );
+    }
+
+    // Cross-encoder fence waits per token -- issue #136.
+    //
+    // The sibling of the barrier count above, and the one that had no precision
+    // axis. `auto_barrier` orders dispatches *within* an encoder session and has
+    // `HazardKey`; `wait_for_buffer` orders *across* sessions and is keyed on
+    // the buffer pointer alone -- no offset, no length. So a read of any byte
+    // waits on the last session that wrote any other byte, which under an arena
+    // is every activation against every other.
+    //
+    // Observed at the call's own site, for §9.2f's reason: the emitted count
+    // depends on the per-session `waited_fences` dedup, which no trace of
+    // bindings can see. The ceiling is sessions x distinct buffers, and the
+    // arena collapses the second term toward 1 -- which cuts both ways, and is
+    // why this is measured rather than argued.
+    if fence_probe::probe_requested() {
+        println!("\n== cross-encoder fence waits per decode token (#136) ==");
+        if let Some(p) = fence_probe::arena_ptr() {
+            println!("arena allocation registered with the probe at {p:#x}");
+        } else if args.arena {
+            // A zero attributable to the arena is the finding; a zero because
+            // nothing told the probe which allocation is the arena's is a
+            // vacuous arm wearing the finding's clothes (§9.2f).
+            println!(
+                "WARNING: --arena is set but no arena pointer reached the probe, \
+                 so the attribution column below is vacuous"
+            );
+        }
+        for st in &decode_steps {
+            let sum = fence_probe::summarize(&st.waits);
+            println!(
+                "{:<28} {:>4} calls  {:>4} emitted  ({} arena)  {} sessions",
+                st.label, sum.calls, sum.emitted, sum.emitted_arena, sum.sessions
+            );
+        }
+        // The verdict is read off the last step, not step 1: under `--arena`
+        // the first `record_steps` decode steps run before the arena exists, so
+        // an early step reports the pool's behaviour in every arm.
+        if let Some(steady) = decode_steps.last() {
+            let sum = fence_probe::summarize(&steady.waits);
+            println!("\nsteady-state ({}):", steady.label);
+            println!("  wait_for_buffer calls      {:>6}", sum.calls);
+            println!("  ... found a fence          {:>6}", sum.found);
+            println!(
+                "  ... reached waitForFence   {:>6}   <- the count the issue asks for",
+                sum.emitted
+            );
+            println!("  ... of those, arena buffer {:>6}", sum.emitted_arena);
+            println!("  offline range test, over the emitted waits:");
+            println!(
+                "    arena, survives          {:>6}   reader overlaps bytes the writer wrote",
+                sum.emitted_arena_survives_range
+            );
+            println!(
+                "    arena, FALSE             {:>6}   <- provably disjoint: the false dependency",
+                sum.emitted_arena_false
+            );
+            println!(
+                "    non-arena, survives      {:>6}",
+                sum.emitted_other_survives_range
+            );
+            println!(
+                "    non-arena, FALSE         {:>6}",
+                sum.emitted_other_false
+            );
+            println!(
+                "    undecidable              {:>6}   writer ranges unrecorded; neither verdict",
+                sum.emitted_undecidable
+            );
+            let by_site: Vec<String> = sum
+                .by_site
+                .iter()
+                .map(|(site, n)| format!("{}={n}", site.as_str()))
+                .collect();
+            println!("  by call site: {}", by_site.join("  "));
+
+            // The emitted waits themselves. A verdict of "0 false" is only
+            // checkable if the reader and writer ranges behind it are visible,
+            // so they are printed rather than summarised away -- the whole
+            // point of the offline test is that a reviewer can re-run it.
+            println!(
+                "\n  the {} emitted waits, with the ranges the test compared:",
+                sum.emitted
+            );
+            for e in steady.waits.iter().filter(|e| e.emitted) {
+                let verdict = match fence_probe::survives_range_test(e) {
+                    Some(true) => "overlaps -> real",
+                    Some(false) => "DISJOINT -> false dependency",
+                    None => "undecidable",
+                };
+                let w: Vec<String> = e
+                    .writer_ranges
+                    .iter()
+                    .map(|r| format!("[{}..{})", r.offset, r.offset + r.len))
+                    .collect();
+                println!(
+                    "    session {:>3}  {:<13} {}ptr {:#x} reader [{}..{})  writer {}  {verdict}",
+                    e.encoder,
+                    e.site.as_str(),
+                    if e.arena { "ARENA " } else { "      " },
+                    e.reader.ptr,
+                    e.reader.offset,
+                    e.reader.offset + e.reader.len,
+                    if w.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        w.join(",")
+                    },
+                );
+            }
+        }
+        let skipped = fence_probe::skipped_count();
+        if skipped > 0 {
+            // Reported rather than implied-away: a count that silently omits
+            // what it did not see reads as coverage it does not have.
+            println!(
+                "\n{skipped} calls occurred outside a recorded window (prefill, sampling, setup)"
+            );
+        }
+
+        // Where the session boundaries fall relative to LFM2's C C A blocks
+        // (§5.3). Sessions divide every CANDLE_METAL_COMPUTE_PER_BUFFER
+        // dispatches -- a boundary with nothing to do with the model's
+        // structure -- so where it lands inside a layer is empirical.
+        if let Some(steady) = decode_steps.last() {
+            println!("\n== encoder session boundaries vs layer structure ==");
+            println!(
+                "CANDLE_METAL_COMPUTE_PER_BUFFER = {}",
+                std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER")
+                    .unwrap_or_else(|_| "50 (default)".to_string())
+            );
+            let mut prev: Option<u64> = None;
+            for (i, d) in steady.dispatches.iter().enumerate() {
+                if prev != Some(d.encoder) {
+                    if prev.is_some() {
+                        println!(
+                            "  session {:>3} begins at dispatch {i:>4}  ({})",
+                            d.encoder, d.pipeline
+                        );
+                    }
+                    prev = Some(d.encoder);
+                }
+            }
+        }
+    } else {
+        println!("\n(cross-encoder fence waits not counted: set CANDLE_METAL_FENCE_PROBE=1)");
     }
 
     // Kernel histogram: what the per-token dispatch budget is actually spent on.

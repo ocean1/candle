@@ -1,7 +1,7 @@
 use crate::metal::{
     arena,
     executor::{DispatchAction, DispatchRecord, ExecutorSlot, Grid},
-    trace, Buffer, ComputePipeline, Fence,
+    fence_probe, trace, Buffer, ComputePipeline, Fence,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -139,8 +139,12 @@ impl BoundRange {
     /// nothing: an unknown extent must fail toward ordering, since the cost of
     /// a spurious barrier is throughput and the cost of a missing one is silent
     /// corruption (§3.5).
+    /// `pub(crate)` so `fence_probe`'s offline test is the *same* predicate the
+    /// intra-encoder path uses. A second implementation could drift from this
+    /// one, and the whole point of the offline test is to say what route (a)
+    /// would do.
     #[inline]
-    fn overlaps(&self, other: &BoundRange) -> bool {
+    pub(crate) fn overlaps(&self, other: &BoundRange) -> bool {
         if self.ptr != other.ptr {
             return false;
         }
@@ -223,6 +227,16 @@ pub struct EncoderState {
     /// Fences already waited on this session, so a buffer bound repeatedly does
     /// not re-emit the same wait.
     pub waited_fences: HashSet<usize>,
+    /// The byte ranges this session wrote, per pointer.
+    ///
+    /// Probe-only and empty unless `CANDLE_METAL_FENCE_PROBE` is set, so the
+    /// shipped path allocates nothing for it. It exists because `all_outputs`
+    /// discards exactly the information a cross-encoder range test would need:
+    /// it is a `HashSet<usize>` of *pointers*, so by `end_encoding` the bytes an
+    /// encoder wrote are gone, and `prev_ce_outputs` is built from it. See
+    /// `fence_probe` for why that makes the offline test new recording rather
+    /// than a re-reading of state that is already there.
+    pub written_ranges: HashMap<usize, Vec<BoundRange>>,
     /// Name of the pipeline most recently set, so a dispatch can be attributed
     /// to a kernel. Only maintained when an executor is installed or profiling
     /// is on -- Metal has no way to read the bound pipeline back, and doing so
@@ -252,6 +266,7 @@ impl EncoderState {
             all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
             waited_fences: HashSet::new(),
+            written_ranges: HashMap::new(),
             current_pipeline: None,
         }
     }
@@ -363,17 +378,52 @@ impl ComputeCommandEncoder {
     /// This replaces waiting on every live fence at encoder creation. The
     /// encoder already records every buffer it binds, so the wait can be
     /// limited to buffers this encoder actually touches.
-    fn wait_for_buffer(&self, ptr: usize) {
+    ///
+    /// Note what the lookup is keyed on, because it is the whole of issue #136:
+    /// `prev_ce_outputs` is `HashMap<usize, Arc<Fence>>` -- the buffer pointer
+    /// alone, no offset and no length -- so a read of *any* byte waits on the
+    /// last session that wrote *any other* byte. `HazardKey` gives the
+    /// intra-encoder path a range option and does not reach here.
+    ///
+    /// `reader` and `site` are for the probe only and are ignored when it is
+    /// off, which is the default; `record_wait` returns on a relaxed load
+    /// before touching either.
+    fn wait_for_buffer(&self, ptr: usize, reader: BoundRange, site: fence_probe::CallSite) {
         let fence = {
             let map = self.prev_ce_outputs.lock().unwrap();
             map.get(&ptr).cloned()
         };
-        let Some(fence) = fence else { return };
+        let Some(fence) = fence else {
+            fence_probe::record_wait(site, reader, false, false, 0, Vec::new());
+            return;
+        };
 
+        let fence_id = Arc::as_ptr(&fence) as usize;
         let mut state = self.state.lock().unwrap();
-        if state.waited_fences.insert(Arc::as_ptr(&fence) as usize) {
+        if state.waited_fences.insert(fence_id) {
             drop(state);
+            fence_probe::record_wait(
+                site,
+                reader,
+                true,
+                true,
+                fence_id,
+                fence_probe::writer_ranges(fence_id, ptr),
+            );
             self.raw.waitForFence(fence.raw());
+        } else {
+            // Found a fence and did not emit: the session had already waited on
+            // it. Recorded rather than dropped, because the ceiling is sessions
+            // x distinct buffers and the dedup is what separates the two terms.
+            drop(state);
+            fence_probe::record_wait(
+                site,
+                reader,
+                true,
+                false,
+                fence_id,
+                fence_probe::writer_ranges(fence_id, ptr),
+            );
         }
     }
 
@@ -555,10 +605,10 @@ impl ComputeCommandEncoder {
             // The clock a liveness recording must use: a value is live until the
             // last dispatch that binds it (`DESIGN.md` §6.7 L4).
             arena::note_bind(ptr);
+            let range = Self::bound_range(buf, offset);
             // Read-after-write against an earlier encoder: order against that
             // buffer's last writer only.
-            self.wait_for_buffer(ptr);
-            let range = Self::bound_range(buf, offset);
+            self.wait_for_buffer(ptr, range, fence_probe::CallSite::Input);
             let mut s = self.state.lock().unwrap();
             let key = s.hazard_key;
             // Read-after-write within this encoder.
@@ -587,9 +637,9 @@ impl ComputeCommandEncoder {
             let ptr = buf.raw_ptr() as usize;
             trace::record_binding(index, ptr, offset, true);
             arena::note_bind(ptr);
-            // Write-after-write or write-after-read against an earlier encoder.
-            self.wait_for_buffer(ptr);
             let range = Self::bound_range(buf, offset);
+            // Write-after-write or write-after-read against an earlier encoder.
+            self.wait_for_buffer(ptr, range, fence_probe::CallSite::Output);
             let mut s = self.state.lock().unwrap();
             let key = s.hazard_key;
             // Write-after-write, and write-after-read.
@@ -598,6 +648,16 @@ impl ComputeCommandEncoder {
             }
             s.next_outputs.insert(key, range);
             s.all_outputs.insert(ptr);
+            // Probe-only, and the reason it is here rather than derived later:
+            // this is the last point at which the *bytes* an encoder wrote are
+            // known. `all_outputs` above keeps only the pointer, and
+            // `prev_ce_outputs` is built from it.
+            if fence_probe::is_recording() {
+                let w = s.written_ranges.entry(ptr).or_default();
+                if !w.contains(&range) {
+                    w.push(range);
+                }
+            }
             drop(s);
             if !self.executor.is_classical() {
                 self.executor.will_bind_buffer(index, buf, offset, true);
@@ -680,9 +740,13 @@ impl ComputeCommandEncoder {
         // Bound directly rather than through `set_input_buffer`, which would
         // renumber a second time.
         let ptr = buffer.raw_ptr() as usize;
-        self.wait_for_buffer(ptr);
+        let range = Self::bound_range(&buffer, 0);
+        // The third call site. `DESIGN.md` §6.4 and issue #136 both say
+        // `wait_for_buffer` has two callers; this one is reached only while a
+        // param capture is open, so it is counted separately rather than folded
+        // into the model's own reads.
+        self.wait_for_buffer(ptr, range, fence_probe::CallSite::CaptureArray);
         {
-            let range = Self::bound_range(&buffer, 0);
             let mut s = self.state.lock().unwrap();
             let key = s.hazard_key;
             s.next_inputs.insert(key, range);
