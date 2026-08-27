@@ -110,6 +110,7 @@ impl Lfm2Config {
             eos_token_id: self.eos_token_id,
             use_flash_attn,
             attn_impl: AttnImpl::default(),
+            kv_append: KvAppend::default(),
         }
     }
 }
@@ -140,6 +141,39 @@ pub enum AttnImpl {
     Sdpa,
 }
 
+/// How the KV cache grows as decode appends a token.
+///
+/// A construction-tier axis in `DESIGN.md` §7.1's terms, following `AttnImpl`'s
+/// shape: both arms are compiled, the old one is the default, and the A/B is one
+/// field apart. §7.2 places it here rather than at compile tier because it
+/// changes neither addressing inside a kernel nor registers per thread — the
+/// kernel sees a different `n` and a different stride, which are dispatch-tier
+/// numbers in a descriptor (§15.2 #8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvAppend {
+    /// `Tensor::cat(&[cache, &new], 2)` — reallocate and copy the whole cache,
+    /// every layer, every token.
+    ///
+    /// The default and the correctness bar. `DESIGN.md` §6.2 measures what it
+    /// costs: the copy grows with `kv_len`, and at 128k it is ~2 GB per token
+    /// on top of reading it.
+    #[default]
+    Cat,
+    /// Write the new token in place at a moving offset inside a pre-allocated
+    /// buffer, and read the cache back as a `narrow` of it.
+    ///
+    /// The `cat` disappears, the copy becomes constant-size, and — the property
+    /// §11.1a.1 actually wants — the buffer identity stops changing, because
+    /// `narrow` shares storage and only rewrites the layout.
+    InPlace,
+}
+
+/// How much KV a sequence may accumulate before [`KvAppend::InPlace`] declines.
+///
+/// **This value is not chosen on evidence, and that is deliberate.** See the
+/// `Cache::new_with` documentation for why, and for what would decide it.
+pub const DEFAULT_KV_CAPACITY: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vocab_size: usize,
@@ -161,11 +195,90 @@ pub struct Config {
     /// Defaults to `Generic`, so `into_config` and every existing caller keep
     /// the path they had without naming it.
     pub attn_impl: AttnImpl,
+    /// Defaults to `Cat`, for the same reason `attn_impl` defaults to `Generic`.
+    pub kv_append: KvAppend,
 }
 
 impl Config {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+}
+
+/// One attention layer's K or V, pre-allocated once and written at a moving
+/// offset.
+///
+/// `DESIGN.md` §6.2's `Tensor::cat` reallocates and copies the whole cache every
+/// token; this writes only the new token's bytes and hands back a `narrow` of
+/// the buffer. Three consequences, and the third is the one §11.1a.1 is after:
+///
+/// * the `cat` is gone, so the `copy2d` per layer per token drops from 2 to 1;
+/// * the surviving `copy2d` is **constant-size** — one token's `[1, 8, 1, 64]`
+///   — where the `cat` copied `kv_len` tokens and grew by 64 rows per step;
+/// * **the buffer identity stops changing.** `narrow` clones the storage `Arc`
+///   and rewrites only the layout, so every token binds the same `MTLBuffer` at
+///   the same base. That is the property ICB replay needs and the reason this
+///   is worth more than the copy it removes.
+///
+/// The read is a *view*, never a copy. `call_sdpa_vector` takes `k_l.stride()`
+/// and `n = k_shape[2]`, so a narrowed cache is exactly the shape it is written
+/// to consume (`candle-metal-kernels/src/kernels/sdpa.rs`); the generic arm's
+/// `repeat_kv` goes through `Tensor::cat`, which handles a strided source.
+#[derive(Debug, Clone)]
+struct KvSlot {
+    /// `[b_sz, n_kv_heads, capacity, head_dim]`, allocated on first append.
+    ///
+    /// `None` until then, because the batch size is not known at `Cache::new`.
+    /// This mirrors `candle_nn::kv_cache::Cache`, deliberately: that type is the
+    /// same mechanism and was read before this was written (see the note on
+    /// `Cache::new_with` for why it is not reused directly).
+    all_data: Option<Tensor>,
+    /// How many tokens of `all_data` are live. The `narrow` length.
+    len: usize,
+    capacity: usize,
+}
+
+impl KvSlot {
+    fn new(capacity: usize) -> Self {
+        Self {
+            all_data: None,
+            len: 0,
+            capacity,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.len = 0;
+        self.all_data = None;
+    }
+
+    /// Append `src` along dim 2 and return the live prefix as a view.
+    ///
+    /// Returns `Err` rather than reallocating when the capacity is exhausted —
+    /// see `Cache::new_with` for why that is a loud failure and not a `Grow`.
+    fn append(&mut self, src: &Tensor) -> Result<Tensor> {
+        let seq_len = src.dim(2)?;
+        if self.all_data.is_none() {
+            let mut shape = src.dims().to_vec();
+            shape[2] = self.capacity;
+            self.all_data = Some(Tensor::zeros(shape, src.dtype(), src.device())?);
+        }
+        let all_data = self.all_data.as_ref().unwrap();
+        if self.len + seq_len > self.capacity {
+            candle::bail!(
+                "lfm2 KV cache exhausted: {} + {} > capacity {}. \
+                 Raise `Config::kv_capacity`; see `DESIGN.md` §6.2a on why no policy is chosen.",
+                self.len,
+                seq_len,
+                self.capacity
+            )
+        }
+        // `slice_set` requires both sides contiguous and writes one `copy2d` of
+        // exactly `src`'s bytes at `offset * block_size` (`tensor_cat.rs`). The
+        // caller has already made `src` contiguous.
+        all_data.slice_set(src, 2, self.len)?;
+        self.len += seq_len;
+        all_data.narrow(2, 0, self.len)
     }
 }
 
@@ -176,6 +289,11 @@ pub struct Cache {
     pub use_kv_cache: bool,
     // KV cache for attention layers: (key, value) per layer
     kvs: Vec<Option<(Tensor, Tensor)>>,
+    // The `KvAppend::InPlace` arm's storage, one (K, V) pair per layer.
+    // Held beside `kvs` rather than replacing it so that both arms stay
+    // compiled and the unselected one allocates nothing.
+    kv_slots: Vec<(KvSlot, KvSlot)>,
+    kv_append: KvAppend,
     // Conv state cache for convolution layers
     conv_states: Vec<Option<Tensor>>,
     cos: Tensor,
@@ -193,6 +311,70 @@ fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
 
 impl Cache {
     pub fn new(use_kv_cache: bool, dtype: DType, config: &Config, device: &Device) -> Result<Self> {
+        Self::new_with(use_kv_cache, dtype, config, device, DEFAULT_KV_CAPACITY)
+    }
+
+    /// As [`Cache::new`], with the [`KvAppend::InPlace`] capacity given
+    /// explicitly.
+    ///
+    /// # The capacity is not decided, and this says so rather than picking
+    ///
+    /// A moving write offset needs a bound on how far it may move. `DESIGN.md`
+    /// §9.1a faced the identical question for the scratch class and built
+    /// `Reserve`, `Grow` and `Bucket` while **choosing none**, because the axis
+    /// that separates them is `kv_len` and the largest value this project has
+    /// ever recorded is **2720** against a 128k target (§13.2). This issue hits
+    /// the same wall, and the same answer is the honest one.
+    ///
+    /// What the three policies would cost here, computed from §5.6's 16 KiB per
+    /// token across all 8 attention layers at B=1, f16:
+    ///
+    /// | `kv_len` | `Reserve` (128k) | `Grow` | `Bucket` |
+    /// |---|---|---|---|
+    /// | 2,720 — the largest ever measured | 2048 MiB | 42.5 MiB | 64 MiB |
+    /// | 32,768 | 2048 MiB | 512 MiB | 512 MiB |
+    /// | 131,072 | 2048 MiB | 2048 MiB | 2048 MiB |
+    ///
+    /// They converge at the target and differ by ~48× in the regime we can
+    /// actually reach — which is precisely the shape that makes a measurement
+    /// here uninformative about the choice.
+    ///
+    /// **What is chosen instead is a parameter with a default and a loud
+    /// failure.** `DEFAULT_KV_CAPACITY` is 4096: above the 2720 ceiling with
+    /// headroom, 64 MiB against a 5.2 GB pool (§6.3b), and small enough that
+    /// nobody mistakes it for a considered long-context answer. Exceeding it is
+    /// an error, not a silent reallocation — a `Grow` arm would put the
+    /// `Tensor::cat` this change exists to remove back on the path at exactly
+    /// the moment the cache is largest, and would move the buffer identity that
+    /// §11.1a.1 wants stable. Failing loudly keeps both properties true or
+    /// visibly absent, which is `DESIGN.md` §2.4's rule about instruments that
+    /// cannot be shown to have engaged.
+    ///
+    /// **What would decide it** is a context-length curve — issue #61, and
+    /// `DESIGN.md` §13.2 records that no preset has evidence for the same
+    /// reason. Concretely: ms/token and peak footprint at `kv_len` across
+    /// 2k/8k/32k/128k, with the three policies as arms. Until that exists, any
+    /// value here is a guess, and this one is labelled as one.
+    ///
+    /// # Why not `candle_nn::kv_cache::KvCache`
+    ///
+    /// It is the same mechanism — `slice_set` at a moving offset, `narrow` to
+    /// read — and it was read before this was written; seven models in
+    /// `candle-transformers` already use it. It is not reused here because its
+    /// `append` implements exactly the `Grow` arm this function declines: on
+    /// exhaustion it does `Tensor::cat` with a fresh block
+    /// (`candle-nn/src/kv_cache.rs`), which reintroduces the reallocation and
+    /// moves the buffer identity. Taking `KvCache` would have been the smaller
+    /// diff and would have silently chosen the policy this section exists to
+    /// leave open. Making that a *choice* rather than an inheritance is the
+    /// reason for the local type, and it is a difference of about forty lines.
+    pub fn new_with(
+        use_kv_cache: bool,
+        dtype: DType,
+        config: &Config,
+        device: &Device,
+        kv_capacity: usize,
+    ) -> Result<Self> {
         let theta = calculate_default_inv_freq(config);
         let theta = Tensor::new(theta, device)?;
 
@@ -208,6 +390,10 @@ impl Cache {
             masks: HashMap::new(),
             use_kv_cache,
             kvs: vec![None; num_layers],
+            kv_slots: (0..num_layers)
+                .map(|_| (KvSlot::new(kv_capacity), KvSlot::new(kv_capacity)))
+                .collect(),
+            kv_append: config.kv_append,
             conv_states: vec![None; num_layers],
             device: device.clone(),
             cos,
@@ -226,8 +412,19 @@ impl Cache {
         }
     }
 
+    /// Drop every sequence-state tensor, returning the cache to its pre-prefill
+    /// state.
+    ///
+    /// Both KV arms are reset, whichever is selected. For `InPlace` that means
+    /// the buffer is dropped rather than the length being rewound: a new
+    /// sequence may have a different batch size, so keeping the allocation
+    /// would pin `b_sz` from the previous one.
     pub fn clear(&mut self) {
         self.kvs.iter_mut().for_each(|v| *v = None);
+        self.kv_slots.iter_mut().for_each(|(k, v)| {
+            k.reset();
+            v.reset();
+        });
         self.conv_states.iter_mut().for_each(|v| *v = None);
     }
 }
@@ -407,22 +604,40 @@ impl Attention {
         let k = self.apply_rotary_emb(&k, index_pos, cache)?;
 
         // Handle KV cache
-        let (k, v) = if cache.use_kv_cache {
-            match &cache.kvs[block_idx] {
-                Some((k_cache, v_cache)) if index_pos > 0 => {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?.contiguous()?;
-                    let v = Tensor::cat(&[v_cache, &v], 2)?.contiguous()?;
+        let (k, v) = if !cache.use_kv_cache {
+            (k, v)
+        } else {
+            match cache.kv_append {
+                KvAppend::Cat => {
+                    let (k, v) = match &cache.kvs[block_idx] {
+                        Some((k_cache, v_cache)) if index_pos > 0 => {
+                            let k = Tensor::cat(&[k_cache, &k], 2)?.contiguous()?;
+                            let v = Tensor::cat(&[v_cache, &v], 2)?.contiguous()?;
+                            (k, v)
+                        }
+                        _ => (k, v),
+                    };
+                    cache.kvs[block_idx] = Some((k.clone(), v.clone()));
                     (k, v)
                 }
-                _ => (k, v),
+                KvAppend::InPlace => {
+                    // `slice_set` requires a contiguous source. `k` comes from
+                    // `rope`, which returns a fresh contiguous tensor; `v` was
+                    // made contiguous above. Asserted rather than assumed,
+                    // because a non-contiguous source is an error here and a
+                    // silent full copy under `Tensor::cat`.
+                    let k = k.contiguous()?;
+                    let v = v.contiguous()?;
+                    let (k_slot, v_slot) = &mut cache.kv_slots[block_idx];
+                    // A turn boundary re-prefills without clearing, so this is
+                    // a `seq_len > 1` append onto a non-empty slot. It is the
+                    // same call — the offset simply advances by more than one.
+                    let k = k_slot.append(&k)?;
+                    let v = v_slot.append(&v)?;
+                    (k, v)
+                }
             }
-        } else {
-            (k, v)
         };
-
-        if cache.use_kv_cache {
-            cache.kvs[block_idx] = Some((k.clone(), v.clone()));
-        }
 
         // The fused kernel is GQA-native — it derives `gqa_factor` from the head
         // counts and indexes `kv_head_idx = head_idx / gqa_factor` in registers
@@ -730,5 +945,174 @@ impl Model {
 
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two arms' shapes and contents, built the way `Attention::forward`
+    /// builds them: `[b_sz, n_kv_heads, seq, head_dim]`, appended along dim 2.
+    fn token(step: usize, dev: &Device) -> Result<Tensor> {
+        // Distinct values per step and per element, so a transposed or
+        // misaligned write is visible rather than accidentally equal. #11.3l's
+        // finding 3 is the rule: a fixture whose values coincide proves nothing.
+        let n: Vec<f32> = (0..2 * 3).map(|i| (step * 100 + i) as f32).collect();
+        Tensor::from_vec(n, (1, 2, 1, 3), dev)
+    }
+
+    /// The reference: what `Tensor::cat` produces, step by step.
+    fn cat_reference(steps: usize, dev: &Device) -> Result<Tensor> {
+        let mut acc: Option<Tensor> = None;
+        for s in 0..steps {
+            let t = token(s, dev)?;
+            acc = Some(match acc {
+                None => t,
+                Some(a) => Tensor::cat(&[&a, &t], 2)?.contiguous()?,
+            });
+        }
+        acc.ok_or_else(|| candle::Error::Msg("no steps".into()))
+    }
+
+    /// **The parity test.** In-place append must equal `Tensor::cat` exactly.
+    ///
+    /// Bit-equality rather than a tolerance: this moves bytes and does no
+    /// arithmetic, so `DESIGN.md` §2.3.5a's changed-digest procedure does not
+    /// apply and anything but equality is a defect.
+    #[test]
+    fn in_place_append_matches_cat() -> Result<()> {
+        let dev = Device::Cpu;
+        for steps in 1..=6 {
+            let mut slot = KvSlot::new(8);
+            let mut got = None;
+            for s in 0..steps {
+                got = Some(slot.append(&token(s, &dev)?)?);
+            }
+            let got = got.unwrap();
+            let want = cat_reference(steps, &dev)?;
+            assert_eq!(got.dims(), want.dims(), "shape at {steps} steps");
+            assert_eq!(
+                got.flatten_all()?.to_vec1::<f32>()?,
+                want.flatten_all()?.to_vec1::<f32>()?,
+                "values at {steps} steps"
+            );
+        }
+        Ok(())
+    }
+
+    /// A turn boundary: `seq_len > 1` appended onto a non-empty slot.
+    ///
+    /// This is the case `lfm2-smoke`'s turn 2 exercises and the one §11.1a's
+    /// single-turn limitation is the precedent for — a second prefill writes
+    /// several positions at a non-zero offset. It is the same `slice_set` call
+    /// with a larger `src`, and the point of the test is that nothing special
+    /// happens.
+    #[test]
+    fn in_place_survives_a_multi_token_append_at_a_nonzero_offset() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut slot = KvSlot::new(8);
+        slot.append(&token(0, &dev)?)?;
+        slot.append(&token(1, &dev)?)?;
+        // A 3-token "prefill" on top of 2 decoded tokens.
+        let prefill = Tensor::cat(&[&token(2, &dev)?, &token(3, &dev)?, &token(4, &dev)?], 2)?
+            .contiguous()?;
+        let got = slot.append(&prefill)?;
+        let want = cat_reference(5, &dev)?;
+        assert_eq!(got.dims(), &[1, 2, 5, 3]);
+        assert_eq!(
+            got.flatten_all()?.to_vec1::<f32>()?,
+            want.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    /// The read is a *view*, and that is the property §11.1a.1 wants.
+    ///
+    /// A `narrow` clones the storage `Arc` and rewrites only the layout, so one
+    /// allocation backs every step and the binding is the same `MTLBuffer` every
+    /// token. If this silently became a copy, the dispatch count and every
+    /// digest would be **unchanged** and only the buffer identity would move —
+    /// which no gate in this project can see. Hence a test.
+    ///
+    /// Observed by aliasing rather than by pointer equality: `same_storage` is
+    /// `pub(crate)` to `candle-core`, and widening a core API for one assertion
+    /// is a larger change than the assertion is worth. A later `append` writes
+    /// through the backing buffer, so if the earlier return value was a view it
+    /// sees nothing (the write lands past its length) while its *own* bytes stay
+    /// readable — and if it were a copy, `all_data` and the view would have
+    /// diverged. The discriminating check is that the backing buffer carries
+    /// every step's bytes at the offsets the views reported.
+    #[test]
+    fn the_read_is_a_view_of_the_preallocated_buffer() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut slot = KvSlot::new(8);
+        let first = slot.append(&token(0, &dev)?)?;
+        let first_before = first.flatten_all()?.to_vec1::<f32>()?;
+        let second = slot.append(&token(1, &dev)?)?;
+
+        // The step-2 write must not have disturbed step 1's region.
+        assert_eq!(
+            first.flatten_all()?.to_vec1::<f32>()?,
+            first_before,
+            "appending must not rewrite the live prefix"
+        );
+
+        // Both views must be prefixes of one buffer: read the backing store at
+        // full capacity and check each view equals its own leading slice.
+        let backing = slot.all_data.as_ref().unwrap();
+        for (steps, view) in [(1usize, &first), (2usize, &second)] {
+            let want = backing
+                .narrow(2, 0, steps)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(
+                view.flatten_all()?.to_vec1::<f32>()?,
+                want,
+                "the {steps}-step view must be the buffer's own prefix"
+            );
+        }
+        Ok(())
+    }
+
+    /// Exhaustion is an error, not a silent reallocation.
+    ///
+    /// `candle_nn::kv_cache::Cache` grows by `Tensor::cat` here; this declines,
+    /// because growing would put back the reallocation this change removes and
+    /// would move the buffer identity, both at the moment the cache is largest.
+    /// See `Cache::new_with` for why no policy is chosen.
+    #[test]
+    fn exceeding_capacity_fails_loudly() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut slot = KvSlot::new(2);
+        slot.append(&token(0, &dev)?)?;
+        slot.append(&token(1, &dev)?)?;
+        let err = slot.append(&token(2, &dev)?).unwrap_err().to_string();
+        assert!(
+            err.contains("KV cache exhausted"),
+            "expected a capacity error, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// `clear()` must reach the in-place slots too.
+    ///
+    /// Resetting only `kvs` would leave a stale buffer that the next sequence
+    /// appends *after*, so its first token would read `len` zeros in front of
+    /// it — a wrong answer that every shape check passes.
+    #[test]
+    fn reset_returns_the_slot_to_its_pre_prefill_state() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut slot = KvSlot::new(8);
+        slot.append(&token(0, &dev)?)?;
+        slot.append(&token(1, &dev)?)?;
+        slot.reset();
+        let got = slot.append(&token(0, &dev)?)?;
+        assert_eq!(got.dims(), &[1, 2, 1, 3], "a reset slot starts at length 1");
+        assert_eq!(
+            got.flatten_all()?.to_vec1::<f32>()?,
+            cat_reference(1, &dev)?.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
     }
 }

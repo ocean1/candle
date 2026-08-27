@@ -103,6 +103,8 @@ struct Axes {
     gpu_offsets: bool,
     /// The attention arm, echoed for the run line.
     attn: String,
+    /// The KV-append arm, echoed for the run line (issue #142).
+    kv_append: String,
 }
 
 impl Axes {
@@ -172,6 +174,7 @@ impl Axes {
             layout,
             gpu_offsets,
             attn: args.attn.clone(),
+            kv_append: args.kv_append.clone(),
         })
     }
 
@@ -183,7 +186,7 @@ impl Axes {
         // line states every axis §7.1 has.
         format!(
             "ParamStyle=Split ArenaLayout={} ArenaOffsets={} HazardKey={} AttnImpl={} \
-             ScratchSizing=none",
+             KvAppend={} ScratchSizing=none",
             if self.arena {
                 #[cfg(feature = "metal")]
                 {
@@ -205,6 +208,11 @@ impl Axes {
                 "Sdpa"
             } else {
                 "Generic"
+            },
+            if self.kv_append == "in-place" {
+                "InPlace"
+            } else {
+                "Cat"
             },
         )
     }
@@ -320,6 +328,11 @@ struct Args {
     /// GQA-native `sdpa_vector`).
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// KV cache growth: `cat` (the default `Tensor::cat` reallocation) or
+    /// `in-place` (pre-allocated, written at a moving offset -- issue #142).
+    #[arg(long, default_value = "cat")]
+    kv_append: String,
 
     /// Decode steps recorded before the arena is installed.
     ///
@@ -527,6 +540,12 @@ fn main() -> Result<()> {
         "generic" => candle_transformers::models::lfm2::AttnImpl::Generic,
         "sdpa" => candle_transformers::models::lfm2::AttnImpl::Sdpa,
         other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
+    };
+    // Refused rather than defaulted, for the same reason as `--attn`.
+    config.kv_append = match args.kv_append.as_str() {
+        "cat" => candle_transformers::models::lfm2::KvAppend::Cat,
+        "in-place" => candle_transformers::models::lfm2::KvAppend::InPlace,
+        other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
