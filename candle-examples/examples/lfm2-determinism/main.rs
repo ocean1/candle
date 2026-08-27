@@ -249,6 +249,33 @@ struct Args {
     /// which is why this is gated on the digest and not on the count.
     #[arg(long, default_value = "run-start")]
     icb_barrier_scope: String,
+
+    /// Suspend the ICB executor across each turn-boundary prefill (lloom #154).
+    ///
+    /// `DESIGN.md` §11.3l records the executor as single-turn, because "32
+    /// positions go stale at the first turn boundary -- the recording was made
+    /// against turn 1's buffers and a new turn re-prefills". The first half is
+    /// reproducible and the second is a claim about *why*, and this flag is the
+    /// control that separates them.
+    ///
+    /// The mechanism it tests: a turn's prefill runs `seq_len > 1`, which takes
+    /// different code paths than decode -- GEMM rather than GEMV, `Conv1d`
+    /// rather than the `seq_len == 1` state path (`lfm2.rs`) -- and it is
+    /// offered to the executor inside the step window the previous decode
+    /// opened, because `end_step` is only called after a *decode* forward. So
+    /// the recording is compared against a prefill's dispatches, position by
+    /// position.
+    ///
+    /// If that is the cause, swapping the slot to `Classical` for the duration
+    /// of the prefill and back afterwards takes `stale` to 0 while leaving
+    /// coverage and the digest unchanged. If a turn boundary genuinely
+    /// invalidated the recording, it will not.
+    ///
+    /// **A probe, not a fix.** It does not re-record, so it establishes what
+    /// goes stale and why; it is not a proposal for how a multi-turn executor
+    /// should be built.
+    #[arg(long)]
+    icb_classical_prefill: bool,
 }
 
 /// Follow-up prompts for multi-turn mode, cycled in order.
@@ -638,11 +665,48 @@ fn main() -> Result<()> {
                 .to_vec()
         };
 
+        // Swap the executor out for the prefill, if asked (lloom #154). The
+        // slot is restored immediately after, so decode still replays and the
+        // only thing that changed is whether a `seq_len > 1` pass was offered
+        // against a `seq_len == 1` recording.
+        #[cfg(feature = "metal")]
+        let icb_suspended = args.icb_classical_prefill
+            && turn > 0
+            && icb_executor.is_some()
+            && decode_steps > icb_installed_at;
+        #[cfg(feature = "metal")]
+        if icb_suspended {
+            if let Some(dev) = metal_device.as_ref() {
+                dev.set_executor(std::sync::Arc::new(
+                    candle_metal_kernels::metal::ExecutorSlot::Classical,
+                ));
+            }
+        }
+
         let input = Tensor::new(turn_ids.as_slice(), &device)?.unsqueeze(0)?;
         let mut logits = model
             .forward(&input, kv_len, &mut cache)
             .context("prefill forward pass")?
             .squeeze(0)?;
+
+        #[cfg(feature = "metal")]
+        if icb_suspended {
+            if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+                // Close a step across the boundary before re-arming. The
+                // executor's `position` counter and the constants pool's cursor
+                // both reset here, and the prefill ran outside the executor but
+                // *not* outside the pool -- so without this the next decode
+                // step's packed dispatches take different constants buffers
+                // than the recording did, and the positions go stale on
+                // identity rather than on anything to do with the turn.
+                exec.end_step(dev.metal_device())
+                    .map_err(|e| anyhow::anyhow!("closing ICB step at turn boundary: {e}"))?;
+                dev.set_executor(std::sync::Arc::new(
+                    candle_metal_kernels::metal::ExecutorSlot::Custom(exec.clone()),
+                ));
+            }
+        }
+
         kv_len += turn_ids.len();
         turns_run = turn + 1;
 
@@ -813,6 +877,13 @@ fn main() -> Result<()> {
         // totals would read the first half as a win and never see the second.
         for ((kernel, reason), n) in &cov.excluded_by_kernel {
             println!("ICB excluded {n:4} {kernel:<40} {reason}");
+        }
+        // Which axis invalidated each stale recording (lloom #154). A count
+        // alone cannot tell a moved grid from a moved binding, and §11.3l's
+        // explanation for the 32 -- "a new turn re-prefills" -- is a claim
+        // about *why*, so checking it needs the axis rather than the total.
+        for ((kernel, axis), n) in exec.stale_by_axis() {
+            println!("ICB stale    {n:4} {kernel:<40} {axis}");
         }
         anyhow::ensure!(
             exec.is_replaying() && cov.covered > 0,

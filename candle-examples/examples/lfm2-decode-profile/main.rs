@@ -328,6 +328,34 @@ struct Args {
     /// sized by `kv_len` (§9.1, #68 finding 4).
     #[arg(long, default_value_t = 2)]
     arena_record_steps: usize,
+
+    /// Conversational turns to run against one cache (lloom #154).
+    ///
+    /// Turn 0 prefills `--prompt`; each later turn prefills a follow-up on top
+    /// of the *same* cache, exactly as `lfm2-determinism --turns` and
+    /// `lfm2-smoke` already do. Each turn's prefill is timed into its own
+    /// bucket and reported with the `kv_len` it ran at, so the question this
+    /// axis exists for -- does a turn boundary re-prefill the whole context or
+    /// only the new tokens -- is answered by whether the per-turn figure tracks
+    /// the new-token count or the running `kv_len`.
+    ///
+    /// **Decode timing is unaffected**: `--n` still counts decode tokens in
+    /// total across turns and the steady-state average still excludes every
+    /// prefill, so a `--turns 3` run's ms/token is comparable to a `--turns 1`
+    /// run's. What is *not* comparable is prefill: turn 0 pays the first-touch
+    /// page-in of the 5.39 GB weight set and later turns do not (§2.4), which
+    /// is the whole reason the turns are reported separately rather than
+    /// averaged.
+    #[arg(long, default_value_t = 1)]
+    turns: usize,
+
+    /// Follow-up prompt each turn after the first appends to the cache.
+    ///
+    /// One string reused rather than a list: the axis this measures is
+    /// `kv_len`, and varying the text between turns would vary the token count
+    /// too, confounding the two.
+    #[arg(long, default_value = "Now summarize that in one sentence.")]
+    follow_up: String,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -585,36 +613,36 @@ fn main() -> Result<()> {
         .to_vec();
     anyhow::ensure!(!prompt_ids.is_empty(), "prompt tokenized to nothing");
 
-    // ---- prefill, timed into its own bucket ------------------------------
-
-    // Synchronize before starting the clock so no earlier work (weight upload,
-    // cache allocation) lands inside the window.
-    device.synchronize()?;
-    if profiling {
-        profile::reset();
-    }
-
-    let prefill_start = std::time::Instant::now();
-    let input = Tensor::new(prompt_ids.as_slice(), &device)?.unsqueeze(0)?;
-    let mut logits = model
-        .forward(&input, 0, &mut cache)
-        .context("prefill forward pass")?
-        .squeeze(0)?;
-    // Force the prefill to complete before the clock stops; candle is
-    // asynchronous, so without this the time recorded is submission, not
-    // execution.
-    device.synchronize()?;
-    let prefill_wall = prefill_start.elapsed();
-
-    let prefill_profile = if profiling {
-        let s = profile::snapshot();
-        profile::reset();
-        Some(s)
+    anyhow::ensure!(args.turns >= 1, "--turns must be at least 1");
+    let follow_up_ids = if args.turns > 1 {
+        let text = format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            args.follow_up
+        );
+        let ids = tokenizer
+            .encode(text.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("tokenizing follow-up: {e}"))?
+            .get_ids()
+            .to_vec();
+        anyhow::ensure!(!ids.is_empty(), "--follow-up tokenized to nothing");
+        ids
     } else {
-        None
+        Vec::new()
     };
 
-    let mut kv_len = prompt_ids.len();
+    // One row per turn's prefill: (tokens fed, kv_len it ran at, wall s, gpu s,
+    // dispatches). The whole point of the `--turns` axis is that these rows are
+    // reported rather than averaged: turn 0 carries the first-touch page-in of
+    // the weight set and the later ones do not (§2.4), so a mean over them
+    // describes neither.
+    struct TurnPrefill {
+        fed: usize,
+        kv_len_at: usize,
+        wall: f64,
+        gpu: f64,
+        dispatches: u64,
+    }
+    let mut prefills: Vec<TurnPrefill> = Vec::with_capacity(args.turns);
 
     // ---- decode, one timed window per token ------------------------------
 
@@ -623,146 +651,231 @@ fn main() -> Result<()> {
     let mut tokens: Vec<u32> = Vec::with_capacity(args.n);
     let mut hit_eos = false;
     let mut last_token_kernels: Vec<(String, u64)> = Vec::new();
+    let mut kv_len = 0usize;
+    // Which entries of `steps` belong to which turn, so `--warmup` can be
+    // applied per turn rather than once over the concatenation.
+    let mut turn_step_idx: Vec<Vec<usize>> = Vec::with_capacity(args.turns);
 
     #[cfg(feature = "metal")]
     let metal_device = match &device {
         Device::Metal(d) => Some(d.clone()),
         _ => None,
     };
-    while tokens.len() < args.n {
-        let next = logits_processor.sample(&logits).context("sampling")?;
-        if eos_ids.contains(&next) {
-            // The point is a steady-state decode measurement, so generation
-            // continues past the model's natural stopping point. Recorded
-            // because past EOS the text degenerates, and a reader should know
-            // the tail was not on-distribution.
-            hit_eos = true;
-        }
-        tokens.push(next);
 
-        // Arena recording spans the first `record_steps` decode steps.
-        //
-        // `next_arena_recording_step` between them is load-bearing rather than
-        // bookkeeping: a plan needs **two** steps, because comparing them is what
-        // separates an activation from session state -- an allocation whose size
-        // moved between them is sized by `kv_len` and must not enter the arena
-        // (§9.1, #68 finding 4). Recording one step makes the planner refuse and
-        // return no allocations, which presents as an arena arm that silently
-        // ran on the pool.
-        #[cfg(feature = "metal")]
-        if axes.arena {
-            if let Some(dev) = metal_device.as_ref() {
-                let step = tokens.len() - 1;
-                if step == 0 {
-                    dev.begin_arena_recording();
-                } else if step < axes.record_steps {
-                    dev.next_arena_recording_step();
-                }
-                dev.begin_decode_step();
-            }
-        }
+    // Decode tokens are split evenly across the turns, so `--n` keeps meaning
+    // "decode tokens timed" whatever `--turns` is and the steady-state average
+    // stays comparable across values of it. The remainder goes to the last turn
+    // rather than the first, so turn 0 -- the one carrying page-in -- does not
+    // also carry a different token count.
+    let per_turn = args.n / args.turns;
+    anyhow::ensure!(
+        per_turn > args.warmup,
+        "--n {} over --turns {} leaves {per_turn} decode tokens per turn, \
+         which does not exceed --warmup {}; raise --n or lower --turns",
+        args.n,
+        args.turns,
+        args.warmup
+    );
 
-        let step_start = std::time::Instant::now();
-        let input = Tensor::new(&[next], &device)?.unsqueeze(0)?;
-        logits = model
-            .forward(&input, kv_len, &mut cache)
-            .context("decode forward pass")?
-            .squeeze(0)?;
-        // One synchronization per token. This is what makes the window a single
-        // token rather than a submission queue, and it is also what the decode
-        // loop does anyway: sampling reads the logits back to the CPU, so the
-        // serialization is inherent to the workload, not an artifact of
-        // measuring it.
+    'turns: for turn in 0..args.turns {
+        // Turn 0 prefills the prompt; every later turn appends a follow-up to
+        // the same cache. `kv_len` is never reset and `Cache` is never cleared,
+        // which is the behaviour this axis exists to time rather than an
+        // assumption it makes -- see `lfm2.rs`'s `Attention::forward`, where the
+        // `index_pos > 0` arm appends to the existing cache.
+        let turn_ids: &[u32] = if turn == 0 {
+            &prompt_ids
+        } else {
+            &follow_up_ids
+        };
+
+        // Synchronize before starting the clock so no earlier work (weight
+        // upload, cache allocation, the previous turn's decode) lands inside
+        // the window.
         device.synchronize()?;
-        let wall = step_start.elapsed().as_secs_f64();
+        if profiling {
+            profile::reset();
+        }
 
-        let (gpu, disp) = if profiling {
+        let prefill_start = std::time::Instant::now();
+        let input = Tensor::new(turn_ids, &device)?.unsqueeze(0)?;
+        #[allow(unused_assignments)]
+        let mut logits = model
+            .forward(&input, kv_len, &mut cache)
+            .with_context(|| format!("turn {turn} prefill forward pass"))?
+            .squeeze(0)?;
+        // Force the prefill to complete before the clock stops; candle is
+        // asynchronous, so without this the time recorded is submission, not
+        // execution.
+        device.synchronize()?;
+        let prefill_wall = prefill_start.elapsed().as_secs_f64();
+
+        let (prefill_gpu, prefill_disp) = if profiling {
             let s = profile::snapshot();
             profile::reset();
-            // Kept from the last iteration: the counters are reset per token, so
-            // after the loop there is nothing left to read. This is one token's
-            // kernel mix, which is what the inventory should be.
-            last_token_kernels = s.by_label.clone();
             (s.gpu_busy_union_s, s.dispatches)
         } else {
             (0.0, 0)
         };
 
-        // The arena is derived from the first `record_steps` decode steps and
-        // installed after them, so those steps run on the pool and are excluded
-        // from the steady-state average below. Placed after the timing snapshot
-        // so the install itself is not counted into a token.
-        #[cfg(feature = "metal")]
-        if axes.arena {
-            if let Some(dev) = metal_device.as_ref() {
-                dev.end_decode_step();
-                // `tokens.len() - 1` is this step's index, so the install fires
-                // on the last recorded step -- the same `record_steps - 1`
-                // condition the dispatch-trace harness uses.
-                if tokens.len() - 1 == axes.record_steps - 1 {
-                    let excluded = dev.arena_recording_excluded();
-                    let by_test = dev.arena_recording_excluded_by_test();
-                    let plan = dev
-                        .finish_arena_recording(axes.layout)
-                        .context("arena recording produced no allocations")?;
-                    let (covered, total) = plan.covered();
-                    if let Some((n_excl, n_all)) = excluded {
-                        eprintln!(
-                            "arena: {n_all} allocations recorded over {} steps, \
-                             {n_excl} excluded as session state",
-                            axes.record_steps
-                        );
-                        // Split by detector, because neither subsumes the other
-                        // and a zero on either side is a result: size growth
-                        // finds the KV cache, cross-step liveness finds the conv
-                        // state, which never grows (§5.7, §9.2c).
-                        if let Some((by_size, by_step)) = by_test {
-                            eprintln!(
-                                "arena:   {by_size} caught by size growth (kv_len), \
-                                 {by_step} by outliving the step"
-                            );
-                        }
+        prefills.push(TurnPrefill {
+            fed: turn_ids.len(),
+            kv_len_at: kv_len,
+            wall: prefill_wall,
+            gpu: prefill_gpu,
+            dispatches: prefill_disp,
+        });
+        kv_len += turn_ids.len();
+
+        let turn_budget = if turn + 1 == args.turns {
+            args.n - tokens.len()
+        } else {
+            per_turn
+        };
+        let turn_end = tokens.len() + turn_budget;
+        let mut turn_steps: Vec<usize> = Vec::with_capacity(turn_budget);
+
+        while tokens.len() < turn_end {
+            let next = logits_processor.sample(&logits).context("sampling")?;
+            if eos_ids.contains(&next) {
+                // The point is a steady-state decode measurement, so generation
+                // continues past the model's natural stopping point. Recorded
+                // because past EOS the text degenerates, and a reader should know
+                // the tail was not on-distribution.
+                hit_eos = true;
+            }
+            tokens.push(next);
+
+            // Arena recording spans the first `record_steps` decode steps.
+            //
+            // `next_arena_recording_step` between them is load-bearing rather than
+            // bookkeeping: a plan needs **two** steps, because comparing them is what
+            // separates an activation from session state -- an allocation whose size
+            // moved between them is sized by `kv_len` and must not enter the arena
+            // (§9.1, #68 finding 4). Recording one step makes the planner refuse and
+            // return no allocations, which presents as an arena arm that silently
+            // ran on the pool.
+            #[cfg(feature = "metal")]
+            if axes.arena {
+                if let Some(dev) = metal_device.as_ref() {
+                    let step = tokens.len() - 1;
+                    if step == 0 {
+                        dev.begin_arena_recording();
+                    } else if step < axes.record_steps {
+                        dev.next_arena_recording_step();
                     }
-                    let monotone = plan.is_bump_reproducible();
-                    eprintln!(
-                        "arena: {covered} of {total} ordinals served -> {} slots, {} B ({:?})",
-                        plan.slots().len(),
-                        plan.arena_bytes(),
-                        axes.layout,
-                    );
-                    dev.install_arena(plan, axes.layout)
-                        .context("installing the arena")?;
-                    if axes.gpu_offsets {
-                        // Checked against the plan that was recorded, not
-                        // against the layout's name: a plan that somehow is not
-                        // monotone must fail before a wrong offset can be bound
-                        // rather than after (§9.3 -- there is no other
-                        // detector).
-                        if !monotone {
-                            anyhow::bail!(
-                                "the recorded plan's offsets are not monotone, so a bump \
+                    dev.begin_decode_step();
+                }
+            }
+
+            let step_start = std::time::Instant::now();
+            let input = Tensor::new(&[next], &device)?.unsqueeze(0)?;
+            logits = model
+                .forward(&input, kv_len, &mut cache)
+                .context("decode forward pass")?
+                .squeeze(0)?;
+            // One synchronization per token. This is what makes the window a single
+            // token rather than a submission queue, and it is also what the decode
+            // loop does anyway: sampling reads the logits back to the CPU, so the
+            // serialization is inherent to the workload, not an artifact of
+            // measuring it.
+            device.synchronize()?;
+            let wall = step_start.elapsed().as_secs_f64();
+
+            let (gpu, disp) = if profiling {
+                let s = profile::snapshot();
+                profile::reset();
+                // Kept from the last iteration: the counters are reset per token, so
+                // after the loop there is nothing left to read. This is one token's
+                // kernel mix, which is what the inventory should be.
+                last_token_kernels = s.by_label.clone();
+                (s.gpu_busy_union_s, s.dispatches)
+            } else {
+                (0.0, 0)
+            };
+
+            // The arena is derived from the first `record_steps` decode steps and
+            // installed after them, so those steps run on the pool and are excluded
+            // from the steady-state average below. Placed after the timing snapshot
+            // so the install itself is not counted into a token.
+            #[cfg(feature = "metal")]
+            if axes.arena {
+                if let Some(dev) = metal_device.as_ref() {
+                    dev.end_decode_step();
+                    // `tokens.len() - 1` is this step's index, so the install fires
+                    // on the last recorded step -- the same `record_steps - 1`
+                    // condition the dispatch-trace harness uses.
+                    if tokens.len() - 1 == axes.record_steps - 1 {
+                        let excluded = dev.arena_recording_excluded();
+                        let by_test = dev.arena_recording_excluded_by_test();
+                        let plan = dev
+                            .finish_arena_recording(axes.layout)
+                            .context("arena recording produced no allocations")?;
+                        let (covered, total) = plan.covered();
+                        if let Some((n_excl, n_all)) = excluded {
+                            eprintln!(
+                                "arena: {n_all} allocations recorded over {} steps, \
+                             {n_excl} excluded as session state",
+                                axes.record_steps
+                            );
+                            // Split by detector, because neither subsumes the other
+                            // and a zero on either side is a result: size growth
+                            // finds the KV cache, cross-step liveness finds the conv
+                            // state, which never grows (§5.7, §9.2c).
+                            if let Some((by_size, by_step)) = by_test {
+                                eprintln!(
+                                    "arena:   {by_size} caught by size growth (kv_len), \
+                                 {by_step} by outliving the step"
+                                );
+                            }
+                        }
+                        let monotone = plan.is_bump_reproducible();
+                        eprintln!(
+                            "arena: {covered} of {total} ordinals served -> {} slots, {} B ({:?})",
+                            plan.slots().len(),
+                            plan.arena_bytes(),
+                            axes.layout,
+                        );
+                        dev.install_arena(plan, axes.layout)
+                            .context("installing the arena")?;
+                        if axes.gpu_offsets {
+                            // Checked against the plan that was recorded, not
+                            // against the layout's name: a plan that somehow is not
+                            // monotone must fail before a wrong offset can be bound
+                            // rather than after (§9.3 -- there is no other
+                            // detector).
+                            if !monotone {
+                                anyhow::bail!(
+                                    "the recorded plan's offsets are not monotone, so a bump \
                                  allocator cannot reproduce them"
+                                );
+                            }
+                            let served = dev
+                                .install_gpu_arena_offsets()
+                                .context("computing arena offsets on the GPU")?;
+                            // The engagement check §2.4 requires: this reads `Gpu`
+                            // only after the table was verified equal to the plan
+                            // element-wise, so it is evidence the GPU allocator ran
+                            // and agreed -- not that a flag was passed.
+                            eprintln!(
+                                "arena: offsets computed on the GPU and verified against the plan \
+                             ({served} ordinals); source now {:?}",
+                                dev.arena_offsets()
                             );
                         }
-                        let served = dev
-                            .install_gpu_arena_offsets()
-                            .context("computing arena offsets on the GPU")?;
-                        // The engagement check §2.4 requires: this reads `Gpu`
-                        // only after the table was verified equal to the plan
-                        // element-wise, so it is evidence the GPU allocator ran
-                        // and agreed -- not that a flag was passed.
-                        eprintln!(
-                            "arena: offsets computed on the GPU and verified against the plan \
-                             ({served} ordinals); source now {:?}",
-                            dev.arena_offsets()
-                        );
                     }
                 }
             }
+
+            steps.push((wall, gpu, disp));
+            turn_steps.push(steps.len() - 1);
+            kv_len += 1;
         }
 
-        steps.push((wall, gpu, disp));
-        kv_len += 1;
+        turn_step_idx.push(turn_steps);
+        if tokens.len() >= args.n {
+            break 'turns;
+        }
     }
 
     // ---- summarize -------------------------------------------------------
@@ -774,14 +887,26 @@ fn main() -> Result<()> {
     // in addition to `--warmup`, not instead of it: they are a different
     // allocator, where warmup is a cold one.
     let arena_skip = if axes.arena { axes.record_steps } else { 0 };
-    let warmup = args.warmup.max(arena_skip).min(steps.len());
-    let steady = &steps[warmup..];
+    let warmup = args.warmup.max(arena_skip);
+
+    // `--warmup` is applied **per turn**, not once over the concatenated run.
+    // Each turn's first decode tokens follow that turn's prefill and are the
+    // same cold shape the run's very first tokens are -- excluding them only
+    // from turn 0 would average a warm mean over turn 0 and a cold-plus-warm
+    // one over the rest, and attribute the difference to `--turns`.
+    let steady: Vec<(f64, f64, u64)> = turn_step_idx
+        .iter()
+        .flat_map(|idx| idx.iter().skip(warmup))
+        .map(|&i| steps[i])
+        .collect();
     anyhow::ensure!(
         !steady.is_empty(),
-        "no steady-state tokens left after {warmup} excluded tokens \
-         (--warmup {}, arena recording {arena_skip}); raise --n",
-        args.warmup
+        "no steady-state tokens left after excluding {warmup} per turn \
+         (--warmup {}, arena recording {arena_skip}) across {} turns; raise --n",
+        args.warmup,
+        turn_step_idx.len()
     );
+    let steady = &steady[..];
 
     let n_steady = steady.len() as f64;
     let wall_mean: f64 = steady.iter().map(|s| s.0).sum::<f64>() / n_steady;
@@ -850,27 +975,38 @@ fn main() -> Result<()> {
     );
     println!();
 
-    println!("=== prefill ({} tokens) ===", prompt_ids.len());
-    println!(
-        "wall                  {:.2} ms",
-        prefill_wall.as_secs_f64() * 1e3
-    );
-    if let Some(p) = &prefill_profile {
-        println!("gpu busy (union)      {:.2} ms", p.gpu_busy_union_s * 1e3);
-        println!("gpu busy (sum)        {:.2} ms", p.gpu_busy_sum_s * 1e3);
-        println!("dispatches            {}", p.dispatches);
-        println!("encoders              {}", p.encoders);
+    // One row per turn, never a mean over them. Turn 0 carries the first-touch
+    // page-in of the 5.39 GB weight set and the later turns do not (§2.4's 35x
+    // and 130x gaps), so an average over the rows describes neither -- and the
+    // comparison this table exists for is *between* the rows, not across them.
+    //
+    // `ms/fed` is the discriminator. If a turn boundary re-prefilled the whole
+    // context, wall would track `kv_len@` and this column would climb with it;
+    // if it prefills only the new tokens, the column is flat and wall tracks
+    // `fed`.
+    println!("=== prefill, per turn ===");
+    println!("turn  fed  kv_len@   wall ms   gpu ms  disp   ms/fed");
+    for (i, p) in prefills.iter().enumerate() {
         println!(
-            "command buffers       {} ({} timed)",
-            p.command_buffers, p.timed_command_buffers
+            "{:>4}  {:>3}  {:>7}  {:>8.2} {:>8.2}  {:>4}  {:>7.3}{}",
+            i,
+            p.fed,
+            p.kv_len_at,
+            p.wall * 1e3,
+            p.gpu * 1e3,
+            p.dispatches,
+            p.wall * 1e3 / p.fed as f64,
+            if i == 0 { "   <- page-in" } else { "" },
         );
     }
     println!();
 
     println!(
-        "=== decode, steady state ({} tokens, {} warmup excluded) ===",
+        "=== decode, steady state ({} tokens, {} warmup excluded per turn \
+         across {} turns) ===",
         steady.len(),
-        warmup
+        warmup,
+        turn_step_idx.len()
     );
     println!(
         "wall / token          {:.3} ms  (sd {:.3}, min {:.3}, med {:.3}, max {:.3})",
@@ -946,19 +1082,33 @@ fn main() -> Result<()> {
     // missing the commit and the variant axes; both are here, so a row can name
     // the configuration it was taken under rather than being read as
     // all-defaults by whoever finds it later.
+    // `prefill_ms` stays turn 0's, so a `--turns 1` run's RESULT line is
+    // byte-comparable with every one taken before this axis existed. The later
+    // turns are a separate field rather than folded in: averaging a page-in
+    // pass with warm ones is exactly what §2.4 says hides the gap, and a reader
+    // parsing `prefill_ms` is entitled to the quantity that name has always
+    // meant.
+    let turn_prefills = prefills
+        .iter()
+        .map(|p| format!("{}:{}:{:.2}", p.fed, p.kv_len_at, p.wall * 1e3))
+        .collect::<Vec<_>>()
+        .join(",");
     println!(
-        "RESULT label={} n={} warmup={} wall_ms_per_token={:.4} gpu_ms_per_token={:.4} \
+        "RESULT label={} n={} warmup={} turns={} wall_ms_per_token={:.4} gpu_ms_per_token={:.4} \
          nongpu_ms_per_token={:.4} dispatches_per_token={:.1} prefill_ms={:.2} \
+         turn_prefills_fed:kvlen:ms=[{}] \
          prompt_tokens={} weight_bytes={} dtype={:?} hit_eos={} profiling={} \
          config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
         warmup,
+        prefills.len(),
         wall_mean * 1e3,
         gpu_mean * 1e3,
         (wall_mean - gpu_mean) * 1e3,
         disp_mean,
-        prefill_wall.as_secs_f64() * 1e3,
+        prefills.first().map(|p| p.wall * 1e3).unwrap_or(0.0),
+        turn_prefills,
         prompt_ids.len(),
         weight_bytes,
         dtype,

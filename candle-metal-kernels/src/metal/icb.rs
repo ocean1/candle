@@ -145,6 +145,46 @@ impl StepDispatch {
             && self.threads_per_threadgroup == other.threads_per_threadgroup
             && self.bindings == other.bindings
     }
+
+    /// The first axis of `replay_compatible` on which two recordings differ.
+    ///
+    /// Ordered as the predicate tests them, so "the first" is well defined
+    /// rather than an arbitrary pick among several that moved. `bindings` is
+    /// split into `identity` and `offset` because those have different fixes:
+    /// a moved pointer wants stable identity (an arena or an in-place cache),
+    /// a moved offset wants indirect dispatch or a position-independent
+    /// formulation (`DESIGN.md` §11.1a.1's residual).
+    ///
+    /// Probe-only (lloom #154).
+    fn stale_axis(&self, other: &StepDispatch) -> &'static str {
+        if self.kernel != other.kernel {
+            return "kernel";
+        }
+        if self.grid != other.grid {
+            return "grid";
+        }
+        if self.threads_per_threadgroup != other.threads_per_threadgroup {
+            return "threadgroup";
+        }
+        if self.bindings.len() != other.bindings.len() {
+            return "binding-count";
+        }
+        for (a, b) in self.bindings.iter().zip(other.bindings.iter()) {
+            if a.ptr != b.ptr {
+                return "binding-identity";
+            }
+            if a.offset != b.offset {
+                return "binding-offset";
+            }
+            if a.len != b.len || a.is_output != b.is_output {
+                return "binding-extent";
+            }
+        }
+        // Unreachable when the caller has established `!replay_compatible`,
+        // and named rather than `unreachable!()` so a probe cannot panic a
+        // measurement run if the predicate ever grows a field this does not.
+        "unattributed"
+    }
 }
 
 /// How far back a command's barrier scan looks, i.e. what "ordered already"
@@ -275,6 +315,17 @@ struct Inner {
     /// means coverage is lower than the plan claims -- reporting the plan's
     /// figure while this is nonzero would overstate what ran.
     stale_positions: usize,
+    /// Why each stale position stopped matching: `(kernel, axis)` -> count.
+    ///
+    /// A count alone cannot distinguish a recording invalidated by a moved
+    /// *grid* from one invalidated by a moved *binding*, and those have
+    /// different fixes -- the first wants indirect dispatch, the second wants
+    /// stable identity. `DESIGN.md` §15.2 #11a is the general form: a per-axis
+    /// total says how many members an axis touches, not how many it owns, so
+    /// the attribution has to be recorded per member rather than summed.
+    ///
+    /// Probe-only (lloom #154). Nothing on a shipped path reads it.
+    stale_by_axis: std::collections::BTreeMap<(String, &'static str), usize>,
     /// Runs that went stale and are never replayed again.
     poisoned: std::collections::HashSet<usize>,
     /// Positions before this index are inside a run whose range already ran.
@@ -359,7 +410,10 @@ impl IcbExecutor {
     /// rather than argued: both arms are built, both are gated on the digest,
     /// and the barrier count moves between them, which is the quantity that
     /// shows the switch engaged (§2.4, §9.2f).
-    pub fn with_barrier_scope(record_steps: usize, barrier_scope: BarrierScope) -> Arc<IcbExecutor> {
+    pub fn with_barrier_scope(
+        record_steps: usize,
+        barrier_scope: BarrierScope,
+    ) -> Arc<IcbExecutor> {
         assert!(
             record_steps >= 2,
             "recording fewer than two steps cannot distinguish a stable position from one \
@@ -374,6 +428,7 @@ impl IcbExecutor {
                 range: None,
                 coverage: Coverage::default(),
                 stale_positions: 0,
+                stale_by_axis: std::collections::BTreeMap::new(),
                 poisoned: std::collections::HashSet::new(),
                 suppress_until: 0,
                 run_in_flight: 0,
@@ -509,6 +564,25 @@ impl IcbExecutor {
     /// Runs that went stale and are no longer replayed.
     pub fn poisoned_runs(&self) -> usize {
         self.inner.lock().unwrap().poisoned.len()
+    }
+
+    /// Stale positions attributed to the axis that moved: `(kernel, axis)`.
+    ///
+    /// The count `stale_positions` reports says *how many*; this says *why*,
+    /// and the two answer different questions. `DESIGN.md` §11.3l records 32
+    /// positions going stale at a turn boundary and attributes them to a new
+    /// turn re-prefilling; the axis is what distinguishes that explanation from
+    /// the alternatives, and it could not be checked without this.
+    ///
+    /// Probe-only (lloom #154).
+    pub fn stale_by_axis(&self) -> Vec<((String, &'static str), usize)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .stale_by_axis
+            .iter()
+            .map(|((k, a), n)| ((k.clone(), *a), *n))
+            .collect()
     }
 
     /// Barriers encoded onto ICB commands.
@@ -960,8 +1034,15 @@ impl Executor for IcbExecutor {
                     // and the digest gate is what says whether the step it was
                     // first seen on was already wrong.
                     if !plan.reference[cmd].replay_compatible(&live) {
-                        inner.stale_positions += 1;
+                        // The axis is read off `plan` before `inner` is
+                        // borrowed mutably, since `plan` borrows from it.
+                        let key = (
+                            live.kernel.as_deref().unwrap_or("<unnamed>").to_string(),
+                            plan.reference[cmd].stale_axis(&live),
+                        );
                         let run_index = inner.run_in_flight;
+                        inner.stale_positions += 1;
+                        *inner.stale_by_axis.entry(key).or_insert(0) += 1;
                         inner.poisoned.insert(run_index);
                     }
                     return DispatchAction::Suppress;
@@ -980,7 +1061,12 @@ impl Executor for IcbExecutor {
                     return DispatchAction::Encode;
                 }
                 if !plan.reference[cmd].replay_compatible(&live) {
+                    let key = (
+                        live.kernel.as_deref().unwrap_or("<unnamed>").to_string(),
+                        plan.reference[cmd].stale_axis(&live),
+                    );
                     inner.stale_positions += 1;
+                    *inner.stale_by_axis.entry(key).or_insert(0) += 1;
                     inner.poisoned.insert(run_index);
                     return DispatchAction::Encode;
                 }
