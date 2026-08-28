@@ -323,6 +323,58 @@ impl MetalDevice {
         self.private_buffers.set_free_budget(bytes);
     }
 
+    /// Installs `DESIGN.md` §9.5k's derived residual as a cap on unplanned
+    /// bytes, across both pools.
+    ///
+    /// `limit` is admission's `budget − predicted`; `planned_shared` and
+    /// `planned_private` are the parts of the predicted set each pool serves.
+    /// Both are needed because the two pools hold different classes and
+    /// `live_bytes` already contains them (§9.5k):
+    ///
+    /// * **shared (`buffers`)** — the KV reserve, via `KvSlot::append` →
+    ///   `Tensor::zeros` → `allocate_buffer`.
+    /// * **private (`private_buffers`)** — the weights, via `to_dtype` →
+    ///   `new_buffer_builder` → `new_buffer`, *and* every activation
+    ///   intermediate (§6.3a's correction: `private_buffers` is not the weight
+    ///   pool, it is where both live).
+    ///
+    /// The **arena is in neither**, because `install_arena` calls the raw
+    /// device — it is the one class of the five genuinely outside the pools,
+    /// which is why admission subtracts it from the budget and not from a
+    /// pool's holdings.
+    ///
+    /// # The limit is per pool, and that is deliberate
+    ///
+    /// Each pool is given the whole residual rather than a share of it, so the
+    /// bound is *"neither pool alone exceeds the residual"* rather than *"their
+    /// sum does not"*. Splitting it would need a policy for the split that no
+    /// measurement supports — §9.5b puts no figure on how unplanned bytes
+    /// divide between the two — and the looser bound is the one that cannot
+    /// refuse a run that would have been fine. **It is a backstop against
+    /// unbounded growth, not an accountant**: §6.3b's stranding, the one
+    /// instance of that shape ever measured, lands in a single pool.
+    pub fn set_residual_cap(&self, limit: usize, planned_shared: usize, planned_private: usize) {
+        self.buffers.set_residual_cap(limit, planned_shared);
+        self.private_buffers
+            .set_residual_cap(limit, planned_private);
+    }
+
+    /// Removes the residual cap from both pools, restoring the unbounded
+    /// behaviour that shipped.
+    pub fn clear_residual_cap(&self) {
+        self.buffers.clear_residual_cap();
+        self.private_buffers.clear_residual_cap();
+    }
+
+    /// Unplanned bytes in each pool, shared first, or `None` where no cap is
+    /// installed.
+    pub fn unplanned_bytes(&self) -> (Option<usize>, Option<usize>) {
+        (
+            self.buffers.unplanned_bytes(),
+            self.private_buffers.unplanned_bytes(),
+        )
+    }
+
     /// How many `MetalDevice` handles are alive, counted through the teardown
     /// guard.
     ///
@@ -725,6 +777,15 @@ impl MetalDevice {
             Some(b) => b,
             None => {
                 let alloc = buf_size(size);
+                // `DESIGN.md` §9.5k's one branch, on the derived residual. It
+                // sits on the pool MISS, after `acquire` has declined, because
+                // a hit allocates nothing and there is nothing to bound; and
+                // BEFORE `new_buffer`, because reporting an overrun after the
+                // allocation is committed is useless. Inert with no cap
+                // installed, which is every process that has not run admission.
+                self.private_buffers
+                    .check_residual(alloc)
+                    .map_err(|e| MetalError::Message(e.to_string()))?;
                 let new_buffer = self
                     .device
                     .new_buffer(alloc, PRIVATE_RESOURCE_OPTIONS)
@@ -849,6 +910,13 @@ impl MetalDevice {
             return Ok(b);
         }
         let size = buf_size(size);
+        // §9.5k's branch, on the pool miss and before the allocation -- see
+        // `new_buffer` above. This is the pool the KV reserve is served from
+        // (`KvSlot::append` -> `Tensor::zeros` -> here), which is why the
+        // subtracted `planned` figure includes KV.
+        self.buffers
+            .check_residual(size)
+            .map_err(|e| MetalError::Message(e.to_string()))?;
         let new_buffer = self
             .device
             .new_buffer(size, RESOURCE_OPTIONS)

@@ -306,8 +306,105 @@ struct PoolState {
     /// Cap on `free_bytes`. See `evict_over_budget` for why there has to be one.
     free_budget: usize,
 
+    /// Cap on bytes the pools hold that **no planner owns** — `DESIGN.md`
+    /// §9.5k's derived residual, installed by admission.
+    ///
+    /// `None` until a caller installs one, which is every pool in the tests and
+    /// the default `BufferPool::new`. **Absent means unbounded, which is the
+    /// behaviour that shipped**, so a process that never runs admission is
+    /// byte-for-byte what it was.
+    ///
+    /// See `residual_cap` for what it is, why the quantity it bounds is
+    /// derived rather than `live_bytes`, and why this is one branch rather
+    /// than a general gate.
+    residual: Option<ResidualCap>,
+
     counters: PoolCounters,
 }
+
+/// The derived cap on unplanned bytes, and the planned figure it is derived
+/// from (`DESIGN.md` §9.5k).
+///
+/// # Why a cap here at all, when §9.5e declines per-allocation checking
+///
+/// §9.5e declines a per-allocation gate on a **correctness** argument rather
+/// than a cost one: the allocation site is deep inside a forward pass, its
+/// caller is a `Tensor` op with no policy to apply, and the only available
+/// response is an error unwinding mid-token. **That argument is right, and it
+/// covers the classes admission KNOWS.** Checking those again at allocation
+/// time can only re-discover what was already decided, later and worse.
+///
+/// It does **not** cover the one class admission *derives*, because there is
+/// nothing for admission to have decided about it. So this is not a second
+/// gate doing admission's job worse — it is the backstop for the single term
+/// that can exceed its share at runtime, and **it cannot fire at all if
+/// admission was honest**.
+///
+/// # Why it is affordable
+///
+/// §9.5e's premise, from #167's ablation (§6.3d): **accounting is cheap,
+/// calling into Metal is not.** Eager residency notification cost
+/// +0.093 ms/token and the ablation with the bookkeeping kept and the Metal
+/// call skipped read baseline — so the cost was Metal's. This check calls into
+/// Metal **nowhere**: `live_bytes` and `free_bytes` are already maintained
+/// incrementally, `pending_bytes` is a sum over a list the same lock already
+/// holds, and the comparison is one branch on integers.
+#[derive(Clone, Copy, Debug)]
+struct ResidualCap {
+    /// `budget − predicted`: what is left for everything the five classes do
+    /// not name.
+    limit: usize,
+    /// The classes this pool serves — weights, KV, scratch, conv — which are
+    /// **already inside `live_bytes`** and must be subtracted before the
+    /// comparison.
+    ///
+    /// **Comparing `live_bytes` against `limit` would refuse the weights
+    /// themselves**: `to_dtype` puts them in `private_buffers` and
+    /// `KvSlot::append` puts KV in `buffers` (§9.5k). The arena is the one
+    /// class outside the pools, since `install_arena` calls the raw device.
+    planned: usize,
+}
+
+/// A fresh allocation would take the pool past its derived residual
+/// (`DESIGN.md` §9.5k).
+///
+/// **The failure stays ugly and becomes ugly at a known boundary rather than
+/// as a kernel panic** — which is the whole justification for the check. The
+/// two panics this design exists to prevent (§9.5a) gave a machine-wide
+/// `IOGPUGroupMemory` assertion with `memoryPressure` reading False; this gives
+/// an error naming the quantity that overran and the figure admission derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidualExceeded {
+    /// Bytes already held that no planner owns.
+    pub unplanned: usize,
+    /// The allocation that would have crossed the limit.
+    pub requested: usize,
+    /// `budget − predicted`, from admission.
+    pub limit: usize,
+    /// The predicted classes this pool serves, subtracted to get `unplanned`.
+    pub planned: usize,
+}
+
+impl std::fmt::Display for ResidualExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gb = |b: usize| b as f64 / 1e9;
+        write!(
+            f,
+            "memory residual exhausted: {:.2} GB unplanned + {:.2} GB requested \
+             > {:.2} GB residual (DESIGN.md §9.5k). {:.2} GB of predicted \
+             classes are excluded from the figure. Either an allocation path is \
+             growing without bound (§9.5f candidate 2 -- §6.3b's stranding is \
+             the measured instance) or admission was given a configuration the \
+             run then left behind.",
+            gb(self.unplanned),
+            gb(self.requested),
+            gb(self.limit),
+            gb(self.planned),
+        )
+    }
+}
+
+impl std::error::Error for ResidualExceeded {}
 
 /// A buffer waiting for the GPU to finish with it.
 struct PendingBuffer {
@@ -387,6 +484,9 @@ impl PoolInner {
                 free_bytes: 0,
                 free_order: std::collections::VecDeque::new(),
                 free_budget: DEFAULT_FREE_BUDGET_BYTES,
+                // Absent = unbounded, which is what shipped. Admission installs
+                // one; a process that never runs admission is unchanged.
+                residual: None,
                 counters: PoolCounters::default(),
             }),
             clock,
@@ -498,6 +598,35 @@ impl PoolInner {
 }
 
 impl PoolState {
+    /// Bytes this pool holds that no planner owns (`DESIGN.md` §9.5k).
+    ///
+    /// `live + free + pending − planned`. All three terms are bytes the process
+    /// holds and the OS cannot have, and **`pending_bytes` is the one that
+    /// matters**: `free_bytes` is capped by `free_budget`, and `pending_bytes`
+    /// is capped by nothing — it is §6.3b's stranding at ~21 MB/token, 8.398 GB
+    /// over 400 tokens, the largest unbounded term this project has observed.
+    ///
+    /// The subtraction **saturates**, and that is not defensive tidiness: early
+    /// in a run the pool holds far less than the planned set because the
+    /// weights are still loading, so a wrapping subtraction would report a
+    /// colossal figure and refuse a run that is fine.
+    ///
+    /// `pending` is summed rather than maintained incrementally. It is a walk
+    /// of a list the lock already holds, it happens only on a genuine
+    /// allocation (never on a pool hit), and `occupancy()` already sums it the
+    /// same way — maintaining a fifth counter to avoid it would be hot-path
+    /// work whose only consumer is this branch.
+    fn unplanned_bytes(&self, cap: ResidualCap) -> usize {
+        let held = self.live_bytes
+            + self.free_bytes
+            + self
+                .pending
+                .iter()
+                .map(|p| p.buffer.length())
+                .sum::<usize>();
+        held.saturating_sub(cap.planned)
+    }
+
     /// Drops the oldest free buffers until the free list is back inside its
     /// byte budget.
     ///
@@ -619,6 +748,49 @@ impl BufferPool {
         self.inner.notify_evicted(&evicted);
     }
 
+    /// Installs `DESIGN.md` §9.5k's derived cap on **unplanned** bytes.
+    ///
+    /// `limit` is `budget − predicted` and `planned` is the part of the
+    /// predicted set this pool serves — weights, KV, scratch and conv, all of
+    /// which are already inside `live_bytes`. Both come from admission, which
+    /// computed them before anything was allocated.
+    ///
+    /// **Call once, at configuration time.** Installing a cap mid-run is
+    /// permitted and is what a test does, but in a real process the numbers are
+    /// admission's and admission runs once.
+    ///
+    /// # This is one branch on one class, deliberately
+    ///
+    /// §9.5e declines per-allocation checking **as a general gate** on a
+    /// correctness argument, and that argument stands for the classes admission
+    /// knows. This bounds only the class admission *derives* — see
+    /// [`ResidualCap`]. It calls into Metal nowhere and it cannot fire if
+    /// admission was honest.
+    pub fn set_residual_cap(&self, limit: usize, planned: usize) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.residual = Some(ResidualCap { limit, planned });
+        }
+    }
+
+    /// Removes the residual cap, restoring the unbounded behaviour that
+    /// shipped.
+    pub fn clear_residual_cap(&self) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.residual = None;
+        }
+    }
+
+    /// Bytes this pool holds that no planner owns, or `None` with no cap
+    /// installed.
+    ///
+    /// `live + free + pending − planned`. See [`ResidualCap::planned`] for why
+    /// the subtraction is there and what comparing `live_bytes` alone would do.
+    pub fn unplanned_bytes(&self) -> Option<usize> {
+        let state = self.inner.state.lock().ok()?;
+        let cap = state.residual?;
+        Some(state.unplanned_bytes(cap))
+    }
+
     /// Takes a reusable buffer of at least `size` bytes, if one is free.
     ///
     /// Probes the exact-size bucket first, since an exact match cannot be
@@ -684,6 +856,56 @@ impl BufferPool {
             size: bucket_size,
             pool: Arc::downgrade(&self.inner),
         }))
+    }
+
+    /// Whether allocating `size` fresh bytes would take this pool past
+    /// `DESIGN.md` §9.5k's derived residual.
+    ///
+    /// **This is the one branch, and it is asked before the buffer is
+    /// created** — checking after `newBufferWithLength` would report an
+    /// overrun having already committed it, which is the shape that makes an
+    /// error useless. `Ok(())` with no cap installed, which is what shipped.
+    ///
+    /// # It cannot fire if admission was honest
+    ///
+    /// `unplanned` counts bytes the pool holds that no planner owns, so a
+    /// process whose predicted classes are what it actually allocates never
+    /// approaches the limit. What it bounds is the case admission cannot see:
+    /// an allocation path growing without bound at runtime (§9.5f's second
+    /// candidate explanation), of which §6.3b's stranding is the one instance
+    /// that has been measured — 11.6 buffers and ~21 MB per token, capped by
+    /// nothing before this.
+    ///
+    /// # What it does NOT do
+    ///
+    /// It calls into Metal nowhere. `live_bytes` and `free_bytes` are already
+    /// maintained incrementally (*"so the budget check never has to walk the
+    /// buckets"*), and the comparison is one branch on integers. #167's
+    /// ablation is the premise: **accounting is cheap, calling into Metal is
+    /// not** (§6.3d) — an eager `removeAllocation` per buffer cost
+    /// +0.093 ms/token and the same bookkeeping with the Metal call skipped
+    /// read baseline.
+    pub fn check_residual(&self, size: usize) -> Result<(), ResidualExceeded> {
+        let Ok(state) = self.inner.state.lock() else {
+            // Poisoned. Refusing here would turn one thread's panic into a
+            // failure to allocate for every other, which is a worse outcome
+            // than the unbounded behaviour that shipped.
+            return Ok(());
+        };
+        let Some(cap) = state.residual else {
+            return Ok(());
+        };
+        let unplanned = state.unplanned_bytes(cap);
+        let would_be = unplanned.saturating_add(size);
+        if would_be > cap.limit {
+            return Err(ResidualExceeded {
+                unplanned,
+                requested: size,
+                limit: cap.limit,
+                planned: cap.planned,
+            });
+        }
+        Ok(())
     }
 
     /// Wraps a freshly created `Buffer` in a pool handle.
@@ -845,6 +1067,175 @@ mod tests {
     fn release_and_complete(pool: &BufferPool, clock: &GpuClock, b: Arc<PooledBuffer>) {
         drop(b);
         gpu_completes(pool, clock);
+    }
+
+    /// Allocates the way `MetalDevice` does **with the residual check in
+    /// place**: reuse if possible, else check, else create and adopt.
+    ///
+    /// The ordering mirrors `device.rs` exactly -- the check sits on the pool
+    /// miss and before the allocation -- so a test exercising this exercises
+    /// the shape that ships.
+    fn alloc_checked(
+        pool: &BufferPool,
+        dev: &Device,
+        size: usize,
+    ) -> std::result::Result<Arc<PooledBuffer>, ResidualExceeded> {
+        if let Some(b) = pool.acquire(size) {
+            return Ok(b);
+        }
+        pool.check_residual(size)?;
+        let raw = dev
+            .new_buffer(size, crate::RESOURCE_OPTIONS)
+            .expect("buffer allocation");
+        Ok(pool.adopt(raw, size))
+    }
+
+    /// **Both bounds** (`DESIGN.md` §8.1g, and #184's precedent): a check that
+    /// refuses everything is not a check.
+    ///
+    /// Asserted in one test so neither arm can be dropped without the other
+    /// going red. The admitted arm is not incidental -- it is half the result.
+    #[test]
+    fn residual_admits_inside_the_cap_and_refuses_past_it() {
+        let dev = device();
+        let (pool, _clock) = pool_with_clock();
+        // 1 MiB of residual, and nothing planned in this pool.
+        pool.set_residual_cap(1024 * 1024, 0);
+
+        // ADMITTED: comfortably inside.
+        let a = alloc_checked(&pool, &dev, 256 * 1024).expect("inside the cap must be admitted");
+        assert_eq!(pool.unplanned_bytes(), Some(256 * 1024));
+
+        // Still admitted: exactly at the cap, since the test is `>` not `>=`.
+        let b = alloc_checked(&pool, &dev, 768 * 1024).expect("exactly at the cap fits");
+        assert_eq!(pool.unplanned_bytes(), Some(1024 * 1024));
+
+        // REFUSED: one byte past it.
+        let err = alloc_checked(&pool, &dev, 1).expect_err("past the cap must be refused");
+        assert_eq!(err.limit, 1024 * 1024);
+        assert_eq!(err.unplanned, 1024 * 1024);
+        assert_eq!(err.requested, 1);
+        drop((a, b));
+    }
+
+    /// **The check is inert with no cap installed**, which is what shipped.
+    ///
+    /// This is the off-arm, and it is what makes the change safe to land: a
+    /// process that never runs admission is byte-for-byte what it was.
+    #[test]
+    fn no_cap_installed_means_no_refusal() {
+        let dev = device();
+        let (pool, _clock) = pool_with_clock();
+        assert_eq!(pool.unplanned_bytes(), None, "no cap installed");
+        for _ in 0..8 {
+            alloc_checked(&pool, &dev, 1024 * 1024).expect("uncapped pool never refuses");
+        }
+        assert!(pool.check_residual(usize::MAX / 2).is_ok());
+    }
+
+    /// **The planned classes are subtracted, so the weights are not refused.**
+    ///
+    /// §9.5k's load-bearing correction: weights land in `private_buffers` and
+    /// KV in `buffers`, so both are already inside `live_bytes`. A check
+    /// comparing `live_bytes` against the residual would refuse them.
+    ///
+    /// The mutation this kills is the *obvious* form of the check, and it is
+    /// the one the issue calls out by name.
+    #[test]
+    fn planned_bytes_are_subtracted_so_the_weights_are_not_refused() {
+        let dev = device();
+        let (pool, _clock) = pool_with_clock();
+        let planned = 4 * 1024 * 1024;
+        // A residual much smaller than the planned set -- exactly the real
+        // shape, where 5.4 GB of weights sit under a 3.5 GB residual.
+        pool.set_residual_cap(1024 * 1024, planned);
+
+        // Allocate the whole planned set. Under a `live_bytes >= limit` check
+        // every one of these would be refused.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                alloc_checked(&pool, &dev, 1024 * 1024)
+                    .expect("a planned allocation must never be refused"),
+            );
+        }
+        assert_eq!(
+            pool.unplanned_bytes(),
+            Some(0),
+            "the planned set contributes ZERO unplanned bytes"
+        );
+        // And the residual still bounds what comes after it.
+        alloc_checked(&pool, &dev, 1024 * 1024).expect("the first unplanned MiB fits");
+        alloc_checked(&pool, &dev, 1).expect_err("the residual still bounds the rest");
+    }
+
+    /// **`pending_bytes` counts**, and it is the term that matters.
+    ///
+    /// §6.3b's stranding is `pending`: 11.6 buffers/token, ~21 MB/token,
+    /// capped by nothing. `free_bytes` is capped by `set_free_budget`. A check
+    /// counting only `live_bytes` would miss the one unbounded term, so this
+    /// releases a buffer *without* completing the GPU -- which parks it in
+    /// `pending` -- and asserts it is still counted.
+    #[test]
+    fn pending_and_free_bytes_are_counted_not_only_live() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        pool.set_residual_cap(4 * 1024 * 1024, 0);
+
+        let b = alloc_checked(&pool, &dev, 2 * 1024 * 1024).expect("first fits");
+        // Release without completing: the buffer parks in `pending`, which is
+        // where §6.3b's stranding lives.
+        drop(b);
+        assert_eq!(
+            pool.unplanned_bytes(),
+            Some(2 * 1024 * 1024),
+            "a stranded buffer is still bytes the OS cannot have"
+        );
+
+        // Now let the GPU finish, moving it to the free list. Still counted.
+        gpu_completes(&pool, &clock);
+        assert_eq!(
+            pool.unplanned_bytes(),
+            Some(2 * 1024 * 1024),
+            "a free buffer is still held by the process"
+        );
+    }
+
+    /// A pool hit allocates nothing, so it is not bounded and pays no check.
+    #[test]
+    fn a_pool_hit_is_not_subject_to_the_cap() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        pool.set_residual_cap(2 * 1024 * 1024, 0);
+
+        let b = alloc_checked(&pool, &dev, 1024 * 1024).expect("first fits");
+        release_and_complete(&pool, &clock, b);
+
+        // Shrink the cap below what the pool already holds. A fresh allocation
+        // would now be refused...
+        pool.set_residual_cap(0, 0);
+        assert!(pool.check_residual(1).is_err());
+        // ...but the reuse path never asks, because it allocates nothing.
+        assert!(
+            alloc_checked(&pool, &dev, 1024 * 1024).is_ok(),
+            "reuse must not be refused: it allocates nothing"
+        );
+    }
+
+    /// The refusal names the quantity that overran and the derived figure.
+    ///
+    /// §9.5k: the failure *"stays ugly and becomes ugly at a known boundary
+    /// rather than as a kernel panic"* -- so the message has to say which
+    /// boundary.
+    #[test]
+    fn refusal_message_names_the_residual_and_the_overrun() {
+        let (pool, _clock) = pool_with_clock();
+        pool.set_residual_cap(1000, 0);
+        let err = pool.check_residual(2000).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("residual exhausted"), "{msg}");
+        assert!(msg.contains("§9.5k"), "cite the section: {msg}");
+        assert!(msg.contains("§6.3b"), "name the measured instance: {msg}");
     }
 
     #[test]
