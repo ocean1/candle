@@ -60,7 +60,7 @@ use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, KvAppend, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -185,6 +185,18 @@ struct Args {
     /// `Sdpa × arena`, which is why #105's C6 reports counts rather than digests.
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// KV cache growth: `cat` (the default `Tensor::cat` reallocation) or
+    /// `in-place` (pre-allocated, written at a moving offset -- issue #142).
+    ///
+    /// **The digests must not move across this axis**, which is what makes it
+    /// different from `--attn`. `Sdpa` changes the arithmetic and legitimately
+    /// moves them (§2.3.8c); `in-place` changes only *where the bytes live*, so
+    /// a moved digest here is a defect rather than a variant (§2.3.5a). Gate it
+    /// against the pair for whichever `--attn` arm is selected, not against the
+    /// canonical generic pair.
+    #[arg(long, default_value = "cat")]
+    kv_append: String,
 
     /// How every kernel's scalars reach it: `split` (the default, one `setBytes`
     /// per scalar) or `packed` (one `device const Params*`, issue #115).
@@ -433,6 +445,16 @@ fn main() -> Result<()> {
         other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
     };
     println!("attention implementation: {:?}", config.attn_impl);
+    // Refused rather than defaulted, for the same reason as `--attn`: an
+    // unrecognized value that silently pinned the default would report the
+    // `cat` arm's digest under the `in-place` arm's name, which is #69's
+    // vacuous run (§2.4, §9.2f).
+    config.kv_append = match args.kv_append.as_str() {
+        "cat" => KvAppend::Cat,
+        "in-place" => KvAppend::InPlace,
+        other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
+    };
+    println!("kv append: {:?}", config.kv_append);
 
     // The binding-style axis (issue #115). Set before any dispatch, and read
     // back from the crate rather than echoed from `args`, so the line printed is

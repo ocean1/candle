@@ -110,7 +110,7 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, KvAppend, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -187,6 +187,23 @@ struct Args {
     /// cannot tell you the second thing.
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// KV cache growth: `cat` (the default `Tensor::cat` reallocation) or
+    /// `in-place` (pre-allocated, written at a moving offset — issue #142).
+    ///
+    /// **This harness is the primary correctness evidence for that arm**, and
+    /// the reason is #128's own demonstration: its mutation was *"appending the
+    /// value cache in the wrong order"*, which produced three identical digests
+    /// of a model emitting `picture picture picture`. The digest gate cannot see
+    /// that bug class; this one can, and `in-place` changes exactly where KV
+    /// bytes live.
+    ///
+    /// Turn 2 is the part that matters here. It re-prefills onto the
+    /// *accumulated* cache without clearing it, so under `in-place` it is a
+    /// `seq_len > 1` write at a non-zero offset — the turn boundary §11.1a's
+    /// single-turn limitation is the precedent for.
+    #[arg(long, default_value = "cat")]
+    kv_append: String,
 
     /// Print each turn's prompt and completion. On by default; `--quiet`
     /// leaves only the verdict lines, for a scripted gate.
@@ -362,6 +379,12 @@ fn main() -> Result<()> {
         "sdpa" => AttnImpl::Sdpa,
         other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
     };
+    // Refused rather than defaulted, for the same reason as `--attn` above.
+    config.kv_append = match args.kv_append.as_str() {
+        "cat" => KvAppend::Cat,
+        "in-place" => KvAppend::InPlace,
+        other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
+    };
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
@@ -405,6 +428,7 @@ fn main() -> Result<()> {
 
     println!("model     {}", model_dir.display());
     println!("attention {:?}", config.attn_impl);
+    println!("kv append {:?}", config.kv_append);
     println!(
         "dtype     {dtype:?}   device {}",
         if args.cpu { "cpu" } else { "metal" }
@@ -536,9 +560,10 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "SMOKE attn={:?} turn1_expect={:?} turn1_ok={} turn1_tokens={} \
+        "SMOKE attn={:?} kv_append={:?} turn1_expect={:?} turn1_ok={} turn1_tokens={} \
          turn2_expect={:?} turn2_ok={} turn2_tokens={} verdict={}",
         config.attn_impl,
+        config.kv_append,
         args.expect_turn1,
         turn1_ok,
         turns[0].tokens,
