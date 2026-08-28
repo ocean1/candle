@@ -59,6 +59,9 @@ metal = [
     "candle-ug?/metal",
 ]
 metal-debug-labels = ["metal", "candle-metal-kernels/debug-labels"]
+# Per-memory-class and event telemetry (#171). Composes with a release build;
+# off by default, and off it compiles to nothing.
+metal-run-telemetry = ["metal", "candle-metal-kernels/run-telemetry"]
 ug = ["dep:candle-ug"]
 
 [[bench]]
