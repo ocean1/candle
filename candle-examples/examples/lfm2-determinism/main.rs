@@ -1190,3 +1190,53 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_forced_tokens;
+
+    /// The `TOKENS` line this harness prints must feed straight back into
+    /// `--force-tokens`, because that round trip is how a reference sequence is
+    /// produced in practice (issue #170).
+    #[test]
+    fn the_tokens_line_round_trips_into_force_tokens() {
+        let ids = parse_forced_tokens("785,267,3728,9560\n").unwrap();
+        assert_eq!(ids, vec![785, 267, 3728, 9560]);
+    }
+
+    #[test]
+    fn one_id_per_line_with_comments_and_blanks() {
+        let ids = parse_forced_tokens("# a reference sequence\n785\n\n267  # trailing\n\t3728\n")
+            .unwrap();
+        assert_eq!(ids, vec![785, 267, 3728]);
+    }
+
+    /// A parse error is refused rather than skipped.
+    ///
+    /// Skipping would force a **different, shorter** sequence than the file
+    /// names, and both arms would agree on it — a comparison that is internally
+    /// consistent, reproducible, and not the one that was asked for. That is
+    /// §2.4's shape exactly, and the failure would be invisible in the output
+    /// because `forced` would still be nonzero.
+    #[test]
+    fn an_unparseable_entry_is_refused_not_skipped() {
+        let err = parse_forced_tokens("785\nnot-a-token\n267\n").unwrap_err();
+        assert!(
+            format!("{err}").contains("not a token id"),
+            "unexpected error: {err}"
+        );
+        // The load-bearing half: it did not quietly return [785, 267].
+        assert!(parse_forced_tokens("785\nnot-a-token\n267\n").is_err());
+    }
+
+    #[test]
+    fn an_empty_file_is_refused() {
+        assert!(parse_forced_tokens("# only a comment\n\n").is_err());
+    }
+
+    /// A negative id is a parse failure rather than a wrap to `u32::MAX`.
+    #[test]
+    fn a_negative_id_is_refused() {
+        assert!(parse_forced_tokens("785\n-1\n").is_err());
+    }
+}
