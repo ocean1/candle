@@ -291,6 +291,31 @@ struct Args {
     /// which is why this is gated on the digest and not on the count.
     #[arg(long, default_value = "run-start")]
     icb_barrier_scope: String,
+
+    /// Whether candle's own `auto_barrier` still fires at a replayed position:
+    /// `always` or `skip-replayed` (issue #144).
+    ///
+    /// `DESIGN.md` §11.3p. `auto_barrier` is the first statement of
+    /// `dispatch_thread_groups` and `offer_to_executor` is consulted after it,
+    /// so a replayed position emits candle's barrier *and* the ICB's -- §11.3n
+    /// measures the 401 as **additive**, for 906 orderings against the classical
+    /// arm's 505. §11.3p attributes the 505 and finds **393 fire at covered
+    /// non-head positions**, where the ICB has already encoded ordering.
+    ///
+    /// `always` is the default and is byte-for-byte what ships.
+    /// `skip-replayed` suppresses candle's barrier at a **non-head member of a
+    /// run already in flight** -- narrower than "the position is covered", for
+    /// the three reasons §11.3p gives and which
+    /// `measurements/issue-144-predicate.md` argues at edge level.
+    ///
+    /// **This removes ordering edges**, so under `HazardTrackingModeUntracked` a
+    /// wrongly-removed one is silent corruption rather than an error (§3.5) --
+    /// the same standing as `HazardKey::Range`. Both arms must produce the
+    /// canonical digests; a moved digest here is a defect and not a variant
+    /// (§2.3.5a), and the barrier count cannot detect one because it would
+    /// simply be lower and still plausible (§2.4).
+    #[arg(long, default_value = "always")]
+    icb_replay_barriers: String,
 }
 
 /// Follow-up prompts for multi-turn mode, cycled in order.
@@ -676,8 +701,20 @@ fn main() -> Result<()> {
         ),
     };
     #[cfg(feature = "metal")]
+    let icb_replay_barriers = match args.icb_replay_barriers.as_str() {
+        "always" => candle_metal_kernels::ReplayBarriers::Always,
+        "skip-replayed" => candle_metal_kernels::ReplayBarriers::SkipReplayed,
+        other => anyhow::bail!(
+            "--icb-replay-barriers must be `always` or `skip-replayed`, got `{other}`"
+        ),
+    };
+    #[cfg(feature = "metal")]
     let icb_executor = args.icb.then(|| {
-        candle_metal_kernels::IcbExecutor::with_barrier_scope(ICB_RECORD_STEPS, icb_barrier_scope)
+        candle_metal_kernels::IcbExecutor::configured(
+            ICB_RECORD_STEPS,
+            icb_barrier_scope,
+            icb_replay_barriers,
+        )
     });
     #[cfg(feature = "metal")]
     let icb_installed_at = if args.arena { ARENA_RECORD_STEPS } else { 0 };
@@ -881,6 +918,22 @@ fn main() -> Result<()> {
             cov.inline_constants,
         );
         println!("ICB barrier scope: {icb_barrier_scope:?}");
+        // Issue #144. Printed beside the scope because the two axes are
+        // independent and a reader comparing arms needs both: `BarrierScope`
+        // governs the ordering the ICB *encodes*, `ReplayBarriers` the ordering
+        // candle *still emits* beside it (§11.3n -- additive, not substitutive).
+        //
+        // `barriers_suppressed` is the quantity that shows the switch engaged,
+        // which is the check #69's vacuous determinism run earned (§2.4, §9.2f):
+        // both arms there silently ran the default and the "changed" arm
+        // reported a passing digest for the unchanged path. **It is engagement
+        // proof and never the correctness argument** -- a wrongly-suppressed
+        // edge leaves this higher and the barrier count lower, both plausible.
+        // The correctness evidence is this harness's own digest.
+        println!(
+            "ICB replay barriers: {icb_replay_barriers:?}  suppressed={}",
+            candle_metal_kernels::metal::trace::barriers_suppressed(),
+        );
         // Per kernel, with the reason attached, because the totals above cannot
         // distinguish a position that became *covered* from one that merely
         // changed which bucket excludes it. #103 gave `sdpa_vector` a packed

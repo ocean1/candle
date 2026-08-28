@@ -2613,7 +2613,10 @@ fn residency_set_keys_views_to_their_parent() {
     // Two disjoint views over the same allocation.
     let a = parent.view(0, 16);
     let b = parent.view(16, 16);
-    assert!(set.contains(&a), "a view must resolve to its parent's entry");
+    assert!(
+        set.contains(&a),
+        "a view must resolve to its parent's entry"
+    );
     assert!(set.contains(&b));
 
     // Inserting a view adds nothing: the allocation is already there.

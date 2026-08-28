@@ -504,8 +504,58 @@ impl ComputeCommandEncoder {
     }
 
     fn auto_barrier(&self) {
+        // Issue #144: ask whether the executor will replay this position as a
+        // non-head member of a run already in flight, in which case the ordering
+        // this fence would express is already encoded on the ICB command that
+        // replaces it (`ReplayBarriers`, and
+        // `measurements/issue-144-predicate.md` for the edge-level argument).
+        //
+        // **The query is non-advancing, and that is the whole seam.**
+        // `dispatch_action` cannot be used here: it drains `pending`,
+        // `pending_retained` and `pending_pipeline` with three `mem::take`s, so
+        // a speculative call would record the next dispatch with no bindings.
+        // `Executor::disposition` is the decision half split out from that
+        // drain -- a phase check and a window test, touching neither the
+        // bindings nor the cursor.
+        //
+        // `Classical` answers `Unknown` without a virtual call, so on the
+        // default path this is one predictable branch and the behaviour is
+        // byte-for-byte what shipped.
+        let suppress = matches!(
+            self.executor.disposition(),
+            crate::metal::executor::Disposition::ReplayedInFlightRun
+        );
+
         let mut s = self.state.lock().unwrap();
         if s.needs_barrier {
+            if suppress {
+                // Do NOT emit, and do NOT discharge. The state is rolled exactly
+                // as the no-barrier arm below rolls it, so `needs_barrier` stays
+                // set and `prev_*` keeps accumulating.
+                //
+                // **This is the correctness centre of the change, and the
+                // alternative is a silent wrong answer.** Clearing
+                // `needs_barrier` and replacing `prev_*` -- i.e. doing
+                // everything the emitting arm does except the emit -- would
+                // discharge the pending edge for every *later* dispatch as well,
+                // including the uncovered gap positions between the runs. Those
+                // are encoded classically and depend on candle's fence; §11.3m
+                // is exactly this asymmetry, and §11.3p obstacle 2 is the
+                // population it would break. Suppressing the emit while keeping
+                // the state is what confines the change to the position whose
+                // ordering the ICB has genuinely re-expressed.
+                //
+                // So the invariant is: a suppressed barrier is *deferred*, not
+                // dropped. If the very next position is a gap dispatch, it still
+                // sees `needs_barrier` and emits -- which is why the 123
+                // interleaved positions keep their ordering.
+                let mut next_out = s.next_outputs.take();
+                s.prev_outputs.absorb(&mut next_out);
+                let mut next_in = s.next_inputs.take();
+                s.prev_inputs.absorb(&mut next_in);
+                trace::record_barrier_suppressed();
+                return;
+            }
             self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
             // Observed here rather than reconstructed downstream: the barrier
             // count `DESIGN.md` §9.2e requires is a property of this branch, and

@@ -47,7 +47,9 @@ use objc2_metal::{
 };
 use std::sync::{Arc, Mutex};
 
-use super::executor::{DispatchAction, DispatchRecord, Executor, Grid, IcbRange, Size3};
+use super::executor::{
+    DispatchAction, DispatchRecord, Disposition, Executor, Grid, IcbRange, Size3,
+};
 
 /// One buffer binding, as an ICB command needs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,6 +196,85 @@ pub enum BarrierScope {
     SinceBarrier,
 }
 
+/// Whether candle's own `auto_barrier` still fires at a position the ICB is
+/// replaying (`DESIGN.md` §11.3p, issue #144).
+///
+/// # What this axis is
+///
+/// `auto_barrier` is the **first statement** of `dispatch_thread_groups` and
+/// `offer_to_executor` is consulted **after** it (`encoder.rs:405` and `:416`),
+/// so a replayed position emits candle's barrier *and* the ICB's. §11.3n
+/// measures the consequence: the 401 encoded `setBarrier` commands are
+/// **additive** rather than substitutive, for 906 orderings against the
+/// classical arm's 505. §11.3p then attributes the 505 and finds **393 of them
+/// fire at covered non-head positions** -- where the ICB has already encoded
+/// ordering covering the same edges.
+///
+/// This axis is the mechanism for asking whether those 393 can go. It is
+/// deliberately **not** a new arm of [`BarrierScope`], which governs how far
+/// back the ICB's own scan looks and whose `SinceBarrier` arm is wrong on
+/// purpose -- issue #144's "Not in scope" is explicit that `BarrierScope` stays
+/// as it is.
+///
+/// # Why it is safe to land dark
+///
+/// `Always` is the default and is byte-for-byte what ships. And `Classical` is
+/// unaffected **by construction**: `ExecutorSlot::Classical` answers
+/// `Disposition::Unknown` without a virtual call, so with no executor installed
+/// there is no second ordering source and the axis has nothing to act on. That
+/// is the property `HazardKey` holds (§9.2e, §9.2f) and the one that makes this
+/// reviewable.
+///
+/// # The predicate, and why it is narrower than "the position is covered"
+///
+/// Argued in full in `measurements/issue-144-predicate.md`, committed before
+/// this code was written. §11.3p gives three obstacles and each is discharged
+/// differently:
+///
+/// * **Run heads are excluded by construction.** A head's scan slice is empty
+///   (`covered[run_first_cmd..cmd_index]`), so candle's fence is the only thing
+///   ordering a gap dispatch into it -- 30 of the 505, every one required.
+///   Suppression is decided **once per run at the head** and applied only to the
+///   run's interior, which makes "head" structural rather than a predicate
+///   someone has to remember to exclude. 32 decisions per step, not 433.
+/// * **The primitives are different objects** (§11.3m). Candle's barrier at a
+///   covered position also orders the 123 uncovered positions interleaved
+///   between runs, which `setBarrier` does not. Measured as edges rather than
+///   counts: removing the ICB's own barriers breaks **1960** edges, so its
+///   ordering is load-bearing, and the specific gap-writer edges this obstacle
+///   warns about are **11**, all out of `sdpa_vector` and `rope_f16`.
+/// * **7 of 31 covered runs cross an encoder-session seam**, at multiples of
+///   `CANDLE_METAL_COMPUTE_PER_BUFFER`. Those positions carry no classical
+///   barrier at all (the new session's hazard state is empty), so nothing is
+///   suppressed at them -- and it is the seam's own ordering, via
+///   `prev_ce_outputs` and `wait_for_buffer` on the shared pointer, that saves
+///   all 11 of obstacle 2's edges. **No barrier count shows this**, which is why
+///   the argument had to be made in edges.
+///
+/// # The gate
+///
+/// This **removes ordering edges**, and under `HazardTrackingModeUntracked` a
+/// wrongly-removed edge is silent corruption rather than an error (§3.5) -- the
+/// same standing as `HazardKey::Range`. So it is gated on §15.1 #7 and #8:
+/// `--turns 3` digests for both canonical pairs over three runs, plus
+/// `lfm2-smoke`. **A moved barrier count is engagement proof and never the
+/// correctness argument** (§2.4): a wrongly-dropped edge leaves the count lower
+/// and entirely plausible, which is the failure mode that rule exists for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReplayBarriers {
+    /// `auto_barrier` fires unconditionally. **The default, and byte-for-byte
+    /// what ships.**
+    #[default]
+    Always,
+    /// Suppress candle's barrier where the executor will replay the position
+    /// **and** the ICB has encoded ordering covering the same edges.
+    ///
+    /// Narrower than "the position is covered": only a **non-head member of a
+    /// run already in flight** qualifies. See this type's own documentation for
+    /// how each of §11.3p's three obstacles is discharged.
+    SkipReplayed,
+}
+
 /// Why a position is not replayed, kept so the executor can report coverage
 /// with the reasons attached rather than as a bare count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +367,9 @@ struct Inner {
     position: usize,
     /// How far back a barrier scan looks. See [`BarrierScope`].
     barrier_scope: BarrierScope,
+    /// Whether candle's own barrier is suppressed at replayed positions.
+    /// See [`ReplayBarriers`].
+    replay_barriers: ReplayBarriers,
 }
 
 /// One maximal run of consecutive covered positions.
@@ -359,7 +443,27 @@ impl IcbExecutor {
     /// rather than argued: both arms are built, both are gated on the digest,
     /// and the barrier count moves between them, which is the quantity that
     /// shows the switch engaged (§2.4, §9.2f).
-    pub fn with_barrier_scope(record_steps: usize, barrier_scope: BarrierScope) -> Arc<IcbExecutor> {
+    pub fn with_barrier_scope(
+        record_steps: usize,
+        barrier_scope: BarrierScope,
+    ) -> Arc<IcbExecutor> {
+        Self::configured(record_steps, barrier_scope, ReplayBarriers::default())
+    }
+
+    /// As [`IcbExecutor::with_barrier_scope`], also choosing whether candle's
+    /// own barrier is suppressed at replayed positions ([`ReplayBarriers`],
+    /// issue #144).
+    ///
+    /// The two axes are independent and are deliberately kept so.
+    /// [`BarrierScope`] governs the ordering the ICB **encodes**;
+    /// [`ReplayBarriers`] governs the ordering candle **still emits** beside it.
+    /// §11.3n is what separates them: the two counts are additive rather than
+    /// substitutive, so they are two quantities and not one.
+    pub fn configured(
+        record_steps: usize,
+        barrier_scope: BarrierScope,
+        replay_barriers: ReplayBarriers,
+    ) -> Arc<IcbExecutor> {
         assert!(
             record_steps >= 2,
             "recording fewer than two steps cannot distinguish a stable position from one \
@@ -379,6 +483,7 @@ impl IcbExecutor {
                 run_in_flight: 0,
                 position: 0,
                 barrier_scope,
+                replay_barriers,
             }),
         })
     }
@@ -1002,6 +1107,56 @@ impl Executor for IcbExecutor {
                 }
             }
         }
+    }
+
+    /// The decision half of [`Self::dispatch_action`], split out so it can be
+    /// asked at `auto_barrier` time (issue #144).
+    ///
+    /// # Why this is a separate method and not a second call to `dispatch_action`
+    ///
+    /// `dispatch_action` **drains**: three `std::mem::take`s empty `pending`,
+    /// `pending_retained` and `pending_pipeline`, which
+    /// [`Executor::will_bind_buffer`] spent the whole preceding argument walk
+    /// filling. A speculative call would therefore record the *next* dispatch
+    /// with no bindings, which is a corrupted recording rather than a
+    /// double-advanced cursor. The issue body named the cursor as the blocker;
+    /// the drain is the real one, and splitting the decision from it is the
+    /// seam.
+    ///
+    /// This reads `phase`, `suppress_until` and `poisoned` and **touches none of
+    /// the pending state**. `position` is likewise only read: the increment
+    /// stays in `dispatch_action`, so calling this any number of times per
+    /// dispatch -- including zero, which is what `ReplayBarriers::Always` does
+    /// -- leaves the executor's cursor exactly where it was.
+    ///
+    /// # Why the answer is `ReplayedInFlightRun` and not "covered"
+    ///
+    /// `pos < suppress_until` is precisely *"a non-head member of a run whose
+    /// head has already validated and executed its range"*, which is the
+    /// predicate `measurements/issue-144-predicate.md` argues and no wider:
+    ///
+    /// * a **run head** has `pos == suppress_until`'s lower bound at the moment
+    ///   it is offered and is therefore never inside the window -- so obstacle 1
+    ///   is discharged by construction rather than by an exclusion someone has
+    ///   to remember;
+    /// * a **gap** position is not in any run's window;
+    /// * a **poisoned or fallen-back** run never sets the window, so its members
+    ///   are encoded classically and keep their barriers.
+    fn disposition(&self) -> Disposition {
+        let inner = self.inner.lock().unwrap();
+        if inner.replay_barriers != ReplayBarriers::SkipReplayed {
+            return Disposition::Unknown;
+        }
+        if inner.phase != Phase::Replaying {
+            return Disposition::Unknown;
+        }
+        // Inside a run whose head already executed the range. The head itself is
+        // excluded: when a head is offered, `suppress_until` still holds the
+        // *previous* run's bound, which never covers it.
+        if inner.position < inner.suppress_until {
+            return Disposition::ReplayedInFlightRun;
+        }
+        Disposition::Unknown
     }
 
     fn will_bind_buffer(&self, index: usize, buffer: &Buffer, offset: usize, is_output: bool) {

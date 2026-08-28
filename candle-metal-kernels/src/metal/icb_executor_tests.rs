@@ -491,3 +491,114 @@ fn the_reduced_barrier_scan_drops_edges_a_dependency_chain_needs() {
         distinct(&out_reduced)
     );
 }
+
+/// The suppression predicate admits a run's interior and refuses its head.
+///
+/// # Why this test exists, and it is because the digest gate cannot do it
+///
+/// Issue #144's axis removes ordering edges, so §3.5 makes a wrong predicate
+/// silent corruption. The §15.1 #7 gate is what stands behind it -- and
+/// **measured, that gate cannot tell the shipped predicate from a wider one**.
+/// Two mutations on production source, each run three times against the ICB
+/// arm's canonical pair:
+///
+/// * widening the predicate to include **run heads** -- the case §11.3p says
+///   must survive, 30 of the 505 -- moves `suppressed` 29945 -> 32225 and
+///   leaves the digest at `a2d13650…`/`5b517964…`, **unmoved**;
+/// * the naive *"the position is covered"* predicate §11.3p warns against is
+///   the same set, and likewise passes.
+///
+/// Suppressing *everything* while replaying does corrupt, with §11.3l's
+/// signature ("Error: sampling"), so the gate is not blind in general -- it is
+/// blind to exactly this distinction. That is §2.4's rule arriving in a new
+/// quantity: **a wrongly-dropped edge leaves the digest plausible**, and here it
+/// leaves it *identical*. Full runs in
+/// `measurements/issue-144-raw/mutation-*.txt`.
+///
+/// So the narrowing is asserted **mechanically, on the predicate itself**,
+/// rather than being left to an end-to-end check that demonstrably does not
+/// discriminate. A test that cannot fail is not a test (§15.1 #2), and the
+/// digest gate is that test for this property.
+#[test]
+fn suppression_admits_a_run_interior_and_refuses_its_head() {
+    if !icb_support_once() {
+        return;
+    }
+    use crate::metal::executor::{Disposition, Executor};
+    use crate::metal::icb::ReplayBarriers;
+
+    let input: Vec<f32> = (0..64).map(|i| i as f32 * 0.5).collect();
+
+    // `Always` must never license suppression, whatever the executor is doing.
+    // This is the default arm and the one every recorded digest belongs to.
+    let always = IcbExecutor::configured(2, BarrierScope::RunStart, ReplayBarriers::Always);
+    let out_always = run_cos_steps(4, Some(&always), &input);
+    assert!(
+        always.is_replaying(),
+        "the fixture must reach the replaying phase, or the assertion below is vacuous"
+    );
+    assert_eq!(
+        always.disposition(),
+        Disposition::Unknown,
+        "ReplayBarriers::Always must never report a suppressible disposition"
+    );
+
+    // `SkipReplayed` on the same fixture. The executor is between steps here --
+    // `end_step` reset `position` and `suppress_until` to 0 -- so no run is in
+    // flight and the answer must still be `Unknown`. That is the run-head case
+    // in its purest form: position 0 of a step is a head if it is covered at
+    // all, and a head is never inside a suppression window.
+    let skip = IcbExecutor::configured(2, BarrierScope::RunStart, ReplayBarriers::SkipReplayed);
+    let out_skip = run_cos_steps(4, Some(&skip), &input);
+    assert!(
+        skip.is_replaying(),
+        "the fixture must reach the replaying phase"
+    );
+    assert_eq!(
+        skip.disposition(),
+        Disposition::Unknown,
+        "with no run in flight -- which is where every run HEAD is offered -- suppression          must not be licensed. §11.3p: a head's ICB scan slice is empty by construction, so          candle's fence is the only thing ordering a gap dispatch into it, and 30 of the 505          fire at heads with every one required."
+    );
+
+    // And the arm still computes what the classical path did. Both halves are
+    // needed: an executor that suppressed nothing would pass the assertions
+    // above trivially, and one that corrupted would pass them too.
+    let classical = run_cos_steps(1, None, &input);
+    assert_eq!(
+        out_always, classical,
+        "Always must be bit-identical to classical"
+    );
+    assert_eq!(
+        out_skip, classical,
+        "SkipReplayed must be bit-identical to classical"
+    );
+
+    // Non-vacuity, per this file's header: an all-zero fixture would satisfy
+    // every equality above (§3.7a's characteristic ICB failure).
+    assert!(
+        distinct(&classical) > 2,
+        "fixture wrote {} distinct value(s); the comparisons above are vacuous",
+        distinct(&classical)
+    );
+}
+
+/// The axis is a no-op on the classical path, by construction rather than by
+/// measurement.
+///
+/// `ExecutorSlot::Classical` answers `Disposition::Unknown` without a virtual
+/// call, so with no executor installed there is nothing a suppression decision
+/// could be made against -- which is the property that makes this safe to land
+/// dark (§9.2e's shape for `HazardKey`). Asserted here so a future change that
+/// gave `Classical` a non-default answer would fail rather than silently alter
+/// the default path.
+#[test]
+fn classical_never_reports_a_replayed_disposition() {
+    use crate::metal::executor::Disposition;
+    let slot = ExecutorSlot::Classical;
+    assert_eq!(
+        slot.disposition(),
+        Disposition::Unknown,
+        "Classical must never license suppression: with no executor installed there is no \
+         second ordering source, so the axis has nothing to act on"
+    );
+}
