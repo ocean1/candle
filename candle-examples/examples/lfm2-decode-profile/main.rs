@@ -107,6 +107,14 @@ struct Axes {
     kv_append: String,
     /// The conv-state arm (#141), echoed for the run line.
     conv_state: ConvState,
+    /// Whether the ICB executor is installed (`Executor=Icb`, #115).
+    icb: bool,
+    /// The binding style, resolved from the crate rather than echoed from
+    /// `args`, so the printed line is what the kernels will use.
+    packed_params: bool,
+    /// Whether candle's barrier is suppressed at replayed positions (#144).
+    #[cfg(feature = "metal")]
+    replay_barriers: candle_metal_kernels::ReplayBarriers,
 }
 
 impl Axes {
@@ -169,6 +177,101 @@ impl Axes {
             anyhow::bail!("--arena needs a Metal device");
         }
 
+        // ---- the ICB axes (issue #169) -----------------------------------
+        //
+        // Both switches are thrown *here*, before the first pipeline is built,
+        // for the reasons `lfm2-dispatch-trace` records:
+        //
+        // * `supportIndirectCommandBuffers` is a property of a pipeline and
+        //   pipelines are cached per process, so one built earlier keeps the old
+        //   setting -- and encoding that into an ICB is §3.7d's segfault at
+        //   encode time, with no error to catch.
+        // * the constants pool has to be serving before the recorded steps run,
+        //   or the params buffer is a fresh allocation per dispatch and every
+        //   packed position varies (§11.3l finding 3).
+        #[cfg(feature = "metal")]
+        let packed_params = {
+            use candle_metal_kernels::{default_param_style, set_default_param_style, ParamStyle};
+            let want = match args.param_style.as_str() {
+                "split" => ParamStyle::Split,
+                "packed" => ParamStyle::Packed,
+                other => {
+                    anyhow::bail!("--param-style must be `split` or `packed`, got `{other}`")
+                }
+            };
+            set_default_param_style(want);
+            // Read back rather than echoed: the engagement check §2.4 requires,
+            // after #69's vacuous run reported a passing digest for the default
+            // path under a flag that never took.
+            let got = default_param_style();
+            anyhow::ensure!(
+                got == want,
+                "--param-style {want:?} did not take effect; default_param_style() reports {got:?}"
+            );
+            got == ParamStyle::Packed
+        };
+        #[cfg(not(feature = "metal"))]
+        let packed_params = {
+            if args.param_style != "split" {
+                anyhow::bail!("--param-style needs a Metal build");
+            }
+            false
+        };
+
+        #[cfg(feature = "metal")]
+        let replay_barriers = match args.replay_barriers.as_str() {
+            "always" => candle_metal_kernels::ReplayBarriers::Always,
+            "skip-replayed" | "skip" => candle_metal_kernels::ReplayBarriers::SkipReplayed,
+            other => anyhow::bail!(
+                "--replay-barriers must be `always` or `skip-replayed`, got `{other}`"
+            ),
+        };
+        #[cfg(not(feature = "metal"))]
+        if args.replay_barriers != "always" {
+            anyhow::bail!("--replay-barriers needs a Metal build");
+        }
+
+        if args.icb {
+            if !matches!(_device, Device::Metal(_)) {
+                anyhow::bail!("--icb needs a Metal device");
+            }
+            anyhow::ensure!(
+                packed_params,
+                "--icb needs --param-style packed: an ICB command cannot carry an inline \
+                 constant (DESIGN.md §3.7c), so under `split` every position is excluded and \
+                 the run would report a working executor that replayed nothing"
+            );
+            // The arena is what makes buffer identity stable (§9.2c). Without
+            // it every position is excluded as `varies` and the run reports zero
+            // coverage for a reason that has nothing to do with the executor --
+            // a plausible null that would be read as "replay does not work".
+            anyhow::ensure!(
+                args.arena,
+                "--icb needs --arena: the pool hands out a different buffer for the same \
+                 logical slot every token (§11.1a.1), so without the arena every position is \
+                 excluded as `varies` and coverage is zero for a reason that is not the \
+                 executor's"
+            );
+            #[cfg(feature = "metal")]
+            {
+                candle_metal_kernels::set_pipelines_support_icb(true)
+                    .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
+                candle_metal_kernels::set_constants_pool_enabled(true);
+            }
+        } else {
+            // Refused rather than ignored: a row reading `ReplayBarriers=SkipReplayed`
+            // on a run with no executor installed would name an arm that did
+            // nothing, which is the failure `MathMode` embodied for the life of
+            // the project (§7.1a).
+            #[cfg(feature = "metal")]
+            anyhow::ensure!(
+                replay_barriers == candle_metal_kernels::ReplayBarriers::Always,
+                "--replay-barriers only has an effect under --icb: it governs the barrier \
+                 candle emits beside a *replayed* position, and without an executor there \
+                 are none"
+            );
+        }
+
         Ok(Self {
             arena: args.arena,
             record_steps: args.arena_record_steps,
@@ -178,30 +281,38 @@ impl Axes {
             attn: args.attn.clone(),
             kv_append: args.kv_append.clone(),
             conv_state: ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?,
+            icb: args.icb,
+            packed_params,
+            #[cfg(feature = "metal")]
+            replay_barriers,
         })
     }
 
     /// The configuration as one line, in the form the registry keys on.
     fn config_line(&self) -> String {
-        // ParamStyle is not selectable from here: nothing on the LFM2 path
-        // dispatches the packed variants (§11.3k), so a flag would name an arm
-        // that does not run. Recorded as `split` rather than omitted, so the
-        // line states every axis §7.1 has.
+        // `ParamStyle`, `Executor` and `ReplayBarriers` became selectable here
+        // in issue #169, and each is read back from the mechanism that decides
+        // it rather than echoed from the flag -- §7.1a's own complaint about
+        // this function, which claimed to state "every axis §7.1 has" while
+        // hardcoding three of them.
         //
-        // `Executor` and `ReplayBarriers` are stated for that same reason and
-        // are likewise not selectable here. This harness deliberately carries no
-        // `--icb` (§11.3n): with the flag present, the timing §17 Phase 2 item
-        // 10 forbids would be one argument away and nothing in the output would
-        // say the arm is invalid. `ReplayBarriers` only has an effect under an
-        // installed ICB executor, so on this harness it is `Always` by
-        // construction -- recorded so a row cannot be read as having been taken
-        // under an unstated arm, which is #99's diagnosis and the failure
-        // `MathMode` embodied for the life of the project by being in neither
-        // the registry nor a config line.
+        // This harness carried no `--icb` until then, on §11.3n's ground that
+        // "an instrument whose output has no valid interpretation should not be
+        // built before the interpretation is". That was right about the
+        // measurement it had in view -- a 78 %-coverage executor against a full
+        // classical baseline, which is thesis 1's and confounded -- and #169
+        // establishes a different arm that is not. So the flag follows the
+        // interpretation rather than preceding it, which is what §11.3n asked
+        // for and not what it forbade.
         format!(
-            "ParamStyle=Split ArenaLayout={} ArenaOffsets={} HazardKey={} AttnImpl={} \
-             KvAppend={} ConvState={} ScratchSizing=none Executor=Classical \
-             ReplayBarriers=Always",
+            "ParamStyle={} ArenaLayout={} ArenaOffsets={} HazardKey={} AttnImpl={} \
+             KvAppend={} ConvState={} ScratchSizing=none Executor={} \
+             ReplayBarriers={}",
+            if self.packed_params {
+                "Packed"
+            } else {
+                "Split"
+            },
             if self.arena {
                 #[cfg(feature = "metal")]
                 {
@@ -236,7 +347,32 @@ impl Axes {
                 }
                 ConvState::RotatingRing { k } => format!("RotatingRing(k={k})"),
             },
+            if self.icb { "Icb" } else { "Classical" },
+            Self::replay_barriers_name(self),
         )
+    }
+
+    /// The `ReplayBarriers` arm as the registry spells it.
+    ///
+    /// Stated even under `Executor=Classical`, where it is `Always` by
+    /// construction, because an axis omitted from a config line is one a later
+    /// reader cannot distinguish from an axis that did not exist -- which is
+    /// exactly how `MathMode` stayed invisible for the life of the project
+    /// (§7.1a), and why #171's run store makes an unrecorded axis a value rather
+    /// than a gap.
+    fn replay_barriers_name(&self) -> &'static str {
+        #[cfg(feature = "metal")]
+        {
+            match self.replay_barriers {
+                candle_metal_kernels::ReplayBarriers::Always => "Always",
+                candle_metal_kernels::ReplayBarriers::SkipReplayed => "SkipReplayed",
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = self;
+            "Always"
+        }
     }
 
     fn hazard_key_name() -> &'static str {
@@ -369,6 +505,47 @@ struct Args {
     /// sized by `kv_len` (§9.1, #68 finding 4).
     #[arg(long, default_value_t = 2)]
     arena_record_steps: usize,
+
+    /// Kernel constant binding: `split` (`setBytes`, the default) or `packed`
+    /// (a `device const Params*`, which is what an ICB command can hold).
+    ///
+    /// Selectable here as of issue #169. §11.3n declined the flag on the ground
+    /// that an instrument whose output has no valid interpretation should not be
+    /// built before the interpretation is; #169 establishes the interpretation
+    /// (see `--icb`), so the instrument follows it rather than preceding it.
+    #[arg(long, default_value = "split")]
+    param_style: String,
+
+    /// Replay the invariant decode positions from an `MTLIndirectCommandBuffer`
+    /// (`Executor=Icb`, §11.3l) instead of encoding every one classically.
+    ///
+    /// Needs `--param-style packed`, and refuses rather than covering nothing:
+    /// under `split` an ICB command cannot hold the constants (§3.7c), so every
+    /// position is excluded and the run would report a working executor that
+    /// replayed nothing. The same guard `lfm2-dispatch-trace` carries.
+    ///
+    /// **What this flag is for, since §11.3n deliberately withheld it.** The
+    /// measurement §17 Phase 2 item 10's commentary forbids is *a 78 %-coverage
+    /// executor timed against a full classical baseline*, where the barrier
+    /// count is a function of the covered set -- fatal to thesis 1 (*is replay
+    /// generally cheaper than encoding*), which §11.0 records as already dead on
+    /// other evidence. The arm this flag serves is a different question with no
+    /// such confound: **does this engine, replaying the positions it can and
+    /// encoding the rest, run faster than the same engine not doing that?** The
+    /// coverage is not an uncontrolled variable there; it is the configuration
+    /// under test.
+    #[arg(long)]
+    icb: bool,
+
+    /// Whether candle's own barrier still fires at a replayed position:
+    /// `always` (the default, byte-for-byte what ships) or `skip-replayed`
+    /// (#144's `ReplayBarriers::SkipReplayed`, §11.3r).
+    ///
+    /// Only has an effect under `--icb`, and is refused without it rather than
+    /// silently ignored -- so a row cannot be read as having been taken under an
+    /// arm that did nothing, which is the `MathMode` failure §7.1a records.
+    #[arg(long, default_value = "always")]
+    replay_barriers: String,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -544,6 +721,24 @@ fn main() -> Result<()> {
         Device::new_metal(0)?
     };
 
+    // ---- variant axes, resolved before the first pipeline exists ---------
+    //
+    // Resolved *here* rather than after the model is built, and the ordering is
+    // load-bearing rather than tidy: `supportIndirectCommandBuffers` is a
+    // property of a pipeline, pipelines are cached per process, and
+    // `set_pipelines_support_icb` refuses to change once one has been built
+    // rather than flipping and hoping (§3.7d -- the alternative is a segfault at
+    // encode time with no error to catch).
+    //
+    // Loading the weights builds pipelines: `from_mmaped_safetensors` upcasts
+    // through `to_dtype`, which dispatches `cast`. So a resolve placed after
+    // `Model::new` -- where it sat until issue #169 -- makes `--icb` fail with
+    // "Failed to create pipeline" after the weights are already resident. It is
+    // a refusal rather than a silent wrong arm, which is the guard working; but
+    // there is no reason to pay it, and nothing in the resolve needs the model.
+    let axes = Axes::resolve(&args, &device)?;
+    axes.announce();
+
     // f16 on Metal is what ambrogio loads. Measuring f32 here would measure a
     // path nothing runs, and would move twice the bytes per token.
     let dtype = match args.dtype.as_deref() {
@@ -597,13 +792,6 @@ fn main() -> Result<()> {
 
     let model = Model::new(&config, vb).context("constructing LFM2 model")?;
     let mut cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
-
-    // ---- variant axes, validated before the clock starts -----------------
-    //
-    // Parsed and checked here so an unsatisfiable combination fails before the
-    // model runs rather than after a five-minute measurement.
-    let axes = Axes::resolve(&args, &device)?;
-    axes.announce();
 
     let sampling = if args.temperature <= 0. {
         Sampling::ArgMax
@@ -677,6 +865,49 @@ fn main() -> Result<()> {
         Device::Metal(d) => Some(d.clone()),
         _ => None,
     };
+
+    // Steps the ICB executor records before deciding what is replayable.
+    //
+    // Three rather than the minimum of two, matching `lfm2-dispatch-trace`: a
+    // position that happens to agree between two consecutive steps but drifts on
+    // the third would be admitted by a two-step window, and admitting one
+    // wrongly is silent corruption under `HazardTrackingModeUntracked` (§3.5)
+    // rather than a visible failure.
+    #[cfg(feature = "metal")]
+    const ICB_RECORD_STEPS: usize = 3;
+
+    // The executor records *after* the arena is installed. Recording earlier
+    // captures the pool's buffer identities, which vary per step by
+    // construction, so every position would be excluded as `varies` (§9.2c).
+    // `--icb` requires `--arena` for this reason, so the install step is always
+    // `record_steps` here.
+    #[cfg(feature = "metal")]
+    let icb_executor = if axes.icb {
+        Some(candle_metal_kernels::IcbExecutor::configured(
+            ICB_RECORD_STEPS,
+            candle_metal_kernels::BarrierScope::default(),
+            axes.replay_barriers,
+        ))
+    } else {
+        None
+    };
+    #[cfg(feature = "metal")]
+    let icb_installed_at = axes.record_steps;
+
+    // Tokens excluded from the steady-state average because the executor is
+    // still recording. Kept separate from `--warmup` and from the arena's own
+    // recording window for the reason the arena's are: they measure a different
+    // mechanism, not a cold one, and averaging them in would attribute the
+    // difference to the thing under test.
+    #[cfg(feature = "metal")]
+    let icb_skip = if axes.icb {
+        icb_installed_at + ICB_RECORD_STEPS
+    } else {
+        0
+    };
+    #[cfg(not(feature = "metal"))]
+    let icb_skip = 0usize;
+
     while tokens.len() < args.n {
         let next = logits_processor.sample(&logits).context("sampling")?;
         if eos_ids.contains(&next) {
@@ -710,6 +941,18 @@ fn main() -> Result<()> {
             }
         }
 
+        // Install once, at the first step whose operands are stable -- which is
+        // the step after the arena's recording window closes, since the arena is
+        // what makes them stable.
+        #[cfg(feature = "metal")]
+        if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+            if tokens.len() - 1 == icb_installed_at {
+                dev.set_executor(std::sync::Arc::new(
+                    candle_metal_kernels::metal::ExecutorSlot::Custom(exec.clone()),
+                ));
+            }
+        }
+
         let step_start = std::time::Instant::now();
         let input = Tensor::new(&[next], &device)?.unsqueeze(0)?;
         logits = model
@@ -722,6 +965,29 @@ fn main() -> Result<()> {
         // serialization is inherent to the workload, not an artifact of
         // measuring it.
         device.synchronize()?;
+
+        // Close the ICB step here: after the forward pass has drained and
+        // *before* the next iteration samples, so an ICB step is exactly the
+        // forward pass and nothing else.
+        //
+        // The placement is load-bearing and both obvious alternatives are wrong
+        // (§11.3l finding 4). Closing at the top of the loop puts the previous
+        // iteration's `sample` inside the window, which adds a `softmax_f32` and
+        // an `affine_f32`; positions are compared by index, so a two-dispatch
+        // shift pairs unrelated dispatches and *every* position reads as
+        // varying -- a plausible zero-coverage result rather than an error.
+        //
+        // It sits inside the timed window deliberately. `end_step` is what an
+        // ICB arm costs per token; hoisting it out would time the replay and
+        // hide its bookkeeping, which is the arm's own cost being excluded from
+        // the arm.
+        #[cfg(feature = "metal")]
+        if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+            if tokens.len() - 1 >= icb_installed_at {
+                exec.end_step(dev.metal_device())
+                    .map_err(|e| anyhow::anyhow!("closing ICB step: {e}"))?;
+            }
+        }
         let wall = step_start.elapsed().as_secs_f64();
 
         let (gpu, disp) = if profiling {
@@ -821,13 +1087,20 @@ fn main() -> Result<()> {
     // the arena -- the confound this harness exists to remove. They are dropped
     // in addition to `--warmup`, not instead of it: they are a different
     // allocator, where warmup is a cold one.
+    //
+    // Under `--icb` the same argument applies one layer up and for a *different*
+    // mechanism: the executor spends `ICB_RECORD_STEPS` steps recording before
+    // it replays anything, and those steps are classical. Averaging them into an
+    // `Executor=Icb` mean would report a blend of the two arms under one arm's
+    // name -- which is the confound in miniature, inside the arm rather than
+    // between the arms.
     let arena_skip = if axes.arena { axes.record_steps } else { 0 };
-    let warmup = args.warmup.max(arena_skip).min(steps.len());
+    let warmup = args.warmup.max(arena_skip).max(icb_skip).min(steps.len());
     let steady = &steps[warmup..];
     anyhow::ensure!(
         !steady.is_empty(),
         "no steady-state tokens left after {warmup} excluded tokens \
-         (--warmup {}, arena recording {arena_skip}); raise --n",
+         (--warmup {}, arena recording {arena_skip}, icb recording {icb_skip}); raise --n",
         args.warmup
     );
 
@@ -989,6 +1262,77 @@ fn main() -> Result<()> {
         println!();
     }
 
+    // ---- what the executor actually did ----------------------------------
+    //
+    // The engagement proof §2.4 requires, and it is the half of this harness
+    // that makes an `Executor=Icb` timing readable at all. A ms/token figure
+    // under `--icb` is uninterpretable without knowing how much was replayed:
+    // "78 % coverage" is the configuration under test, so it has to be reported
+    // beside the time rather than assumed from the flag.
+    //
+    // `suppressed` is #144's engagement quantity, and it is the one that
+    // separates the two `ReplayBarriers` arms: 0 under `Always` against tens of
+    // thousands under `SkipReplayed`. A flag echoed back would prove nothing --
+    // #69's vacuous run reported a passing digest for the default path under a
+    // flag that never took.
+    #[cfg(feature = "metal")]
+    let mut icb_result_fields = String::new();
+    #[cfg(feature = "metal")]
+    if let Some(exec) = icb_executor.as_ref() {
+        let cov = exec.coverage();
+        let suppressed = candle_metal_kernels::metal::trace::barriers_suppressed();
+        println!("=== icb replay ===");
+        println!("replaying             {}", exec.is_replaying());
+        println!("positions per step    {}", cov.positions);
+        println!(
+            "covered               {} ({:.1} %)",
+            cov.covered,
+            if cov.positions == 0 {
+                0.0
+            } else {
+                100.0 * cov.covered as f64 / cov.positions as f64
+            }
+        );
+        println!("execute calls / step  {} (one per run)", exec.runs());
+        println!("excluded, varies      {}", cov.varies);
+        println!("excluded, inline      {}", cov.inline_constants);
+        println!("excluded, no pipeline {}", cov.no_pipeline);
+        // Zero is the expected value. Nonzero means a replayed position stopped
+        // matching its recording mid-run, so the coverage above overstates what
+        // ran and the timing is a blend of two arms.
+        println!("stale positions       {}", exec.stale_positions());
+        println!("poisoned runs         {}", exec.poisoned_runs());
+        println!("barriers in icb       {}", exec.encoded_barriers());
+        println!("barriers suppressed   {suppressed}  (#144 engagement proof)");
+        println!();
+
+        // A stale position means the measured arm is not the arm named. Refused
+        // rather than reported, for the reason #115 refuses a digest under the
+        // same condition: a partially-classical run under an `Icb` label is a
+        // row nobody can interpret, and it is exactly the confound this issue
+        // exists to avoid introducing a second time.
+        anyhow::ensure!(
+            exec.stale_positions() == 0,
+            "{} positions went stale, so the timed run is partly classical under an \
+             Executor=Icb label; at --turns 1 this should be 0 (§11.3l's single-turn \
+             restriction is about turn boundaries, which this harness has none of)",
+            exec.stale_positions()
+        );
+
+        icb_result_fields = format!(
+            " icb_positions={} icb_covered={} icb_runs={} icb_barriers={} \
+             icb_barriers_suppressed={} icb_stale={}",
+            cov.positions,
+            cov.covered,
+            exec.runs(),
+            exec.encoded_barriers(),
+            suppressed,
+            exec.stale_positions(),
+        );
+    }
+    #[cfg(not(feature = "metal"))]
+    let icb_result_fields = String::new();
+
     // The configuration is part of the RESULT line, not a separate note.
     // #99's diagnosis was that the harness emits a near-complete cache key
     // missing the commit and the variant axes; both are here, so a row can name
@@ -998,7 +1342,7 @@ fn main() -> Result<()> {
         "RESULT label={} n={} warmup={} wall_ms_per_token={:.4} gpu_ms_per_token={:.4} \
          nongpu_ms_per_token={:.4} dispatches_per_token={:.1} prefill_ms={:.2} \
          prompt_tokens={} weight_bytes={} dtype={:?} hit_eos={} profiling={} \
-         config=[{}] candle_commit={} seed={} temp={} top_p={}",
+         config=[{}]{} candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
         warmup,
@@ -1013,6 +1357,7 @@ fn main() -> Result<()> {
         hit_eos,
         profiling,
         axes.config_line(),
+        icb_result_fields,
         // Passed in by the caller rather than read from git here.
         //
         // A `git rev-parse` at runtime names the tree the binary is *run* from,
