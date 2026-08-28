@@ -187,9 +187,21 @@ impl Axes {
         // dispatches the packed variants (§11.3k), so a flag would name an arm
         // that does not run. Recorded as `split` rather than omitted, so the
         // line states every axis §7.1 has.
+        //
+        // `Executor` and `ReplayBarriers` are stated for that same reason and
+        // are likewise not selectable here. This harness deliberately carries no
+        // `--icb` (§11.3n): with the flag present, the timing §17 Phase 2 item
+        // 10 forbids would be one argument away and nothing in the output would
+        // say the arm is invalid. `ReplayBarriers` only has an effect under an
+        // installed ICB executor, so on this harness it is `Always` by
+        // construction -- recorded so a row cannot be read as having been taken
+        // under an unstated arm, which is #99's diagnosis and the failure
+        // `MathMode` embodied for the life of the project by being in neither
+        // the registry nor a config line.
         format!(
             "ParamStyle=Split ArenaLayout={} ArenaOffsets={} HazardKey={} AttnImpl={} \
-             KvAppend={} ConvState={} ScratchSizing=none",
+             KvAppend={} ConvState={} ScratchSizing=none Executor=Classical \
+             ReplayBarriers=Always",
             if self.arena {
                 #[cfg(feature = "metal")]
                 {
