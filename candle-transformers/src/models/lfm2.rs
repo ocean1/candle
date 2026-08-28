@@ -812,7 +812,22 @@ impl Attention {
                     let (k, v) = match &cache.kvs[block_idx] {
                         Some((k_cache, v_cache)) if index_pos > 0 => {
                             let k = Tensor::cat(&[k_cache, &k], 2)?.contiguous()?;
-                            let v = Tensor::cat(&[v_cache, &v], 2)?.contiguous()?;
+                            // MUTATION, lloom #170 -- DO NOT MERGE. This branch
+                            // exists to make the discriminator report "defect".
+                            //
+                            // #121/#128's founding mutation: the value cache is
+                            // appended in the wrong order, so V is misaligned
+                            // against K while every shape stays valid. It is the
+                            // known defect DESIGN.md §2.3.8d records producing
+                            // THREE IDENTICAL DIGESTS of a model emitting
+                            // "picture picture picture" -- a build reproducible
+                            // and wrong at once, and the case a digest gate
+                            // structurally cannot see.
+                            //
+                            // A discriminator that cannot report "defect" has
+                            // not been shown to discriminate, which is what
+                            // makes the instrument a test rather than a display.
+                            let v = Tensor::cat(&[&v, v_cache], 2)?.contiguous()?;
                             (k, v)
                         }
                         _ => (k, v),
