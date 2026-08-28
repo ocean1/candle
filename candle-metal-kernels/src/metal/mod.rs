@@ -24,6 +24,10 @@ mod icb_tests;
 pub mod library;
 pub mod profile;
 pub mod residency_set;
+/// Memory-class and event telemetry (issue #171). Every entry point is inert
+/// without the `run-telemetry` feature, so the module is declared
+/// unconditionally and compiles to nothing when the feature is off.
+pub mod run_telemetry;
 pub mod scratch;
 #[cfg(test)]
 mod scratch_gpu_tests;

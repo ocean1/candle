@@ -53,6 +53,43 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
+/// The serialized run record (lloom issue #171).
+///
+/// Written **at exit**, beside the `RESULT` line. The only thing it does inside
+/// a timed window is stamp each finished token with `CLOCK_UPTIME_RAW`, which is
+/// what lets the memory timeline be plotted against token index instead of
+/// against a reconstruction.
+mod run_record;
+
+/// One `sysctl -n` read, for the machine fields of the run record.
+fn sysctl_str(key: &str) -> String {
+    std::process::Command::new("sysctl")
+        .args(["-n", key])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The 1-minute load average.
+///
+/// Recorded at the start **and** the end of a run, because one reading cannot
+/// show a build starting midway through -- `lloom-probe`'s `Conditions` makes
+/// the same split for the same reason. `.bench/README.md` §1.2: a number taken
+/// on this machine without stating contention is not interpretable, and #40's
+/// null control read **+65.8 %** with two other agents building.
+fn load_average() -> Option<f64> {
+    extern "C" {
+        fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+    }
+    let mut a = [0.0f64; 3];
+    // SAFETY: `getloadavg` writes at most `nelem` doubles into the buffer, and
+    // we pass the true length of a stack array we own.
+    let n = unsafe { getloadavg(a.as_mut_ptr(), 3) };
+    (n > 0).then_some(a[0])
+}
+
 /// Access to the Metal profiling counters, with a no-op stand-in off Metal.
 ///
 /// The shim keeps the call sites unconditional: without it every snapshot and
@@ -239,6 +276,122 @@ impl Axes {
         )
     }
 
+    /// Every axis `.bench/configurations.md` §1 declares, as `(axis, arm)`.
+    ///
+    /// # Why this is not `config_line()` split on spaces
+    ///
+    /// `config_line`'s own comment says it "states every axis §7.1 has", and it
+    /// does not: the registry declares **eleven** and that line emits **eight**.
+    /// `Executor`, `BarrierScope` and `MathMode` are missing. That is not a
+    /// cosmetic gap — it is precisely the shape of the failure #122 recorded,
+    /// where `MathMode` was a real, switchable axis absent from both the
+    /// registry and the `config=[…]` line and was therefore invisible for the
+    /// life of the project (`DESIGN.md` §2.3.9).
+    ///
+    /// `.bench/configurations.md` §1 states the consequence exactly: the
+    /// `config=[…]` line "catches an axis added to the harness and not to this
+    /// file. It does **not** catch an axis added to neither."
+    ///
+    /// So this function reports all eleven, reading each from the mechanism that
+    /// actually decides it rather than from a flag — `MathMode` from the same
+    /// environment variable `kernel.rs:203` reads, `Executor` from the device.
+    /// A run recorded through this cannot be silently pooled with one taken
+    /// under a different math mode, which is the merge the store must refuse.
+    ///
+    /// `config_line` is deliberately left alone: it is what every committed
+    /// artifact's `RESULT` line looks like, and changing its shape would break
+    /// the ingest of the corpus that already exists.
+    fn axis_pairs(&self) -> Vec<(String, String)> {
+        let p = |k: &str, v: &str| (k.to_string(), v.to_string());
+        vec![
+            // Not selectable here -- nothing on the LFM2 path dispatches the
+            // packed variants (§11.3k) -- but stated, because an axis that is
+            // pinned at a default is still an axis the run was taken under.
+            p("ParamStyle", "Split"),
+            p("Executor", Self::executor_name()),
+            p(
+                "ArenaLayout",
+                &if self.arena {
+                    #[cfg(feature = "metal")]
+                    {
+                        match self.layout {
+                            candle::metal_backend::ArenaLayout::Packed => "Packed".to_string(),
+                            candle::metal_backend::ArenaLayout::NonAliasing => {
+                                "NonAliasing".to_string()
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        "none".to_string()
+                    }
+                } else {
+                    "none(pool)".to_string()
+                },
+            ),
+            p("ArenaOffsets", if self.gpu_offsets { "Gpu" } else { "Cpu" }),
+            p("HazardKey", Self::hazard_key_name()),
+            p(
+                "AttnImpl",
+                if self.attn == "sdpa" {
+                    "Sdpa"
+                } else {
+                    "Generic"
+                },
+            ),
+            p(
+                "KvAppend",
+                if self.kv_append == "in-place" {
+                    "InPlace"
+                } else {
+                    "Cat"
+                },
+            ),
+            p(
+                "ConvState",
+                &match self.conv_state {
+                    ConvState::Shuffle => "Shuffle".to_string(),
+                    ConvState::SlidingRing { k, slack } => {
+                        format!("SlidingRing(k={k},slack={slack})")
+                    }
+                    ConvState::RotatingRing { k } => format!("RotatingRing(k={k})"),
+                },
+            ),
+            // Only selects anything under `Executor=Icb`, which this harness
+            // does not take. Stated at its default rather than omitted: an
+            // unstated axis and an axis at its default are different facts, and
+            // conflating them is what this whole function exists to stop.
+            p("BarrierScope", "RunStart"),
+            p("ScratchSizing", "none"),
+            p("MathMode", Self::math_mode_name()),
+        ]
+    }
+
+    /// The math mode this build will compile its kernels under.
+    ///
+    /// Read from the same environment variable `candle-metal-kernels`'
+    /// `kernel.rs:203` reads, so the recorded value is the one that decides
+    /// codegen rather than a flag we happen to pass. Note the off arm is
+    /// `Relaxed`, **not** `Safe` — `MTLMathMode` has three values and neither
+    /// arm available today is the strict one (§2.3.5, §2.3.9).
+    fn math_mode_name() -> &'static str {
+        match std::env::var("CANDLE_METAL_ENABLE_FAST_MATH").as_deref() {
+            Ok("0") | Ok("false") | Ok("no") => "Relaxed+Precise",
+            // Metal's own default is `Fast`, so an unset variable is the fast
+            // arm rather than an unknown one: candle's `get_env_bool(.., true)`
+            // declines to depart from Metal, and the `else` branch is the
+            // departure (§2.3.9).
+            _ => "Fast",
+        }
+    }
+
+    fn executor_name() -> &'static str {
+        // This harness never selects the ICB executor -- #115 ships `--icb` on
+        // the trace harness, and §17 Phase 2 item 10 forbids timing a
+        // 78 %-coverage executor against a full baseline anyway.
+        "Classical"
+    }
+
     fn hazard_key_name() -> &'static str {
         #[cfg(feature = "metal")]
         {
@@ -307,6 +460,24 @@ struct Args {
     /// Label printed with the result, to tag a run inside a batch.
     #[arg(long, default_value = "")]
     label: String,
+
+    // ---- the run store (lloom issue #171) -------------------------------
+    /// Append a serialized run record to this JSONL file, at exit.
+    ///
+    /// Nothing is written without it, and a write failure is a warning rather
+    /// than a failed run: the measurement has already happened by then.
+    #[arg(long)]
+    run_store: Option<String>,
+
+    /// Run id, shared with the `lloom-sample` telemetry for the same run so the
+    /// two files can be joined without guessing.
+    #[arg(long)]
+    run_id: Option<String>,
+
+    /// Path of the `lloom-sample` telemetry recorded around this run, recorded
+    /// in the run record so a reader can find it.
+    #[arg(long)]
+    telemetry_path: Option<String>,
 
     // ---- variant axes (`DESIGN.md` §7.1) --------------------------------
     //
@@ -532,6 +703,11 @@ fn main() -> Result<()> {
 
     let profiling = profile::enabled();
 
+    // Before anything loads, so it is the load the run *began* under. The
+    // closing reading is taken at the record, and the pair is what shows a
+    // build arriving midway through.
+    let load_at_start = load_average();
+
     // Cloned rather than moved out: `args` is read again below, both to resolve
     // the variant axes and to print them on the RESULT line.
     let model_dir = args.model_dir.clone().or_else(default_model_dir).context(
@@ -668,6 +844,11 @@ fn main() -> Result<()> {
 
     // Per token: (wall seconds, gpu busy seconds, dispatches).
     let mut steps: Vec<(f64, f64, u64)> = Vec::with_capacity(args.n);
+    // Per token, for the run record: `CLOCK_UPTIME_RAW` at the end of the token
+    // and the `kv_len` it ran at. Pre-reserved, so the push inside the loop
+    // cannot reallocate mid-window; the stamp itself is one
+    // `clock_gettime_nsec_np` against a 24 MHz timebase (`DESIGN.md` §3.4b).
+    let mut step_stamps: Vec<(u64, usize)> = Vec::with_capacity(args.n);
     let mut tokens: Vec<u32> = Vec::with_capacity(args.n);
     let mut hit_eos = false;
     let mut last_token_kernels: Vec<(String, u64)> = Vec::new();
@@ -810,6 +991,9 @@ fn main() -> Result<()> {
         }
 
         steps.push((wall, gpu, disp));
+        // Stamped after the timing snapshot, so the clock read is outside the
+        // window it describes rather than inside it.
+        step_stamps.push((run_record::now_ns(), kv_len));
         kv_len += 1;
     }
 
@@ -1025,6 +1209,107 @@ fn main() -> Result<()> {
         args.temperature,
         args.top_p,
     );
+
+    // ---- the run record, at exit (lloom issue #171) ----------------------
+    //
+    // Deliberately here: after the last token, after `device.synchronize()`,
+    // after every mean is computed, and after `RESULT` is printed. Nothing
+    // below runs inside a measured window.
+    //
+    // Absent `--run-store`, nothing is written and nothing fails. `lloom-sample`
+    // decided the same way and gives the reason: telemetry failure must degrade
+    // to "no telemetry", never to "failed measurement".
+    if let Some(store) = args.run_store.as_deref() {
+        let m = |v: f64| run_record::Measured::Value(v);
+        // With profiling off the harness cannot compute a GPU split -- the
+        // figures come from `GPUStartTime`/`GPUEndTime`, which only the
+        // profiling path collects. Recorded NEVER RUN rather than as the 0.0
+        // the `RESULT` line prints, which is the defect the corpus already
+        // carries: a real zero standing where "not measured" was meant.
+        let (gpu_metric, nongpu_metric, disp_metric) = if profiling {
+            (
+                m(gpu_mean * 1e3),
+                m((wall_mean - gpu_mean) * 1e3),
+                m(disp_mean),
+            )
+        } else {
+            (
+                run_record::Measured::NeverRun,
+                run_record::Measured::NeverRun,
+                run_record::Measured::NeverRun,
+            )
+        };
+
+        let rec = run_record::RunRecord {
+            run_id: args.run_id.clone().unwrap_or_else(|| {
+                format!(
+                    "{}-{}",
+                    if args.label.is_empty() {
+                        "run"
+                    } else {
+                        &args.label
+                    },
+                    std::process::id()
+                )
+            }),
+            harness: "lfm2-decode-profile",
+            label: args.label.clone(),
+            candle_commit: std::env::var("LLOOM_CANDLE_COMMIT")
+                .ok()
+                .filter(|v| !v.is_empty() && v != "unknown"),
+            lloom_commit: std::env::var("LLOOM_COMMIT")
+                .ok()
+                .filter(|v| !v.is_empty() && v != "unknown"),
+            binary_uuid: run_record::self_uuid(),
+            binary_path: std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string()),
+            axes: axes.axis_pairs(),
+            machine: sysctl_str("hw.model"),
+            macos_build: sysctl_str("kern.osversion"),
+            load_start: load_at_start,
+            load_end: load_average(),
+            under_lease: std::env::var("LLOOM_ARB_LEASE").is_ok(),
+            n: args.n,
+            warmup,
+            seed: args.seed,
+            temperature: args.temperature,
+            top_p: args.top_p,
+            prompt_tokens: prompt_ids.len(),
+            kv_len_first: step_stamps.first().map(|s| s.1).unwrap_or(0),
+            kv_len_last: step_stamps.last().map(|s| s.1).unwrap_or(0),
+            dtype: format!("{dtype:?}"),
+            profiling_compiled: cfg!(feature = "metal"),
+            profiling_enabled: profiling,
+            wall_ms_per_token: m(wall_mean * 1e3),
+            gpu_ms_per_token: gpu_metric,
+            nongpu_ms_per_token: nongpu_metric,
+            dispatches_per_token: disp_metric,
+            prefill_ms: m(prefill_wall.as_secs_f64() * 1e3),
+            weight_bytes: m(weight_bytes as f64),
+            steps: steps
+                .iter()
+                .zip(step_stamps.iter())
+                .enumerate()
+                .map(|(i, ((wall, gpu, disp), (t_end_ns, kv)))| run_record::Step {
+                    index: i,
+                    warmup: i < warmup,
+                    wall_ms: wall * 1e3,
+                    gpu_ms: if profiling { Some(gpu * 1e3) } else { None },
+                    dispatches: if profiling { Some(*disp) } else { None },
+                    t_end_ns: *t_end_ns,
+                    kv_len: *kv,
+                })
+                .collect(),
+            telemetry_path: args.telemetry_path.clone(),
+        };
+        match rec.emit(store) {
+            Ok(()) => eprintln!("run record appended to {store}"),
+            // A failed write is reported and does not fail the run: the
+            // measurement already happened and its `RESULT` line is printed.
+            Err(e) => eprintln!("WARNING: could not write the run record to {store}: {e}"),
+        }
+    }
 
     Ok(())
 }

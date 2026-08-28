@@ -14,6 +14,13 @@ license = "MIT OR Apache-2.0"
 default = []
 # Emit per-dispatch Metal debug groups for Xcode GPU captures / Instruments.
 debug-labels = []
+# Per-memory-class and event telemetry on a CLOCK_UPTIME_RAW timeline (#171).
+#
+# Composes with a RELEASE build -- it is not a debug build and not a permanent
+# cost. Off, every entry point in `metal::run_telemetry` is an empty inline
+# function, following `debug-labels`'s shape, so there is no call to elide and
+# no state to allocate.
+run-telemetry = []
 
 [dependencies]
 half = { version = "2.5.0", features = [
