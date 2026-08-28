@@ -119,6 +119,35 @@ pub trait Executor: Send + Sync {
         }
     }
 
+    /// What this position's disposition will be, **without advancing anything**.
+    ///
+    /// Consulted by `auto_barrier` *before* the dispatch is offered, which is
+    /// the ordering §11.3p identifies as the obstacle: `auto_barrier` runs at
+    /// `encoder.rs:405` and `offer_to_executor` at `:416`, so at fence time the
+    /// encoder does not yet know whether the position will be replayed.
+    ///
+    /// # Why this is not `dispatch_action`
+    ///
+    /// **`dispatch_action` is not pure.** It advances `position`, `suppress_until`
+    /// and `run_in_flight`, and -- the part the issue body understates -- it
+    /// **drains** the binding state accumulated by [`Self::will_bind_buffer`]
+    /// with three `std::mem::take`s, so a second call sees empty bindings and
+    /// would record a dispatch with no operands. Calling it speculatively to
+    /// learn the disposition would therefore corrupt the recording, not merely
+    /// double-advance a cursor.
+    ///
+    /// So the seam is to **split the decision from the drain**. The decision
+    /// half is a phase check and a `command_of` lookup, neither of which touches
+    /// `pending` -- which is why this can be defaulted to
+    /// [`Disposition::Unknown`] and cost every existing implementor nothing.
+    ///
+    /// Defaulted so no existing executor changes behaviour: an implementor that
+    /// does not override this is treated as though every position were
+    /// classically encoded, which is what they all are.
+    fn disposition(&self) -> Disposition {
+        Disposition::Unknown
+    }
+
     /// Called when a buffer is bound, before the bind reaches Metal.
     ///
     /// A replaying executor needs this because bindings are applied as
@@ -128,6 +157,33 @@ pub trait Executor: Send + Sync {
 
     /// Called when pipeline state is set, before it reaches Metal.
     fn will_set_pipeline(&self, _pipeline: &ComputePipeline) {}
+}
+
+/// What an executor will do with the position about to be dispatched, as far as
+/// can be known *before* the dispatch is offered.
+///
+/// This is the decision half of `dispatch_action`, split out so it can be asked
+/// at `auto_barrier` time without consuming the pending bindings (see
+/// [`Executor::disposition`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Disposition {
+    /// Nothing is known, or the position will be encoded classically. The
+    /// default, and what every executor that does not override
+    /// [`Executor::disposition`] reports.
+    #[default]
+    Unknown,
+    /// This position is a **non-head member of a run that is already in
+    /// flight** -- its ICB command was executed by the range its run head
+    /// requested, and the ordering it needs was encoded onto that command as a
+    /// `setBarrier`.
+    ///
+    /// This is the *only* disposition that licenses suppressing candle's
+    /// barrier, and the narrowness is the whole of the argument
+    /// (`measurements/issue-144-predicate.md`). A run head is deliberately not
+    /// included: its scan slice is empty by construction, so candle's fence is
+    /// the only thing ordering a gap dispatch into it, and §11.3p records 30 of
+    /// the 505 firing at heads with every one required.
+    ReplayedInFlightRun,
 }
 
 /// What the encoder should do at a dispatch position.
@@ -234,6 +290,22 @@ impl ExecutorSlot {
         match self {
             ExecutorSlot::Classical => DispatchAction::Encode,
             ExecutorSlot::Custom(e) => e.dispatch_action(record),
+        }
+    }
+
+    /// What the installed executor will do with this position, without
+    /// advancing it (see [`Executor::disposition`]).
+    ///
+    /// `Classical` answers [`Disposition::Unknown`] **without a virtual call**,
+    /// which is what makes issue #144's axis a no-op on the default path by
+    /// construction rather than by measurement: with no executor installed there
+    /// is no second ordering source, so there is nothing a suppression decision
+    /// could be made against.
+    #[inline(always)]
+    pub fn disposition(&self) -> Disposition {
+        match self {
+            ExecutorSlot::Classical => Disposition::Unknown,
+            ExecutorSlot::Custom(e) => e.disposition(),
         }
     }
 

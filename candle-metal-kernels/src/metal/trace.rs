@@ -282,6 +282,61 @@ pub fn record_barrier() {
     }
 }
 
+/// Record that `auto_barrier` had a barrier pending and **did not emit it**,
+/// because the position is being replayed from the ICB (issue #144,
+/// `ReplayBarriers::SkipReplayed`).
+///
+/// Counted at the suppression site rather than by differencing two runs, for
+/// §2.4's reason: *an instrument that cannot be shown to have engaged has not
+/// measured anything*, and #69's determinism gate was vacuous because both arms
+/// silently ran the default. A nonzero count here is the quantity that shows
+/// the axis took effect.
+///
+/// **It is engagement proof and never the correctness argument** (§2.4). A
+/// wrongly-suppressed edge leaves this count higher and the barrier count lower,
+/// both entirely plausible; the correctness evidence is §15.1 #7's digest gate
+/// and §15.1 #8's `lfm2-smoke`.
+///
+/// Note the pending barrier is **deferred rather than discharged** -- see
+/// `auto_barrier` -- so one suppressed here may still be emitted at the next
+/// classically-encoded position. This therefore counts *suppression events*,
+/// not edges removed, and the two are different quantities.
+/// # Why this counter is NOT gated on `is_recording`
+///
+/// Everything else in this module is, because a trace is opt-in and expensive.
+/// This one must not be, and the reason is the whole point of having it: the
+/// harness that **gates** this axis is `lfm2-determinism`, which never calls
+/// `set_recording` at all. A counter behind `is_recording()` would read 0 there
+/// on both arms, and a reader would conclude the axis had not engaged -- or
+/// worse, would not notice.
+///
+/// That is precisely #69's vacuous determinism run (§9.2f): the harness consumed
+/// the `OnceLock` guarding the mode switch, both arms ran the default, and the
+/// "changed" arm reported a passing digest for the unchanged path. It was caught
+/// by checking that the **barrier count moved between arms**, not by trusting
+/// the flag. This counter is that check for this axis, so it has to be readable
+/// in the run that does the gating.
+///
+/// It is a single relaxed increment on a path that already takes a mutex, so
+/// the cost is nil beside `auto_barrier`'s own lock.
+#[inline]
+pub fn record_barrier_suppressed() {
+    BARRIERS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Suppression events since process start (issue #144).
+///
+/// Process-cumulative rather than per step, because the quantity it exists to
+/// answer is *"did the switch engage at all"* and that is answered by any
+/// nonzero value. Per-step figures come from the dispatch trace, which records
+/// barriers against the position that follows them.
+pub fn barriers_suppressed() -> usize {
+    BARRIERS_SUPPRESSED.load(Ordering::Relaxed)
+}
+
+/// Suppression events, independent of whether a trace is being recorded.
+static BARRIERS_SUPPRESSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Record that a new encoder session began, resetting hazard state.
 ///
 /// Barriers order dispatches only *within* an encoder, so a barrier count is
