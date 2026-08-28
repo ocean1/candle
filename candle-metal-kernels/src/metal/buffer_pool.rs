@@ -318,10 +318,48 @@ struct PendingBuffer {
     epoch: u64,
 }
 
+/// Told when the pool destroys a free buffer, so a holder of a second reference
+/// to it can let go first.
+///
+/// Exists for the residency set (`DESIGN.md` §6.3c): the set retains every
+/// buffer the pool allocated, and eviction *destroys* buffers to keep the free
+/// list inside its budget. Without a notification the set goes on listing an
+/// allocation whose handle is gone, which is the state that makes a later
+/// `removeAllocation` a machine panic rather than an error.
+///
+/// This is §6.7 L4a's rule applied to the one transition the pool did not
+/// announce: eviction was a state change with no event, so the only other way
+/// for the set to learn of it would be to poll -- and the same section says a
+/// poll that exists because an event is missing cannot be optimized into
+/// correctness.
+pub trait BufferEvictionObserver: Send + Sync {
+    /// Called with **all** the buffers one eviction round is about to destroy.
+    ///
+    /// # Why a batch rather than one call per buffer
+    ///
+    /// Measured, and the difference is the whole cost of this mechanism. A
+    /// residency-set removal ends in `commit()`, which is the expensive part;
+    /// decode evicts ~11.6 buffers per token (§6.3b, because the KV cache asks
+    /// for a slightly larger size every step and never asks for the one it just
+    /// freed), so a per-buffer call pays ~11.6 commits per token where a batch
+    /// pays one. Per-buffer measured **+0.087 ms/token of non-GPU time — 9 % of
+    /// §11.2's 6.1 % budget**; batched is inside the noise.
+    ///
+    /// Called with the pool's lock **released**, and before the buffers are
+    /// dropped, so the observer may take its own locks and is looking at
+    /// allocations that still exist.
+    fn on_evict(&self, buffers: &[Buffer]);
+}
+
 pub struct PoolInner {
     state: Mutex<PoolState>,
     /// How far the GPU has got. Shared with `Commands`, which advances it.
     clock: Arc<GpuClock>,
+    /// Told when a free buffer is destroyed. See [`BufferEvictionObserver`].
+    ///
+    /// `None` for a pool with no second referent, which is every pool in the
+    /// tests and the default `BufferPool::new`. The device installs one.
+    on_evict: Mutex<Option<Arc<dyn BufferEvictionObserver>>>,
 }
 
 /// Default cap on bytes held in a free list.
@@ -352,7 +390,14 @@ impl PoolInner {
                 counters: PoolCounters::default(),
             }),
             clock,
+            on_evict: Mutex::new(None),
         }
+    }
+
+    /// The eviction observer, if one is installed. Cheap: one lock and a clone
+    /// of an `Option<Arc>`, taken only when an eviction actually happens.
+    fn eviction_observer(&self) -> Option<Arc<dyn BufferEvictionObserver>> {
+        self.on_evict.lock().ok().and_then(|o| o.clone())
     }
 
     /// Hands a buffer back. Called only from `PooledBuffer::drop`.
@@ -425,7 +470,29 @@ impl PoolInner {
         if drained > 0 {
             state.counters.drained += drained;
             state.counters.pending = state.pending.len() as u64;
-            state.evict_over_budget();
+            let evicted = state.evict_over_budget();
+            // Drop the lock before telling the observer, and tell it before the
+            // buffers are destroyed: `evicted` still owns them here, so the
+            // residency set is removing an allocation that provably still
+            // exists (`DESIGN.md` §6.3c).
+            drop(state);
+            self.notify_evicted(&evicted);
+        }
+    }
+
+    /// Tells the eviction observer about buffers the pool is destroying.
+    ///
+    /// Takes them by reference and lets the caller drop them afterwards, so the
+    /// `MTLBuffer` is still alive while `removeAllocation` runs. Removing an
+    /// allocation that has already been freed is the exact operation
+    /// `IOGPUGroupMemory::remove_memory_object()` aborts the machine over, so
+    /// the order here is the point rather than a detail.
+    fn notify_evicted(&self, evicted: &[Buffer]) {
+        if evicted.is_empty() {
+            return;
+        }
+        if let Some(observer) = self.eviction_observer() {
+            observer.on_evict(evicted);
         }
     }
 }
@@ -456,7 +523,14 @@ impl PoolState {
     /// Oldest-first, because a size that has not been asked for since it was
     /// freed is the least likely to be asked for again -- in the growing case,
     /// provably never.
-    fn evict_over_budget(&mut self) {
+    /// Returns the buffers it removed rather than dropping them here, so the
+    /// caller can hand them to the eviction observer **before** they are
+    /// destroyed (`DESIGN.md` §6.3c). Dropping them inside this function would
+    /// free the `MTLBuffer` while the residency set still lists it, which is the
+    /// same defect the teardown guard exists to prevent, one clock earlier.
+    #[must_use]
+    fn evict_over_budget(&mut self) -> Vec<Buffer> {
+        let mut evicted = Vec::new();
         while self.free_bytes > self.free_budget {
             let Some(size) = self.free_order.pop_front() else {
                 break;
@@ -466,15 +540,17 @@ impl PoolState {
             };
             // Stale entry: a lookup already took this buffer, so there is
             // nothing here to evict and the queue entry is just noise.
-            if bucket.pop().is_none() {
+            let Some(buffer) = bucket.pop() else {
                 continue;
-            }
+            };
             if bucket.is_empty() {
                 self.free.remove(&size);
             }
             self.free_bytes = self.free_bytes.saturating_sub(size);
             self.counters.evicted += 1;
+            evicted.push(buffer);
         }
+        evicted
     }
 }
 
@@ -509,6 +585,18 @@ impl BufferPool {
         }
     }
 
+    /// Installs the observer told when this pool destroys a free buffer.
+    ///
+    /// Call during device setup, before any allocation: an observer installed
+    /// later would miss buffers already evicted, and for the residency set that
+    /// means an allocation it still lists whose handle is gone
+    /// (`DESIGN.md` §6.3c). Replaces any previous observer.
+    pub fn set_eviction_observer(&self, observer: Arc<dyn BufferEvictionObserver>) {
+        if let Ok(mut slot) = self.inner.on_evict.lock() {
+            *slot = Some(observer);
+        }
+    }
+
     /// Returns every buffer whose epoch has completed to its free list.
     ///
     /// Call from a command buffer completion handler, once per command buffer.
@@ -519,10 +607,16 @@ impl BufferPool {
     /// Sets the cap on bytes retained in the free list, evicting immediately if
     /// the new cap is already exceeded. See `DEFAULT_FREE_BUDGET_BYTES`.
     pub fn set_free_budget(&self, bytes: usize) {
-        if let Ok(mut state) = self.inner.state.lock() {
+        let evicted = {
+            let Ok(mut state) = self.inner.state.lock() else {
+                return;
+            };
             state.free_budget = bytes;
-            state.evict_over_budget();
-        }
+            state.evict_over_budget()
+        };
+        // Outside the lock, and before `evicted` is dropped -- see
+        // `PoolInner::notify_evicted`.
+        self.inner.notify_evicted(&evicted);
     }
 
     /// Takes a reusable buffer of at least `size` bytes, if one is free.

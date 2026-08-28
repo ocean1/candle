@@ -546,3 +546,186 @@ fn trim_does_not_free_buffers_still_in_flight() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The residency-set guard (lloom issue #166, `DESIGN.md` §6.3c).
+//
+// The defect these cover is a *kernel panic*:
+// `IOGPUGroupMemory::remove_memory_object()` aborts the machine when asked to
+// remove an allocation that is already gone. That is not a testable assertion,
+// and a test that provoked it would cost the machine and the user's session —
+// so **nothing here reproduces the crash**. What is testable is the mechanism
+// that makes it unreachable, and that is what these assert: that the set is
+// emptied while the buffers still exist, and that the emptying happens when the
+// last device handle drops rather than when any clone does.
+// ---------------------------------------------------------------------------
+
+/// The guard fires on the **last** handle, not on every clone.
+///
+/// `MetalDevice` is `Clone` and every `Tensor` holds a clone through its
+/// `MetalStorage`, so a `Drop` written on `MetalDevice` itself would fire
+/// hundreds of times per decode token — each time waiting for the GPU. This
+/// pins the property that keeps that wait off the hot path.
+#[test]
+fn teardown_guard_is_shared_by_every_device_clone() -> Result<()> {
+    let _guard = lock();
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+
+    let before = metal.device_handles();
+
+    // A tensor holds a device clone through its storage, so allocating must
+    // raise the count — which is exactly why the guard cannot live on
+    // `MetalDevice::drop`.
+    let t = Tensor::zeros((64, 64), DType::F32, &device)?;
+    let with_tensor = metal.device_handles();
+    assert!(
+        with_tensor > before,
+        "a tensor must hold a device handle ({before} -> {with_tensor}); \
+         if it does not, the premise for the guard's placement has changed"
+    );
+
+    // Dropping it lowers the count and must NOT have run the guard: the
+    // residency set is still populated and the device still works.
+    drop(t);
+    assert_eq!(
+        metal.device_handles(),
+        before,
+        "dropping a tensor should release exactly its own device handle"
+    );
+    assert!(
+        metal.residency_set_len() > 0,
+        "dropping a tensor must not empty the residency set — that is the \
+         teardown path firing on the hot path"
+    );
+
+    // And the device is still usable, which is the observable consequence of
+    // the guard not having run.
+    let sum = Tensor::ones((8, 8), DType::F32, &device)?
+        .sum_all()?
+        .to_scalar::<f32>()?;
+    assert_eq!(sum, 64.0);
+    Ok(())
+}
+
+/// Dropping the last handle empties the residency set.
+///
+/// This is the ordering the panic came from, asserted from the outside: after
+/// the device is gone, the set holds nothing, so the later teardown of the
+/// Metal object has nothing to remove and cannot ask the kernel to remove an
+/// absent allocation.
+///
+/// It is observed through an `Arc` the test keeps to the set itself, because
+/// after the device drops there is no device left to ask.
+#[test]
+fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
+    let _guard = lock();
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+
+    // Allocate through several paths so the set is genuinely populated.
+    let a = Tensor::zeros((128, 128), DType::F32, &device)?;
+    let b = Tensor::ones((64, 64), DType::F32, &device)?;
+    let c = (&b + 1.0)?;
+    let set = metal.residency_set_handle();
+    assert!(
+        !set.is_empty(),
+        "expected allocations to have registered in the residency set"
+    );
+
+    drop((a, b, c));
+    assert!(
+        !set.is_empty(),
+        "dropping tensors must not empty the set (issue #166)"
+    );
+
+    // The last handle goes here. `set` outlives it deliberately, which is the
+    // whole point: once the device is gone there is nothing left to ask.
+    drop(device);
+
+    assert_eq!(
+        set.len(),
+        0,
+        "the last device handle dropping must empty the residency set before \
+         the pools free the buffers it lists (`DESIGN.md` §6.3c)"
+    );
+    Ok(())
+}
+
+/// Evicting a buffer retires it from the residency set's membership record.
+///
+/// The pool bounds its free list by **destroying** buffers whose size will not
+/// be asked for again (§6.3b). That is a second place a buffer's existence
+/// ends, and nothing was announcing it — so the record went on naming
+/// allocations whose handles were gone, on the steady-state decode path rather
+/// than only at teardown.
+///
+/// What is asserted is the *record*, not a Metal call, and that is the design
+/// rather than a weaker test: unregistering eagerly puts a `commit()` on the
+/// per-token path and measured **+0.062 ms/token** against §11.2's 6.1 %
+/// budget, where retiring the key is free and is what makes a later remove a
+/// no-op. Teardown clears Metal's side with `removeAllAllocations`, which names
+/// no object. See `ResidencyEvictionObserver`.
+#[test]
+fn evicting_a_free_buffer_retires_it_from_the_membership_record() -> Result<()> {
+    let _guard = lock();
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+
+    // Free several distinct sizes, then synchronize so they reach the free
+    // list rather than sitting pending on the GPU.
+    for i in 1..=8 {
+        let t = Tensor::zeros((256, 256 + i), DType::F32, &device)?;
+        drop(t);
+    }
+    metal.wait_until_completed()?;
+
+    let before = metal.residency_set_len();
+    let evicted_before = {
+        let (s, p) = metal.pool_counters();
+        s.evicted + p.evicted
+    };
+
+    // A budget of zero evicts the whole free list.
+    metal.set_free_budget(0);
+
+    let (s, p) = metal.pool_counters();
+    let evicted = (s.evicted + p.evicted) - evicted_before;
+    assert!(
+        evicted > 0,
+        "expected the budget change to evict something; with nothing evicted \
+         this test asserts nothing"
+    );
+
+    let after = metal.residency_set_len();
+    assert_eq!(
+        before - after,
+        evicted as usize,
+        "every evicted buffer must leave the membership record: {evicted} \
+         evicted, record went {before} -> {after}"
+    );
+
+    // The consequence that matters: nothing can now name one of those
+    // allocations to Metal. `trim_unused_buffers` walks the free list and
+    // removes what it finds, and the free list is empty — so this is a no-op
+    // rather than a removal of an allocation the pool already destroyed.
+    metal.trim_unused_buffers();
+    assert_eq!(
+        metal.residency_set_len(),
+        after,
+        "a trim after an eviction must not remove anything further"
+    );
+    Ok(())
+}

@@ -2493,6 +2493,190 @@ fn residency_set_batch_insert_remove() {
     assert_eq!(raw.allocationCount(), base);
 }
 
+/// A second remove of the same buffer must not reach `removeAllocation`.
+///
+/// **This is the test that cannot be written the obvious way.** The defect's
+/// natural expression is `IOGPUGroupMemory::remove_memory_object()` panicking
+/// the *machine* (`DESIGN.md` §6.3c), so a test that actually provokes it costs
+/// the machine and the user's session and must never be written. What is
+/// testable is the guard: the membership set refuses the second remove, so the
+/// call never happens.
+///
+/// The assertion is on **two independent quantities** — our own membership
+/// count and Metal's `allocationCount()` — because agreeing with itself is what
+/// a broken bookkeeping layer also does.
+#[test]
+fn residency_set_refuses_a_double_remove() {
+    use objc2_metal::MTLResidencySet;
+
+    let device = device();
+    let set = ResidencySet::new(&device);
+    let Some(raw) = set.raw() else {
+        return;
+    };
+
+    let buf = new_buffer(&device, &[1.0f32]);
+    let base = raw.allocationCount();
+
+    set.insert(&buf);
+    assert!(set.contains(&buf), "insert did not record membership");
+    assert_eq!(raw.allocationCount(), base + 1);
+
+    // First remove: the set holds it, so this is a real removal.
+    assert_eq!(set.remove(&buf), 1, "first remove should have removed one");
+    assert!(!set.contains(&buf));
+    assert_eq!(raw.allocationCount(), base);
+
+    // Second remove: absent. This is the call that would reach the kernel's
+    // assertion, and the count returning 0 is the evidence it did not.
+    assert_eq!(
+        set.remove(&buf),
+        0,
+        "a second remove must be refused, not forwarded to Metal"
+    );
+    assert_eq!(raw.allocationCount(), base);
+
+    // A buffer that was never inserted is the same case by a different route.
+    let never = new_buffer(&device, &[2.0f32]);
+    assert_eq!(
+        set.remove(&never),
+        0,
+        "removing a never-inserted buffer must be refused"
+    );
+    assert_eq!(raw.allocationCount(), base);
+}
+
+/// Inserting the same buffer twice must leave the set holding it **once**.
+///
+/// Otherwise the set's own count and Metal's disagree about how many removes
+/// the allocation needs, and the guard in `remove` stops being able to decide.
+#[test]
+fn residency_set_insert_is_idempotent() {
+    use objc2_metal::MTLResidencySet;
+
+    let device = device();
+    let set = ResidencySet::new(&device);
+    let Some(raw) = set.raw() else {
+        return;
+    };
+
+    let buf = new_buffer(&device, &[1.0f32]);
+    let base = raw.allocationCount();
+    let base_members = set.len();
+
+    assert_eq!(set.insert(&buf), 1, "the first insert adds the allocation");
+
+    // **The returned count is the discriminating quantity, and neither of the
+    // two obvious ones is.** `addAllocation` is idempotent on Metal's side, so
+    // `allocationCount()` reads `base + 1` whether or not the duplicate was
+    // forwarded; and a `HashSet` holding one key has the same length either
+    // way. Both assertions pass under a mutation that re-adds unconditionally —
+    // measured. Only counting the calls we chose to make sees it.
+    assert_eq!(
+        set.insert(&buf),
+        0,
+        "a repeated insert must be skipped, not forwarded to Metal"
+    );
+    assert_eq!(set.len(), base_members + 1);
+    assert_eq!(raw.allocationCount(), base + 1);
+
+    assert_eq!(set.remove(&buf), 1);
+    assert_eq!(set.len(), base_members);
+    assert_eq!(raw.allocationCount(), base);
+    // And the second remove is still refused, which is the property a
+    // double-insert would have broken.
+    assert_eq!(set.remove(&buf), 0);
+}
+
+/// An arena slot is a view over a shared parent, so N views are **one**
+/// allocation to Metal and must be one member here (`DESIGN.md` §9.2).
+///
+/// Keying membership on the handle rather than on the underlying `MTLBuffer`
+/// would make a view's removal drop the parent while other views still use it —
+/// and would make the parent's insertion look like N removals' worth.
+#[test]
+fn residency_set_keys_views_to_their_parent() {
+    use objc2_metal::MTLResidencySet;
+
+    let device = device();
+    let set = ResidencySet::new(&device);
+    let Some(raw) = set.raw() else {
+        return;
+    };
+
+    let parent = new_buffer(&device, &[0.0f32; 64]);
+    let base = raw.allocationCount();
+
+    set.insert(&parent);
+    assert_eq!(raw.allocationCount(), base + 1);
+
+    // Two disjoint views over the same allocation.
+    let a = parent.view(0, 16);
+    let b = parent.view(16, 16);
+    assert!(set.contains(&a), "a view must resolve to its parent's entry");
+    assert!(set.contains(&b));
+
+    // Inserting a view adds nothing: the allocation is already there.
+    set.insert(&a);
+    assert_eq!(
+        raw.allocationCount(),
+        base + 1,
+        "inserting a view must not add a second allocation"
+    );
+
+    // Removing through one view removes the single allocation, and the second
+    // view's removal is then refused rather than reaching the kernel.
+    assert_eq!(set.remove(&a), 1);
+    assert_eq!(raw.allocationCount(), base);
+    assert_eq!(
+        set.remove(&b),
+        0,
+        "a second view's remove must be refused once the parent is gone"
+    );
+    assert_eq!(raw.allocationCount(), base);
+}
+
+/// `remove_all` is the teardown path: it empties the set in one commit and
+/// leaves every later remove refused.
+#[test]
+fn residency_set_remove_all_empties_and_stays_empty() {
+    use objc2_metal::MTLResidencySet;
+
+    let device = device();
+    let set = ResidencySet::new(&device);
+    let Some(raw) = set.raw() else {
+        return;
+    };
+
+    // This set is freshly created, so it holds nothing but what is inserted
+    // here — which is what lets the count below be asserted absolutely.
+    assert_eq!(raw.allocationCount(), 0);
+
+    let bufs: Vec<Buffer> = (0..4).map(|i| new_buffer(&device, &[i as f32])).collect();
+    set.insert_batch(&bufs);
+    assert_eq!(set.len(), bufs.len());
+    assert_eq!(raw.allocationCount(), bufs.len());
+
+    assert_eq!(
+        set.remove_all(),
+        bufs.len(),
+        "remove_all should report what it removed"
+    );
+    assert!(set.is_empty());
+    assert_eq!(
+        raw.allocationCount(),
+        0,
+        "remove_all must empty Metal's set, not only our bookkeeping"
+    );
+
+    // Every per-buffer remove after a teardown is refused — this is the
+    // ordering the panic came from, with the guard in place.
+    for b in &bufs {
+        assert_eq!(set.remove(b), 0);
+    }
+    assert_eq!(set.remove_all(), 0, "a second remove_all is a no-op");
+}
+
 /// Every name [`ConvKernel`] declares must exist in the compiled `conv.metal`
 /// library.
 ///

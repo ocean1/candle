@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 
 mod device;
 pub use device::{DeviceId, MetalDevice};
+use device::{DeviceTeardown, ResidencyEvictionObserver};
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///
@@ -2134,10 +2135,32 @@ impl BackendDevice for MetalDevice {
             });
         }
 
+        {
+            // Installed before any allocation, so no buffer is evicted without
+            // the residency set hearing about it. The pool bounds its free list
+            // by destroying buffers (§6.3b), which is the second place a
+            // buffer's existence ends and the one nothing was announcing
+            // (`DESIGN.md` §6.3c).
+            let observer = Arc::new(ResidencyEvictionObserver::new(Arc::clone(&residency_set)));
+            buffers.set_eviction_observer(observer.clone());
+            private_buffers.set_eviction_observer(observer);
+        }
+
+        let commands = Arc::new(commands);
+        // The guard holds its own `Arc` to the two things it needs, so it fires
+        // when the last `MetalDevice` handle drops rather than when any clone
+        // does -- every `Tensor` holds a clone, so the difference is a teardown
+        // guard against a per-tensor GPU synchronize (`DESIGN.md` §6.3c).
+        let teardown = Arc::new(DeviceTeardown::new(
+            Arc::clone(&commands),
+            Arc::clone(&residency_set),
+        ));
+
         Ok(Self {
+            teardown,
             id: DeviceId::new(),
             device,
-            commands: Arc::new(commands),
+            commands,
             buffers,
             private_buffers,
             kernels,
