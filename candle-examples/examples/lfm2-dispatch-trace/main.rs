@@ -39,7 +39,9 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, KvAppend, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{
+    AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model,
+};
 use clap::Parser;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -175,6 +177,17 @@ struct Args {
     /// canonical generic pair.
     #[arg(long, default_value = "cat")]
     kv_append: String,
+
+    /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
+    /// the default), `ring[:K[:slack]]` (the sliding window, §10.2e) or
+    /// `rotating[:K]` (§10.2a's rotating index, §10.2g).
+    ///
+    /// The two rings differ on exactly the axes this harness measures: `ring`
+    /// compacts, so its per-token dispatch count is non-constant and its write
+    /// offsets slide; `rotating` never compacts, so its count is constant and
+    /// its offsets take one of `l_cache + K` fixed values.
+    #[arg(long, default_value = "shuffle")]
+    conv_state: String,
 
     /// How every kernel's scalars reach it: `split` (the default) or `packed`
     /// (one `device const Params*`, issue #115).
@@ -459,6 +472,8 @@ fn main() -> Result<()> {
         "sdpa" => AttnImpl::Sdpa,
         other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
     };
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    println!("conv state: {:?}", config.conv_state);
     println!("attention implementation: {:?}", config.attn_impl);
     // Refused rather than defaulted, for the same reason as `--attn`: an
     // unrecognized value that silently pinned the default would report the

@@ -60,7 +60,9 @@ use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, KvAppend, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{
+    AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model,
+};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -114,6 +116,19 @@ struct Args {
     /// Emit every token id and its per-step logits digest.
     #[arg(long)]
     dump_tokens: bool,
+
+    /// Write every step's raw f32 logits to this path, as
+    /// `step <i> <v0> <v1> ...` one line per step.
+    ///
+    /// **A digest cannot answer "does the error grow".** §2.3.5a's second
+    /// discriminator is that a reduction-order difference is ulp-scale and does
+    /// *not* grow with reduction length — which is a statement about magnitude,
+    /// and a SHA-256 destroys magnitude by construction: two logit vectors one
+    /// ulp apart and two that are unrelated both give unequal 64-hex strings.
+    /// This dumps the values so the difference between two arms can be
+    /// subtracted rather than merely observed to exist (issue #141, §10.2g).
+    #[arg(long)]
+    dump_logits: Option<String>,
 
     /// Label printed with the result, to tag a run inside a batch.
     #[arg(long, default_value = "")]
@@ -197,6 +212,21 @@ struct Args {
     /// canonical generic pair.
     #[arg(long, default_value = "cat")]
     kv_append: String,
+
+    /// How decode writes conv state: `shuffle` (the default, §6.1's
+    /// `narrow` + `Tensor::cat`), `ring[:K[:slack]]` (the sliding window,
+    /// §10.2e) or `rotating[:K]` (§10.2a's rotating index, §10.2g).
+    ///
+    /// **The two ring arms differ in what this harness should expect, and the
+    /// difference is the point.** `ring` slides, so its live window is
+    /// `l_cache` contiguous slots in the shuffle's own order: the summation
+    /// order is unchanged and the digests must be **unmoved** — a moved digest
+    /// there is a defect. `rotating` rotates which slot holds the newest token,
+    /// which rotates the order `sum_keepdim` walks, so its digests **move
+    /// deliberately** — the shape `--attn sdpa` has (§2.3.8c). §10.2g records
+    /// the discriminator runs that separate that from a computational bug.
+    #[arg(long, default_value = "shuffle")]
+    conv_state: String,
 
     /// How every kernel's scalars reach it: `split` (the default, one `setBytes`
     /// per scalar) or `packed` (one `device const Params*`, issue #115).
@@ -456,6 +486,9 @@ fn main() -> Result<()> {
     };
     println!("kv append: {:?}", config.kv_append);
 
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    println!("conv state: {:?}", config.conv_state);
+
     // The binding-style axis (issue #115). Set before any dispatch, and read
     // back from the crate rather than echoed from `args`, so the line printed is
     // what the kernels will actually use: an A/B behind a switch owes a check
@@ -577,6 +610,12 @@ fn main() -> Result<()> {
     let mut logits_hasher = sha256::Sha256::new();
     let mut tokens: Vec<u32> = Vec::with_capacity(args.n);
     let mut per_step: Vec<(u32, String, usize)> = Vec::with_capacity(args.n);
+    let mut logits_sink = match args.dump_logits.as_deref() {
+        Some(p) => Some(std::io::BufWriter::new(
+            std::fs::File::create(p).with_context(|| format!("creating {p}"))?,
+        )),
+        None => None,
+    };
 
     let start = std::time::Instant::now();
 
@@ -683,6 +722,21 @@ fn main() -> Result<()> {
             }
             let step_digest = sha256::digest_hex(&step_bytes);
             logits_hasher.update(&step_bytes);
+
+            if let Some(sink) = logits_sink.as_mut() {
+                use std::io::Write;
+                let mut line = String::with_capacity(step_logits.len() * 12);
+                line.push_str(&format!("step {}", per_step.len()));
+                for v in &step_logits {
+                    // Hex of the bit pattern: exact, so the comparison is over
+                    // the values the model produced rather than over a decimal
+                    // rendering of them.
+                    line.push_str(&format!(" {:08x}", v.to_bits()));
+                }
+                line.push('\n');
+                sink.write_all(line.as_bytes())
+                    .context("writing --dump-logits")?;
+            }
 
             let next = logits_processor.sample(&logits).context("sampling")?;
 

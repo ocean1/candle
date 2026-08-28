@@ -110,7 +110,9 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, Config, KvAppend, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{
+    AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model,
+};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -204,6 +206,17 @@ struct Args {
     /// single-turn limitation is the precedent for.
     #[arg(long, default_value = "cat")]
     kv_append: String,
+
+    /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
+    /// the default), `ring[:K[:slack]]` (the sliding window, §10.2e) or
+    /// `rotating[:K]` (§10.2a's rotating index, §10.2g).
+    ///
+    /// **This gate is what the digests cannot say for the rotating arm.** Its
+    /// digests move by construction, so §15.1 #7 can only report that they are
+    /// stable; whether the model still answers questions is this harness's
+    /// question and nothing else's (§2.3.8d).
+    #[arg(long, default_value = "shuffle")]
+    conv_state: String,
 
     /// Print each turn's prompt and completion. On by default; `--quiet`
     /// leaves only the verdict lines, for a scripted gate.
@@ -385,6 +398,9 @@ fn main() -> Result<()> {
         "in-place" => KvAppend::InPlace,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
+
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    println!("conv state: {:?}", config.conv_state);
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;

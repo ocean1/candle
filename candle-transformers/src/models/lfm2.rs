@@ -111,7 +111,180 @@ impl Lfm2Config {
             use_flash_attn,
             attn_impl: AttnImpl::default(),
             kv_append: KvAppend::default(),
+            conv_state: ConvState::default(),
         }
+    }
+}
+
+/// How the decode path writes conv state.
+///
+/// A construction-tier axis in `DESIGN.md` §7.1's terms, in the shape §9.1a uses
+/// for `ScratchSizing`: every arm is compiled, the selection is one field, and a
+/// regression is revertible without a rebuild.
+///
+/// # Three arms, and the third moves the digests deliberately
+///
+/// §10.2a specifies "a rotating base into a `(l_cache + K)`-wide buffer" and
+/// predicts the wrap is nearly free because the phase is uniform across the
+/// simdgroup (§3.3). The uniformity argument is sound; what that section gets
+/// wrong is the premise it rests on. It argues the ring "sums the same three
+/// products in the same tap order, differing only in which address each tap
+/// reads", and the second clause is false: `sum_keepdim` accumulates in *slot*
+/// order, so rotating which slot holds which token rotates the summation order.
+/// Float addition is not associative, so the low bits move.
+///
+/// **That makes the rotating arm a different summation order, not a defect —
+/// established by measurement, not by assumption** (issue #141, `DESIGN.md`
+/// §10.2g). §2.3.5a names CPU-backend parity as the only load-bearing
+/// discriminator between a legitimate reduction-order change and a computational
+/// bug, and the rotating arm passes it: exact against an independent f64
+/// reference on the reduction it reorders, and its LFM2 error does not grow over
+/// a full generation. So it is an axis in the shape `AttnImpl::Sdpa` is
+/// (§2.3.8c) — the digests move, deliberately, and the text does not.
+///
+/// - [`ConvState::SlidingRing`] keeps the window contiguous and in the shuffle's
+///   own slot order, so its output is **bit-identical** and it costs a periodic
+///   compaction — §10.2a's own second fallback ("a doubled buffer"), generalised
+///   with `slack` as how much doubling is paid for.
+/// - [`ConvState::RotatingRing`] is §10.2a as specified. It never compacts, so
+///   its dispatch count is **constant** and its write offsets take one of
+///   `l_cache + k` fixed values — both of which the sliding arm gives up
+///   (§10.2e). It moves the digests.
+///
+/// Neither dominates: the sliding arm buys bit-identity with `slack` bytes and a
+/// non-constant dispatch count, the rotating arm buys a constant count and fixed
+/// offsets with a moved digest. `Shuffle` remains the default, so an
+/// unconfigured caller keeps the path every recorded digest belongs to.
+///
+/// # Why `k` is a parameter and not a constant
+///
+/// §16 6b: the ring's resident footprint crosses the snapshot's at
+/// `K = l_cache`, so K is a real memory decision once a speculative scheme
+/// (#89) can supply an acceptance-rate distribution to size it against — and
+/// until then any specific `K > 0` is a number nobody measured. `K = 0` is the
+/// default, so the live window is exactly `l_cache` wide and the mechanism costs
+/// no resident bytes beyond `slack`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConvState {
+    /// `narrow` + `Tensor::cat` — reallocates and copies the whole state every
+    /// token (`DESIGN.md` §6.1). The correctness bar the rings are compared
+    /// against, and the arm every recorded digest belongs to.
+    #[default]
+    Shuffle,
+    /// A sliding write index into an `l_cache + k + slack`-wide buffer
+    /// (`DESIGN.md` §10.2a, §10.2b). The `cat` disappears: the write becomes one
+    /// in-place `slice_set`, and the read is a `narrow` that never wraps.
+    ///
+    /// Bit-identical to `Shuffle`, because the live window is always `l_cache`
+    /// contiguous slots in the shuffle's own order. Costs a compaction every
+    /// `slack` tokens, which makes the per-token dispatch count non-constant.
+    SlidingRing { k: usize, slack: usize },
+    /// A rotating write index into an `l_cache + k`-wide buffer — §10.2a as
+    /// originally specified.
+    ///
+    /// No slack, no compaction, and the write lands at one of `l_cache + k`
+    /// fixed offsets, so the per-token dispatch count is constant. **It moves
+    /// the digests**, because the summation order rotates with the slot the
+    /// newest token occupies; that is a reduction-order change and not a bug —
+    /// see this enum's note, and `DESIGN.md` §10.2g for the discriminator runs.
+    RotatingRing { k: usize },
+}
+
+/// Slack slots when `--conv-state ring` is given without one.
+///
+/// 16 puts the amortised wrap cost at one extra copy per 17 tokens — 0.06
+/// dispatches per conv layer per token against the 2 the shuffle pays — while
+/// costing 16 × 2048 × 2 B × 22 = 1.375 MiB of resident state. Past ~64 the
+/// curve is flat and the memory is not.
+const DEFAULT_RING_SLACK: usize = 16;
+
+impl ConvState {
+    /// Extra history slots beyond the live window.
+    fn history(&self) -> usize {
+        match self {
+            ConvState::Shuffle => 0,
+            ConvState::SlidingRing { k, .. } | ConvState::RotatingRing { k } => *k,
+        }
+    }
+
+    /// Total slots allocated: the live window, the speculative history, and —
+    /// for the sliding arm only — the slack the window slides through before it
+    /// must be compacted. The rotating arm needs none, which is its point.
+    fn width(&self, l_cache: usize) -> usize {
+        match self {
+            ConvState::Shuffle => l_cache,
+            ConvState::SlidingRing { k, slack } => l_cache + k + slack,
+            ConvState::RotatingRing { k } => l_cache + k,
+        }
+    }
+
+    /// Parse a harness flag.
+    ///
+    /// `shuffle` | `ring[:<K>[:<slack>]]` (the sliding arm; `ring` is kept as
+    /// the spelling every recorded #141 artifact uses) | `rotating[:<K>]`.
+    ///
+    /// Lives here rather than in each harness so the harnesses that carry the
+    /// flag cannot drift apart on what a spelling means -- the shape §8.1b
+    /// argues for, applied to a flag instead of a kernel name.
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        if s == "shuffle" {
+            return Ok(ConvState::Shuffle);
+        }
+        let num = |v: &str, what: &str| {
+            v.parse::<usize>()
+                .map_err(|_| format!("--conv-state: {what} must be an integer, got {v:?}"))
+        };
+        // Split `<name>[:<field>...]` once, so both arms share one parse of the
+        // field list and cannot disagree about how `K` is spelled.
+        fn fields<'a>(rest: &'a str, s: &str) -> std::result::Result<Vec<&'a str>, String> {
+            match rest {
+                "" => Ok(vec![]),
+                r => Ok(r
+                    .strip_prefix(':')
+                    .ok_or_else(|| format!("--conv-state: expected `<arm>:...`, got {s:?}"))?
+                    .split(':')
+                    .collect()),
+            }
+        }
+
+        if let Some(rest) = s.strip_prefix("rotating") {
+            let parts = fields(rest, s)?;
+            let k = match parts.as_slice() {
+                [] => 0,
+                [k] => num(k, "K")?,
+                // No `slack` field: the rotating window never slides, so slack
+                // has no meaning here and accepting it silently would let a
+                // caller believe they had configured something.
+                _ => {
+                    return Err(format!(
+                        "--conv-state: `rotating` takes at most `:<K>` (it has no slack \
+                         -- the window rotates in place), got {s:?}"
+                    ))
+                }
+            };
+            return Ok(ConvState::RotatingRing { k });
+        }
+
+        let Some(rest) = s.strip_prefix("ring") else {
+            return Err(format!(
+                "--conv-state must be `shuffle`, `ring`, `ring:<K>`, \
+                 `ring:<K>:<slack>`, `rotating` or `rotating:<K>`, got {s:?}"
+            ));
+        };
+        let parts = fields(rest, s)?;
+        let (k, slack) = match parts.as_slice() {
+            [] => (0, DEFAULT_RING_SLACK),
+            [k] => (num(k, "K")?, DEFAULT_RING_SLACK),
+            [k, slack] => (num(k, "K")?, num(slack, "slack")?),
+            _ => return Err(format!("--conv-state: too many fields in {s:?}")),
+        };
+        if slack == 0 {
+            // A zero-slack window cannot advance, so it would compact on every
+            // token -- strictly worse than the shuffle it replaces. `rotating`
+            // is the arm for "no slack at all", and it is spelled separately.
+            return Err("--conv-state: slack must be >= 1".to_string());
+        }
+        Ok(ConvState::SlidingRing { k, slack })
     }
 }
 
@@ -197,6 +370,8 @@ pub struct Config {
     pub attn_impl: AttnImpl,
     /// Defaults to `Cat`, for the same reason `attn_impl` defaults to `Generic`.
     pub kv_append: KvAppend,
+    /// Defaults to `Shuffle`, so every existing caller keeps §6.1's path.
+    pub conv_state: ConvState,
 }
 
 impl Config {
@@ -296,6 +471,27 @@ pub struct Cache {
     kv_append: KvAppend,
     // Conv state cache for convolution layers
     conv_states: Vec<Option<Tensor>>,
+    /// The ring's rotating write index, in slots.
+    ///
+    /// **Deliberately here and not in a params struct** (`DESIGN.md` §10.2c,
+    /// §10.5, §11.3): it is per-sequence *conv state*, so it migrates and evicts
+    /// with the sequence exactly as the bytes do, and putting it in a struct
+    /// named for KV is the conflation §10.1 renames the abstraction to avoid.
+    ///
+    /// One index for all 22 conv layers rather than one each: every layer is
+    /// written exactly once per token, so their phases are equal at every point
+    /// a layer reads them. Per-layer indices would be 22 copies of one number.
+    conv_phase: usize,
+    /// Set by `Model::forward` when the write slot has run out of slack, so the
+    /// conv layers compact their window before writing this token.
+    ///
+    /// **The decision lives in exactly one place on purpose.** An earlier draft
+    /// had `Model::forward` wrap the index *and* the layers test `phase >=
+    /// width` — two owners of one decision, which is a shape that cannot be
+    /// right: the wrap made the layers' test unreachable, so the compaction
+    /// never ran and the window silently read stale slots from the 17th token
+    /// on. Caught by the bitwise parity test, which is what it is for.
+    conv_compact: bool,
     cos: Tensor,
     sin: Tensor,
     device: Device,
@@ -395,6 +591,8 @@ impl Cache {
                 .collect(),
             kv_append: config.kv_append,
             conv_states: vec![None; num_layers],
+            conv_phase: 0,
+            conv_compact: false,
             device: device.clone(),
             cos,
             sin,
@@ -426,6 +624,8 @@ impl Cache {
             v.reset();
         });
         self.conv_states.iter_mut().for_each(|v| *v = None);
+        self.conv_phase = 0;
+        self.conv_compact = false;
     }
 }
 
@@ -703,6 +903,10 @@ struct ShortConv {
     conv_weight: Tensor,
     l_cache: usize,
     hidden_size: usize,
+    /// One weight permutation per rotation phase, built at load time for
+    /// `ConvState::RotatingRing` and `None` otherwise. See `ShortConv::new`.
+    rotating_weights: Option<Vec<Tensor>>,
+    conv_state: ConvState,
     span: tracing::Span,
 }
 
@@ -718,12 +922,61 @@ impl ShortConv {
         // Conv weight shape: (hidden_size, 1, l_cache) or (hidden_size, l_cache)
         let conv_weight = vb.get((hidden_size, 1, l_cache), "conv.weight")?;
 
+        // The rotating arm's per-phase weights, precomputed at load time.
+        //
+        // **This is what makes the rotating form compute the right convolution
+        // rather than a different one.** A rotating buffer's slot `s` holds the
+        // token of age `(s + width - phase - 1) mod width`, so multiplying slot
+        // `s` by weight `s` -- which is what a naive rotation does -- pairs each
+        // tap with the wrong weight. Measured, that is an **O(1)** error (~1e7
+        // ulp), not a rounding: it is a different operator, and it agrees with
+        // the shuffle only on the one phase in `width` where the rotation is the
+        // identity.
+        //
+        // Permuting the weights by phase restores the pairing exactly, and the
+        // residual against the shuffle is then bounded by **1 ulp** and flat in
+        // run length -- a reduction-order difference and nothing more
+        // (`DESIGN.md` §10.2g). The weight is a `[hidden, l_cache]` constant, so
+        // all `width` permutations are built once here and cost nothing per
+        // token; §10.2a lists this as its third fallback.
+        let rotating_weights = match cfg.conv_state {
+            ConvState::RotatingRing { .. } => {
+                let width = cfg.conv_state.width(l_cache);
+                let w = conv_weight.squeeze(1)?;
+                let mut per_phase = Vec::with_capacity(width);
+                for phase in 0..width {
+                    // Slot `s` must meet the weight of the token it holds. Ages
+                    // run 0 = oldest .. l_cache-1 = newest, and the newest sits
+                    // at `phase`, so slot `s` holds age `s + width - phase - 1`
+                    // (mod width) -- taken over the live window only.
+                    let mut cols = Vec::with_capacity(width);
+                    for s in 0..width {
+                        let age = (s + width - phase - 1) % width;
+                        // Slots outside the live window hold history (K > 0),
+                        // which nothing reads yet; give them a zero column so a
+                        // future reader cannot silently pick up a live weight.
+                        let col = if age < l_cache {
+                            w.narrow(1, age, 1)?
+                        } else {
+                            Tensor::zeros((hidden_size, 1), w.dtype(), w.device())?
+                        };
+                        cols.push(col);
+                    }
+                    per_phase.push(Tensor::cat(&cols, 1)?.contiguous()?);
+                }
+                Some(per_phase)
+            }
+            _ => None,
+        };
+
         Ok(Self {
             in_proj,
             out_proj,
             conv_weight,
+            rotating_weights,
             l_cache,
             hidden_size,
+            conv_state: cfg.conv_state,
             span: tracing::span!(tracing::Level::TRACE, "shortconv"),
         })
     }
@@ -745,32 +998,135 @@ impl ShortConv {
         let conv_weight = self.conv_weight.squeeze(1)?;
 
         let conv_out = if seq_len == 1 {
-            // Token-by-token generation: use cached state
-            let mut state = match &cache.conv_states[block_idx] {
-                Some(s) => s.clone(),
-                None => Tensor::zeros(
-                    (b_sz, self.hidden_size, self.l_cache),
-                    bx.dtype(),
-                    bx.device(),
-                )?,
-            };
+            match self.conv_state {
+                ConvState::RotatingRing { .. } => {
+                    // §10.2a as specified: the window IS the buffer, and the
+                    // write index rotates through it. No slack, so no compaction
+                    // and a constant dispatch count -- and the write lands at one
+                    // of `width` fixed offsets rather than at a sliding one.
+                    //
+                    // **The read is the whole buffer against a phase-permuted
+                    // weight**, which is what keeps it the same convolution. A
+                    // naive rotation multiplies slot `s` by weight `s` and so
+                    // pairs each tap with the wrong weight -- an O(1) error, not
+                    // a rounding. With the permutation the products are exactly
+                    // the shuffle's; only the order `sum_keepdim` accumulates
+                    // them in differs, so the output moves within 1 ulp and the
+                    // LFM2 digests move with it. That is a reduction-order
+                    // change, discharged against §2.3.5a's discriminators rather
+                    // than assumed -- `DESIGN.md` §10.2g.
+                    let width = self.conv_state.width(self.l_cache);
+                    let state = match &cache.conv_states[block_idx] {
+                        Some(s) => s.clone(),
+                        None => {
+                            Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?
+                        }
+                    };
 
-            // Shift cache and add new token
-            if self.l_cache > 1 {
-                let tail = state.narrow(2, 1, self.l_cache - 1)?;
-                state = Tensor::cat(&[tail, bx.clone()], 2)?;
-            } else {
-                state = bx.clone();
+                    // Advanced once per token by `Model::forward`, for the same
+                    // reason the sliding arm's is: 22 conv layers share one index.
+                    let phase = cache.conv_phase;
+                    state.slice_set(&bx, 2, phase)?;
+
+                    if cache.use_kv_cache {
+                        cache.conv_states[block_idx] = Some(state.clone());
+                    }
+
+                    // Built at load time, one per phase -- so the per-token cost
+                    // is an index rather than a permutation (§15.2 #10: the
+                    // answer is computed when the plan is built, not per token).
+                    let w = self
+                        .rotating_weights
+                        .as_ref()
+                        .expect("rotating weights are built whenever the arm is RotatingRing")
+                        .get(phase)
+                        .expect("phase is taken modulo width, so it indexes the table");
+                    (state * w.unsqueeze(0)?)?.sum_keepdim(2)?.contiguous()?
+                }
+                ConvState::SlidingRing { .. } => {
+                    let width = self.conv_state.width(self.l_cache);
+                    // The ring is written in place, so it must exist as storage
+                    // before the write rather than being produced by it.
+                    let mut state = match &cache.conv_states[block_idx] {
+                        Some(s) => s.clone(),
+                        None => {
+                            Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?
+                        }
+                    };
+
+                    // `conv_phase` is the write slot, advanced once per token by
+                    // `Model::forward` -- not here, because all 22 conv layers
+                    // share one index and advancing it per layer would move it 22
+                    // times per token. `conv_compact` comes from the same place,
+                    // so this layer never decides where the window sits.
+                    let phase = cache.conv_phase;
+
+                    // The window has run out of slack: slide it back to the
+                    // front. **This is the entire wrap cost** (`DESIGN.md`
+                    // §16 6a), and it is paid once every `slack` tokens rather
+                    // than on every token. The live window keeps its slot order
+                    // across the move, so the compaction is invisible to the
+                    // arithmetic.
+                    if cache.conv_compact {
+                        let live_w = self.l_cache + self.conv_state.history();
+                        let live = state.narrow(2, width - live_w, live_w)?.contiguous()?;
+                        let pad = Tensor::zeros(
+                            (b_sz, self.hidden_size, width - live_w),
+                            bx.dtype(),
+                            bx.device(),
+                        )?;
+                        state = Tensor::cat(&[live, pad], 2)?.contiguous()?;
+                    }
+
+                    // The whole point: one in-place write at the sliding slot.
+                    // `slice_set` is a single `copy2d` into storage that already
+                    // exists, so the `narrow` and the `cat` both disappear -- 44
+                    // dispatch positions per token become 22 (§10.2b).
+                    state.slice_set(&bx, 2, phase)?;
+
+                    if cache.use_kv_cache {
+                        cache.conv_states[block_idx] = Some(state.clone());
+                    }
+
+                    // The live window is `l_cache` *contiguous* slots ending at
+                    // the write, in the same order the shuffle presents them --
+                    // which is what keeps the three-term sum's accumulation order
+                    // unchanged and the output bit-identical. A rotating index
+                    // would not: see `ConvState`'s note on §10.2a.
+                    let window = state.narrow(2, phase + 1 - self.l_cache, self.l_cache)?;
+                    (window * conv_weight.unsqueeze(0)?)?
+                        .sum_keepdim(2)?
+                        .contiguous()?
+                }
+                ConvState::Shuffle => {
+                    // Token-by-token generation: use cached state
+                    let mut state = match &cache.conv_states[block_idx] {
+                        Some(s) => s.clone(),
+                        None => Tensor::zeros(
+                            (b_sz, self.hidden_size, self.l_cache),
+                            bx.dtype(),
+                            bx.device(),
+                        )?,
+                    };
+
+                    // Shift cache and add new token
+                    if self.l_cache > 1 {
+                        let tail = state.narrow(2, 1, self.l_cache - 1)?;
+                        state = Tensor::cat(&[tail, bx.clone()], 2)?;
+                    } else {
+                        state = bx.clone();
+                    }
+
+                    if cache.use_kv_cache {
+                        cache.conv_states[block_idx] = Some(state.clone());
+                    }
+
+                    // Apply convolution as element-wise multiply and sum
+                    (state * conv_weight.unsqueeze(0)?)?
+                        .sum_keepdim(2)?
+                        .contiguous()?
+                }
             }
-
-            if cache.use_kv_cache {
-                cache.conv_states[block_idx] = Some(state.clone());
-            }
-
-            // Apply convolution as element-wise multiply and sum
-            (state * conv_weight.unsqueeze(0)?)?
-                .sum_keepdim(2)?
-                .contiguous()?
         } else {
             // Prefill: use Conv1d
             let conv = Conv1d::new(
@@ -799,7 +1155,22 @@ impl ShortConv {
                     )?;
                     cache_src = Tensor::cat(&[zeros, cache_src], 2)?;
                 }
-                cache.conv_states[block_idx] = Some(cache_src);
+                // Under the ring the buffer is `l_cache + K + slack` wide and
+                // decode writes into it in place -- so prefill must hand over
+                // storage of the *full* width, with the live window at the front
+                // (write slot `live_w - 1`, which is what `Model::forward` seeds)
+                // and everything after it zeroed. Prefill is off the per-token
+                // path, so this `cat` is paid once per prompt, not once per token.
+                let width = self.conv_state.width(self.l_cache);
+                if width > self.l_cache {
+                    let zeros = Tensor::zeros(
+                        (b_sz, self.hidden_size, width - self.l_cache),
+                        cache_src.dtype(),
+                        cache_src.device(),
+                    )?;
+                    cache_src = Tensor::cat(&[cache_src, zeros], 2)?;
+                }
+                cache.conv_states[block_idx] = Some(cache_src.contiguous()?);
             }
 
             out
@@ -890,6 +1261,8 @@ pub struct Model {
     embedding_norm: RmsNorm,
     lm_head: Linear,
     dtype: DType,
+    conv_state: ConvState,
+    l_cache: usize,
 }
 
 impl Model {
@@ -921,6 +1294,8 @@ impl Model {
             embedding_norm,
             lm_head,
             dtype: vb.dtype(),
+            conv_state: cfg.conv_state,
+            l_cache: cfg.conv_l_cache,
         })
     }
 
@@ -931,6 +1306,58 @@ impl Model {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
+
+        // The ring's write slot, advanced once per forward pass and read by all
+        // 22 conv layers (`DESIGN.md` §10.2c -- it is conv state, so it lives in
+        // `Cache` beside the bytes it indexes rather than in a params struct).
+        //
+        // Prefill writes the state directly rather than through the ring, and
+        // leaves the newest token in the last live slot -- which is slot
+        // `l_cache + K - 1`. Decode advances from there. Advancing *before* the
+        // layers run rather than after is what makes the first decode token
+        // after a prefill land past the newest token instead of overwriting it.
+        //
+        // **One owner for the wrap decision.** This computes both the slot and
+        // whether the layers must compact to reach it; the layers only obey. An
+        // earlier draft split it -- this wrapped the index while the layers
+        // tested `phase >= width` -- and the wrap made the layers' test
+        // unreachable, so the compaction never ran.
+        if let ConvState::RotatingRing { .. } = self.conv_state {
+            // The rotating arm never compacts -- that is the whole difference.
+            // The index wraps modulo the buffer width, which is what makes the
+            // dispatch count constant and the write offsets a fixed finite set.
+            let width = self.conv_state.width(self.l_cache);
+            cache.conv_compact = false;
+            cache.conv_phase = if seq_len == 1 {
+                (cache.conv_phase + 1) % width
+            } else {
+                // Prefill lays the live window down at slots `0..l_cache`, so
+                // the newest token is at `l_cache - 1` -- the same seeding the
+                // sliding arm uses, and for the same reason.
+                self.l_cache - 1
+            };
+        } else if let ConvState::SlidingRing { .. } = self.conv_state {
+            let width = self.conv_state.width(self.l_cache);
+            let live_w = self.l_cache + self.conv_state.history();
+            if seq_len == 1 {
+                let next = cache.conv_phase + 1;
+                cache.conv_compact = next >= width;
+                // After a compaction the live window sits at the front, so the
+                // next write lands immediately after it.
+                cache.conv_phase = if cache.conv_compact { live_w } else { next };
+            } else {
+                // Seeded, not advanced: prefill's own write defines the slot.
+                //
+                // Prefill lays the live window down at slots `0..l_cache` and
+                // zeroes the rest, so the newest token is at `l_cache - 1` --
+                // **not** `live_w - 1`. The two coincide at `K = 0` and diverge
+                // for any `K > 0`, so spelling it `l_cache` is what keeps the
+                // history slots from being read as live.
+                cache.conv_compact = false;
+                cache.conv_phase = self.l_cache - 1;
+            }
+        }
+
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (block_idx, layer) in self.layers.iter().enumerate() {

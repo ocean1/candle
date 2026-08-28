@@ -47,7 +47,7 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{Cache, Config, LayerType, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{Cache, Config, ConvState, LayerType, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -105,6 +105,8 @@ struct Axes {
     attn: String,
     /// The KV-append arm, echoed for the run line (issue #142).
     kv_append: String,
+    /// The conv-state arm (#141), echoed for the run line.
+    conv_state: ConvState,
 }
 
 impl Axes {
@@ -175,6 +177,7 @@ impl Axes {
             gpu_offsets,
             attn: args.attn.clone(),
             kv_append: args.kv_append.clone(),
+            conv_state: ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?,
         })
     }
 
@@ -186,7 +189,7 @@ impl Axes {
         // line states every axis §7.1 has.
         format!(
             "ParamStyle=Split ArenaLayout={} ArenaOffsets={} HazardKey={} AttnImpl={} \
-             KvAppend={} ScratchSizing=none",
+             KvAppend={} ConvState={} ScratchSizing=none",
             if self.arena {
                 #[cfg(feature = "metal")]
                 {
@@ -213,6 +216,13 @@ impl Axes {
                 "InPlace"
             } else {
                 "Cat"
+            },
+            match self.conv_state {
+                ConvState::Shuffle => "Shuffle".to_string(),
+                ConvState::SlidingRing { k, slack } => {
+                    format!("SlidingRing(k={k},slack={slack})")
+                }
+                ConvState::RotatingRing { k } => format!("RotatingRing(k={k})"),
             },
         )
     }
@@ -333,6 +343,12 @@ struct Args {
     /// `in-place` (pre-allocated, written at a moving offset -- issue #142).
     #[arg(long, default_value = "cat")]
     kv_append: String,
+
+    /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
+    /// the default), `ring[:K[:slack]]` (the sliding window, §10.2e) or
+    /// `rotating[:K]` (§10.2a's rotating index, §10.2g).
+    #[arg(long, default_value = "shuffle")]
+    conv_state: String,
 
     /// Decode steps recorded before the arena is installed.
     ///
@@ -536,6 +552,7 @@ fn main() -> Result<()> {
 
     // `AttnImpl` is a construction-tier axis on the config (§7.1, #97), so it
     // is selected before the model is built and both arms stay compiled.
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     config.attn_impl = match args.attn.as_str() {
         "generic" => candle_transformers::models::lfm2::AttnImpl::Generic,
         "sdpa" => candle_transformers::models::lfm2::AttnImpl::Sdpa,
