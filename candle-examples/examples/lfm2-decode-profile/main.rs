@@ -292,6 +292,15 @@ struct Args {
     #[arg(long)]
     per_token: bool,
 
+    /// Split the readback into its GPU-work and host-stall halves (issue #172).
+    ///
+    /// Inserts a `device.synchronize()` between the argmax dispatch and the
+    /// 4-byte `to_scalar` readback so the two can be attributed separately.
+    /// This CHANGES what `sample / token` measures -- with it on, that figure is
+    /// not the shipped path's -- so it is a diagnostic arm, not a default.
+    #[arg(long)]
+    sample_split: bool,
+
     /// Label printed with the result, to tag a run inside a batch.
     #[arg(long, default_value = "")]
     label: String,
@@ -656,6 +665,20 @@ fn main() -> Result<()> {
 
     // Per token: (wall seconds, gpu busy seconds, dispatches).
     let mut steps: Vec<(f64, f64, u64)> = Vec::with_capacity(args.n);
+    // Per token: (sample seconds, eos-test seconds).
+    //
+    // Issue #172. The `wall` window below opens AFTER `sample()` and the EOS
+    // test, so §11.2's 1.151 ms non-GPU figure -- wall minus GPU busy -- cannot
+    // contain either of them. They are timed into their own bucket here so the
+    // share can be attributed rather than inferred.
+    //
+    // A timer pair rather than a counter: §6.4a prices `Instant::now()` at
+    // 43 ns, which is negligible against a readback that blocks on
+    // `flush_and_wait_current()`, and it is the same instrument the wall window
+    // already uses -- so the two are commensurable by construction.
+    let mut sample_steps: Vec<(f64, f64)> = Vec::with_capacity(args.n);
+    // Per token under `--sample-split`: (argmax-and-sync seconds, readback seconds).
+    let mut split_steps: Vec<(f64, f64)> = Vec::with_capacity(args.n);
     let mut tokens: Vec<u32> = Vec::with_capacity(args.n);
     let mut hit_eos = false;
     let mut last_token_kernels: Vec<(String, u64)> = Vec::new();
@@ -666,8 +689,35 @@ fn main() -> Result<()> {
         _ => None,
     };
     while tokens.len() < args.n {
-        let next = logits_processor.sample(&logits).context("sampling")?;
-        if eos_ids.contains(&next) {
+        // `--sample-split` decomposes the readback into the part that is GPU
+        // work and the part that is a host stall, which is what decides whether
+        // moving argmax to the device could remove it (issue #172).
+        //
+        // The forward pass has already been synchronized by the previous
+        // iteration, so `argmax` here enqueues ONE dispatch over 128000 f32 and
+        // `to_scalar` then blits 4 bytes back and blocks on
+        // `flush_and_wait_current()`. Synchronizing between them attributes the
+        // two separately. It is off by default because the extra
+        // synchronization changes what is being timed -- with it on, the
+        // `sample / token` figure is no longer the shipped path's.
+        let sample_start = std::time::Instant::now();
+        let next = if args.sample_split {
+            let idx = logits.argmax(candle::D::Minus1).context("argmax")?;
+            device.synchronize()?;
+            let argmax_s = sample_start.elapsed().as_secs_f64();
+            let read_start = std::time::Instant::now();
+            let tok = idx.to_scalar::<u32>().context("argmax readback")?;
+            split_steps.push((argmax_s, read_start.elapsed().as_secs_f64()));
+            tok
+        } else {
+            logits_processor.sample(&logits).context("sampling")?
+        };
+        let sample_s = sample_start.elapsed().as_secs_f64();
+        let eos_start = std::time::Instant::now();
+        let is_eos = eos_ids.contains(&next);
+        let eos_s = eos_start.elapsed().as_secs_f64();
+        sample_steps.push((sample_s, eos_s));
+        if is_eos {
             // The point is a steady-state decode measurement, so generation
             // continues past the model's natural stopping point. Recorded
             // because past EOS the text degenerates, and a reader should know
@@ -839,6 +889,37 @@ fn main() -> Result<()> {
     let wall_med = walls[walls.len() / 2];
     let wall_max = walls[walls.len() - 1];
 
+    // Issue #172: the readback-and-sample bucket, over the same steady-state
+    // window as `wall` so the two are comparable.
+    //
+    // Note the off-by-one that is deliberate rather than a bug: iteration `i`
+    // samples token `i` from the logits produced by iteration `i-1`, so
+    // `sample_steps[i]` is the readback belonging to the forward pass timed as
+    // `steps[i-1]`. Applying the same `warmup` cut to both keeps equal counts
+    // and drops the same cold region; it does not pair them index-for-index,
+    // and nothing below pairs them.
+    let sample_steady = &sample_steps[warmup..];
+    let n_sample = sample_steady.len() as f64;
+    let sample_mean: f64 = sample_steady.iter().map(|s| s.0).sum::<f64>() / n_sample;
+    let eos_mean: f64 = sample_steady.iter().map(|s| s.1).sum::<f64>() / n_sample;
+    let sample_sd = (sample_steady
+        .iter()
+        .map(|s| (s.0 - sample_mean).powi(2))
+        .sum::<f64>()
+        / n_sample)
+        .sqrt();
+    // Median as well as mean: a readback that blocks on GPU completion is
+    // heavy-tailed by construction, and a mean alone would hide that (§3.2a #3
+    // -- distribution shape matters more than centre).
+    let mut samples: Vec<f64> = sample_steady.iter().map(|s| s.0).collect();
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let sample_min = samples[0];
+    let sample_med = samples[samples.len() / 2];
+    let sample_max = samples[samples.len() - 1];
+    let mut eoss: Vec<f64> = sample_steady.iter().map(|s| s.1).collect();
+    eoss.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let eos_med = eoss[eoss.len() / 2];
+
     // Dispatch counts must be identical token to token if the sequence is
     // stable; report the range so a reader can see whether it was.
     let disp_min = steady.iter().map(|s| s.2).min().unwrap_or(0);
@@ -939,6 +1020,64 @@ fn main() -> Result<()> {
             );
         }
         println!();
+    }
+
+    // Issue #172: the readback-and-sample attribution.
+    //
+    // Printed unconditionally rather than under `profiling`, because it needs
+    // no profile counters -- it is two wall clocks -- and because the whole
+    // point is that this cost is OUTSIDE the window the `non-gpu` line above
+    // reports. A reader who takes `non-gpu` as "everything that is not the GPU"
+    // is reading the figure §11.2 records, and this block is what says
+    // otherwise.
+    println!("=== readback and sample (issue #172) ===");
+    println!(
+        "sample / token        {:.4} ms  (sd {:.4}, min {:.4}, med {:.4}, max {:.4})",
+        sample_mean * 1e3,
+        sample_sd * 1e3,
+        sample_min * 1e3,
+        sample_med * 1e3,
+        sample_max * 1e3
+    );
+    println!(
+        "eos test / token      {:.4} ms  (med {:.4})",
+        eos_mean * 1e3,
+        eos_med * 1e3
+    );
+    println!(
+        "sample+eos            {:.4} ms  = {:.2}% of (wall + sample + eos)",
+        (sample_mean + eos_mean) * 1e3,
+        100.0 * (sample_mean + eos_mean) / (wall_mean + sample_mean + eos_mean)
+    );
+    if args.sample_split && split_steps.len() > warmup {
+        let sp = &split_steps[warmup..];
+        let n_sp = sp.len() as f64;
+        let argmax_mean: f64 = sp.iter().map(|s| s.0).sum::<f64>() / n_sp;
+        let read_mean: f64 = sp.iter().map(|s| s.1).sum::<f64>() / n_sp;
+        let mut a: Vec<f64> = sp.iter().map(|s| s.0).collect();
+        a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let mut r: Vec<f64> = sp.iter().map(|s| s.1).collect();
+        r.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        println!(
+            "  argmax + sync       {:.4} ms  (med {:.4})  <- one dispatch over {} f32",
+            argmax_mean * 1e3,
+            a[a.len() / 2] * 1e3,
+            config.vocab_size
+        );
+        println!(
+            "  4-byte readback     {:.4} ms  (med {:.4})  <- blit + flush_and_wait_current",
+            read_mean * 1e3,
+            r[r.len() / 2] * 1e3
+        );
+    }
+    if profiling {
+        println!(
+            "vs non-gpu            {:.4} ms sample+eos against {:.4} ms non-gpu \
+             -- DISJOINT, not a share",
+            (sample_mean + eos_mean) * 1e3,
+            (wall_mean - gpu_mean) * 1e3
+        );
+        println!();
         println!("=== roofline ===");
         println!("weights per token     {:.3} GB", weight_bytes as f64 / 1e9);
         if gpu_mean > 0.0 {
@@ -984,7 +1123,8 @@ fn main() -> Result<()> {
     // all-defaults by whoever finds it later.
     println!(
         "RESULT label={} n={} warmup={} wall_ms_per_token={:.4} gpu_ms_per_token={:.4} \
-         nongpu_ms_per_token={:.4} dispatches_per_token={:.1} prefill_ms={:.2} \
+         nongpu_ms_per_token={:.4} sample_ms_per_token={:.4} sample_med_ms_per_token={:.4} \
+         eos_ms_per_token={:.4} dispatches_per_token={:.1} prefill_ms={:.2} \
          prompt_tokens={} weight_bytes={} dtype={:?} hit_eos={} profiling={} \
          config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
@@ -993,6 +1133,9 @@ fn main() -> Result<()> {
         wall_mean * 1e3,
         gpu_mean * 1e3,
         (wall_mean - gpu_mean) * 1e3,
+        sample_mean * 1e3,
+        sample_med * 1e3,
+        eos_mean * 1e3,
         disp_mean,
         prefill_wall.as_secs_f64() * 1e3,
         prompt_ids.len(),
