@@ -41,6 +41,10 @@ fn tiny_config(conv_state: ConvState) -> Config {
         eos_token_id: None,
         use_flash_attn: false,
         attn_impl: Default::default(),
+        // §10.4's defaults, matching `into_config`. Added by #116 after this
+        // file was written, which is why it stopped compiling.
+        flash_page_size: 256,
+        flash_pages_per_chunk: 1,
         kv_append: KvAppend::InPlace,
         conv_state,
         memory_budget: None,

@@ -50,6 +50,18 @@ fn default_fraction_matches_admissions() {
     );
 }
 
+/// `MemoryBudget::DEFAULT_WEIGHT_TOLERANCE` is a copy of `admission`'s for the
+/// same reason, and is checked for the same reason (§9.5m, #244).
+#[cfg(feature = "metal")]
+#[test]
+fn default_weight_tolerance_matches_admissions() {
+    assert_eq!(
+        MemoryBudget::DEFAULT_WEIGHT_TOLERANCE,
+        candle::metal_backend::admission::WEIGHT_RECONCILE_TOLERANCE,
+        "the two spellings of §9.5m's tolerance have drifted"
+    );
+}
+
 /// **Both bounds** — a configuration inside the budget is admitted and one
 /// outside it is refused (§8.1g, #184).
 #[cfg(feature = "metal")]
@@ -187,6 +199,11 @@ fn admission_is_off_by_default() {
         eos_token_id: None,
         use_flash_attn: false,
         attn_impl: Default::default(),
+        // §10.4's defaults, matching `into_config`. Added by #116 after this
+        // file was written, which is why it stopped compiling -- see the
+        // module doc.
+        flash_page_size: 256,
+        flash_pages_per_chunk: 1,
         kv_append: Default::default(),
         conv_state: Default::default(),
         memory_budget: None,

@@ -45,6 +45,11 @@ fn config(max_position_embeddings: usize) -> Config {
         eos_token_id: None,
         use_flash_attn: false,
         attn_impl: Default::default(),
+        // §10.4's defaults, matching `into_config`. Added by #116 after this
+        // file was written, which is why it stopped compiling -- see the
+        // module doc.
+        flash_page_size: 256,
+        flash_pages_per_chunk: 1,
         kv_append: Default::default(),
         conv_state: Default::default(),
         memory_budget: None,
@@ -106,4 +111,144 @@ fn no_budget_means_no_refusal_on_the_device() {
     assert!(cfg.memory_budget.is_none());
     Cache::new_with(true, DType::F16, &cfg, &device, 131_072)
         .expect("with no budget set, nothing is refused however large");
+}
+
+// ---- #244: the weight term is caller-supplied, and nothing checked it ----
+
+/// **A caller passing the WRONG weight constant is detected on the device**
+/// (§9.5m, #244) — and this is the test the issue says is the whole point.
+///
+/// # Why this could not be an arithmetic test
+///
+/// `lfm2_admission_tests.rs` and this file's existing cases **both pass
+/// `WEIGHTS` / `WEIGHTS_FULL` as constants**, so no test exercised a caller
+/// getting it wrong, and the arithmetic is correct for whatever it is handed.
+/// That is #240's shape one level up: the *arithmetic* was tested and the
+/// *contract* was not.
+///
+/// So this test does not check arithmetic. It **allocates real bytes on the
+/// device**, then tells admission a figure that does not match them, and checks
+/// that the divergence is seen. `reconcile_weights` reads the pool's own
+/// counters — from outside the model's arithmetic, per #162 — which is why an
+/// allocation has to actually happen for this to mean anything.
+#[test]
+fn a_caller_passing_the_wrong_weight_constant_is_detected_on_the_device() {
+    use candle::metal_backend::admission::{reconcile_weights, WEIGHT_RECONCILE_TOLERANCE};
+    use candle::Tensor;
+
+    let Ok(device) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+    let Ok(metal) = device.as_metal_device() else {
+        eprintln!("not a Metal device; skipping");
+        return;
+    };
+
+    // Allocate a known quantity into the pool the WEIGHTS are served from,
+    // standing in for a weight load. 512 MB is above the 256 MB tolerance, so a
+    // caller that claims zero is wrong by more than the slack -- which is the
+    // discrimination under test rather than a magnitude that happens to be
+    // large.
+    //
+    // **`to_dtype`, not `Tensor::zeros`, and the distinction is §9.5k's.**
+    // `Tensor::zeros` goes `allocate_buffer` -> `self.buffers`, the SHARED pool
+    // that serves the KV reserve. Weights go `to_dtype` -> `new_buffer_builder`
+    // -> `private_buffers`. Writing this test the obvious way allocated into one
+    // pool and read the other, and it read 0 bytes -- which is the same
+    // conflation §9.5k had to read the allocation paths to get right, met from
+    // the test side.
+    const ALLOCATED: usize = 512 * 1_000_000;
+    let elems = ALLOCATED / 2; // f16
+    let held = Tensor::zeros(elems, DType::F32, &device)
+        .expect("allocate")
+        .to_dtype(DType::F16)
+        .expect("into private_buffers");
+    let (_, private) = metal.pool_occupancy();
+    assert!(
+        private.live_bytes >= ALLOCATED,
+        "the private pool must actually hold the bytes this test reasons about, \
+         got {} MB -- if this fails the allocation path has moved (§9.5k)",
+        private.live_bytes / 1_000_000
+    );
+
+    // A caller that UNDER-predicts: it told admission there were no weights
+    // while the process allocated 512 MB. This is the silent direction -- §3.5
+    // reports no overrun, so without this check nothing anywhere says so.
+    let under = reconcile_weights(0, &private, 0, WEIGHT_RECONCILE_TOLERANCE);
+    assert!(
+        under.under_predicted(),
+        "a caller that under-predicts by 512 MB on a real device must be \
+         detected -- this is the direction that fails silently:\n{}",
+        under.describe()
+    );
+    assert!(
+        under.describe().contains("UNDER-PREDICTED"),
+        "{}",
+        under.describe()
+    );
+
+    // **The other bound, without which the above is worthless** (§8.1g): a
+    // caller that tells the truth about the same pool must be quiet.
+    let honest = reconcile_weights(private.live_bytes, &private, 0, WEIGHT_RECONCILE_TOLERANCE);
+    assert!(
+        honest.agrees(),
+        "a caller that got it right must not be reported wrong:\n{}",
+        honest.describe()
+    );
+
+    // And over-prediction reads as over-prediction, not as the silent
+    // direction: #162's own case, the full checkpoint passed for a text-only
+    // load, is a real error and a LOUD one.
+    let over = reconcile_weights(
+        private.live_bytes + 825_299_424,
+        &private,
+        0,
+        WEIGHT_RECONCILE_TOLERANCE,
+    );
+    assert!(over.over_predicted(), "{}", over.describe());
+    assert!(
+        !over.under_predicted(),
+        "the two directions must not be conflated:\n{}",
+        over.describe()
+    );
+
+    drop(held);
+}
+
+/// **The reconciliation is REACHED from `Cache::new_with`**, not merely
+/// present — §9.5l finding 5's lesson, which is this file's whole reason to
+/// exist (§9.5m, #244).
+///
+/// The unit tests were green while admission compiled to its non-Metal stub in
+/// every harness. Nothing that tests arithmetic could have seen that; only
+/// building a `Cache` on a device can. This builds one with a budget whose
+/// weight figure is deliberately wrong and asserts the path runs to completion
+/// — the check reports rather than refuses (see `report_weight_divergence` for
+/// why), so what is asserted here is that a wrong figure does not break the
+/// build, and the detection itself is asserted in the test above.
+#[test]
+fn a_wrong_weight_figure_reports_without_refusing_a_model_that_fits() {
+    let Ok(device) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+
+    // A budget claiming the full VL checkpoint for what is a text-only load.
+    // #162's case: over-predicted by 0.825 GB, and it still fits, so the Cache
+    // must still build -- refusing here would turn a bookkeeping error into a
+    // refusal to run a model that has room.
+    let mut cfg = config(4096);
+    cfg.memory_budget = Some(MemoryBudget::new(WEIGHTS + 825_299_424));
+    Cache::new_with(true, DType::F16, &cfg, &device, 4096)
+        .expect("an over-predicted weight figure that still fits must not refuse");
+
+    // And the under-predicting direction likewise builds: the bytes are already
+    // spent by the time this runs, so the report is the deliverable.
+    let mut under = config(4096);
+    let mut budget = MemoryBudget::new(0);
+    budget.weight_tolerance = MemoryBudget::DEFAULT_WEIGHT_TOLERANCE;
+    under.memory_budget = Some(budget);
+    Cache::new_with(true, DType::F16, &under, &device, 4096)
+        .expect("an under-predicted weight figure reports; it does not refuse");
 }
