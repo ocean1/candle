@@ -130,6 +130,40 @@ struct Args {
     #[arg(long)]
     dump_logits: Option<String>,
 
+    /// Decode this fixed token sequence instead of the sampled one, so two arms
+    /// walk identical positions and their `--dump-logits` output can be
+    /// subtracted (issue #170).
+    ///
+    /// **`--dump-logits` is half an instrument on its own, and this is the other
+    /// half.** §2.3.5a's second discriminator — *is the error ulp-scale, and
+    /// does it grow?* — is a comparison of two logit vectors **at the same
+    /// position**. But a determinism A/B's arms generate different tokens by
+    /// construction: when the digests diverge the arms take different paths and
+    /// stop at different points (§2.4, and #97's 267 against 401). From the
+    /// first divergent step onward the two dumps describe different
+    /// conversations, so subtracting them measures the prompts drifting apart
+    /// rather than the arithmetic differing. §10.2g could subtract its dumps
+    /// *only* because that axis happened not to diverge in tokens — the generic
+    /// arm's stream was byte-identical while the logits digest moved — and an
+    /// axis whose arms diverge is exactly the case worth investigating.
+    ///
+    /// Forcing pins the sequence: every arm is driven through the same tokens,
+    /// so position `i` means the same thing in every dump and `max|Δlogit|` at
+    /// `i` is a property of the arithmetic alone.
+    ///
+    /// Format is one id per line, `#` comments and blank lines ignored; a bare
+    /// whitespace- or comma-separated list on one line also parses, so the
+    /// `TOKENS` line this harness prints can be fed back in directly.
+    ///
+    /// **What is still sampled, and why it must be.** The logits are produced,
+    /// digested and dumped exactly as they would be; the sampler still runs, and
+    /// its choice is *recorded and then discarded* in favour of the forced id.
+    /// That divergence count is the interesting output rather than a diagnostic:
+    /// it is how many positions the arm would have left the reference path at,
+    /// which is what the token digest conflates with everything downstream of it.
+    #[arg(long)]
+    force_tokens: Option<String>,
+
     /// Label printed with the result, to tag a run inside a batch.
     #[arg(long, default_value = "")]
     label: String,
@@ -392,6 +426,34 @@ fn parse_config(raw: &str) -> Result<Config> {
     Ok(config)
 }
 
+/// Parse a `--force-tokens` file into the sequence to decode.
+///
+/// Accepts one id per line and a whitespace- or comma-separated list on one
+/// line, so this harness's own `TOKENS` output round-trips without editing.
+/// `#` starts a comment.
+///
+/// Parse errors are refused rather than skipped: a file with one unparseable
+/// entry silently dropped would force a *different, shorter* sequence than the
+/// one on disk, and both arms would agree on it — a comparison that is
+/// internally consistent and not the one that was asked for (§2.4).
+fn parse_forced_tokens(raw: &str) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for (lineno, line) in raw.lines().enumerate() {
+        let line = match line.split_once('#') {
+            Some((before, _)) => before,
+            None => line,
+        };
+        for field in line.split([',', ' ', '\t']).filter(|f| !f.is_empty()) {
+            let id: u32 = field
+                .parse()
+                .with_context(|| format!("line {}: {field:?} is not a token id", lineno + 1))?;
+            out.push(id);
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "the token file parsed to no tokens");
+    Ok(out)
+}
+
 /// Tensor names, read from the safetensors header without mapping the weights.
 fn tensor_names(path: &Path) -> Result<Vec<String>> {
     use std::io::Read;
@@ -631,6 +693,31 @@ fn main() -> Result<()> {
         .to_vec();
     anyhow::ensure!(!prompt_ids.is_empty(), "prompt tokenized to nothing");
 
+    // Issue #170. Loaded before the loop so a missing or malformed file fails
+    // before a forward pass rather than after one.
+    let forced: Option<Vec<u32>> = match args.force_tokens.as_deref() {
+        Some(p) => {
+            let raw = std::fs::read_to_string(p)
+                .with_context(|| format!("reading --force-tokens {p}"))?;
+            let ids = parse_forced_tokens(&raw).with_context(|| format!("parsing {p}"))?;
+            println!("force tokens: {} ids from {p}", ids.len());
+            Some(ids)
+        }
+        None => None,
+    };
+    // How many steps took the forced id, and at how many of those the sampler
+    // would have chosen something else.
+    //
+    // The first is engagement proof and the second is the measurement. §2.4
+    // requires an instrument be shown to have engaged from a quantity it should
+    // have moved — #69's vacuous determinism run consumed the `OnceLock`
+    // guarding its env switch, so both arms ran the default and the "changed"
+    // arm reported a passing digest for the unchanged path. A `forced=0` run
+    // that printed a digest would be that failure exactly: the sampled path's
+    // result wearing the forced arm's name.
+    let mut forced_steps = 0usize;
+    let mut forced_overrides = 0usize;
+
     let mut token_hasher = sha256::Sha256::new();
     let mut logits_hasher = sha256::Sha256::new();
     let mut tokens: Vec<u32> = Vec::with_capacity(args.n);
@@ -748,6 +835,15 @@ fn main() -> Result<()> {
             if tokens.len() >= args.n {
                 break 'turns;
             }
+            // Stop where the forced sequence stops, checked before the pass
+            // rather than after it. Continuing on the sampled token past the end
+            // would leave one dump whose head is comparable and whose tail is
+            // not, with nothing in the file marking where that changed.
+            if let Some(ids) = forced.as_ref() {
+                if per_step.len() >= ids.len() {
+                    break 'turns;
+                }
+            }
 
             // Digest the logits before sampling: this is the quantity the
             // hardware actually produced, whereas the token is that quantity
@@ -775,9 +871,35 @@ fn main() -> Result<()> {
                     .context("writing --dump-logits")?;
             }
 
-            let next = logits_processor.sample(&logits).context("sampling")?;
+            // The sampler runs either way. Under `--force-tokens` its choice is
+            // recorded and then discarded, which is what makes `overrides` a
+            // measurement rather than a diagnostic: it counts the positions at
+            // which this arm would have left the reference path.
+            let sampled = logits_processor.sample(&logits).context("sampling")?;
 
-            if eos_ids.contains(&next) && !args.ignore_eos {
+            let next = match forced.as_ref().and_then(|ids| ids.get(per_step.len())) {
+                Some(&id) => {
+                    forced_steps += 1;
+                    if id != sampled {
+                        forced_overrides += 1;
+                    }
+                    id
+                }
+                // Not forcing. Unreachable *while* forcing: the loop head
+                // already broke out at the end of the sequence.
+                None => sampled,
+            };
+
+            // EOS and turn boundaries are suppressed under forcing, and the
+            // suppression is the point rather than a convenience.
+            //
+            // Both are decisions taken *from the sampled token*, so leaving them
+            // live would let the arms end a turn at different steps — after
+            // which position `i` no longer names the same thing in the two dumps
+            // and the comparison this flag exists to enable is invalid again,
+            // silently. Forcing means the sequence is the sequence: the run ends
+            // when the forced ids run out or `--n` is reached.
+            if forced.is_none() && eos_ids.contains(&next) && !args.ignore_eos {
                 // End of this turn. With more turns to run the conversation
                 // continues; otherwise generation is done.
                 hit_eos = true;
@@ -892,6 +1014,39 @@ fn main() -> Result<()> {
         }
     }
 
+    // Issue #170. Engagement proof for `--force-tokens`, in the shape §2.4
+    // requires: a quantity the flag should have moved, checked rather than the
+    // flag trusted. A run that forced nothing and printed a digest would be
+    // reporting the sampled path's result under the forced arm's name, which is
+    // #69's vacuous determinism run.
+    if let Some(ids) = forced.as_ref() {
+        println!(
+            "FORCED requested={} forced={} overrides={} generated={}",
+            ids.len(),
+            forced_steps,
+            forced_overrides,
+            tokens.len(),
+        );
+        anyhow::ensure!(
+            forced_steps > 0,
+            "--force-tokens was passed and no step took a forced id, so the digest below is the \
+             sampled path's wearing this arm's name"
+        );
+        // Not an error. `overrides == 0` means this arm sampled the reference
+        // sequence unaided — which is the §10.2g case, where the arms did not
+        // diverge in tokens and forcing was therefore not load-bearing. Said out
+        // loud because a reader otherwise cannot tell that case from one where
+        // forcing carried the whole comparison, and the two license different
+        // claims: the first is comparable *without* this flag and the second is
+        // comparable only *with* it.
+        if forced_overrides == 0 {
+            println!(
+                "FORCED note: this arm sampled the forced sequence unaided, so its tokens would \
+                 have matched the reference without forcing (the §10.2g case)"
+            );
+        }
+    }
+
     // What the ICB executor actually replayed.
     //
     // The digest below is only evidence about replay if replay *happened*, and a
@@ -992,10 +1147,17 @@ fn main() -> Result<()> {
     // output -- and the preceding gate reproduced the same shape, so a 2.4x swing
     // within one gate happened twice out of two
     // (`measurements/issue-102-tok-per-s-removed.md` §4.1).
+    //
+    // `forced` and `overrides` are on this line because a digest is not
+    // interpretable without them (issue #170), for the same reason §2.3.6 puts
+    // the math mode here: under forcing the token digest is a digest of the
+    // *forced* sequence, so two arms agreeing on it means only that both were
+    // driven through the same ids. `overrides` is what says whether they would
+    // have agreed on their own.
     println!(
         "RESULT label={} n={} tokens_sha256={} logits_sha256={} prompt_tokens={} generated={} \
          turns={} final_kv_len={} hit_eos={} dtype={:?} device={} seed={} temp={} top_p={} \
-         elapsed_ms={}",
+         forced={} overrides={} elapsed_ms={}",
         args.label,
         args.n,
         token_digest,
@@ -1010,6 +1172,8 @@ fn main() -> Result<()> {
         args.seed,
         args.temperature,
         args.top_p,
+        forced_steps,
+        forced_overrides,
         elapsed.as_millis(),
     );
 
@@ -1025,4 +1189,54 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_forced_tokens;
+
+    /// The `TOKENS` line this harness prints must feed straight back into
+    /// `--force-tokens`, because that round trip is how a reference sequence is
+    /// produced in practice (issue #170).
+    #[test]
+    fn the_tokens_line_round_trips_into_force_tokens() {
+        let ids = parse_forced_tokens("785,267,3728,9560\n").unwrap();
+        assert_eq!(ids, vec![785, 267, 3728, 9560]);
+    }
+
+    #[test]
+    fn one_id_per_line_with_comments_and_blanks() {
+        let ids = parse_forced_tokens("# a reference sequence\n785\n\n267  # trailing\n\t3728\n")
+            .unwrap();
+        assert_eq!(ids, vec![785, 267, 3728]);
+    }
+
+    /// A parse error is refused rather than skipped.
+    ///
+    /// Skipping would force a **different, shorter** sequence than the file
+    /// names, and both arms would agree on it — a comparison that is internally
+    /// consistent, reproducible, and not the one that was asked for. That is
+    /// §2.4's shape exactly, and the failure would be invisible in the output
+    /// because `forced` would still be nonzero.
+    #[test]
+    fn an_unparseable_entry_is_refused_not_skipped() {
+        let err = parse_forced_tokens("785\nnot-a-token\n267\n").unwrap_err();
+        assert!(
+            format!("{err}").contains("not a token id"),
+            "unexpected error: {err}"
+        );
+        // The load-bearing half: it did not quietly return [785, 267].
+        assert!(parse_forced_tokens("785\nnot-a-token\n267\n").is_err());
+    }
+
+    #[test]
+    fn an_empty_file_is_refused() {
+        assert!(parse_forced_tokens("# only a comment\n\n").is_err());
+    }
+
+    /// A negative id is a parse failure rather than a wrap to `u32::MAX`.
+    #[test]
+    fn a_negative_id_is_refused() {
+        assert!(parse_forced_tokens("785\n-1\n").is_err());
+    }
 }
