@@ -2,7 +2,54 @@ use super::{Buffer, Device};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+/// What the set has done, so the cost model can be checked rather than quoted.
+///
+/// `DESIGN.md` §6.3d prices eager unregistration at +0.062 ms/token and
+/// attributes the cost to `commit()` -- *"any eager scheme puts a `commit()` on
+/// the per-token path"*. That is a claim about a **rate**, and until these
+/// counters existed nothing measured the rate on either side of it.
+///
+/// What they make checkable is the asymmetry the claim assumes. An allocation
+/// already commits -- [`ResidencySet::insert`] is one buffer and one commit, and
+/// it is called from every pool miss -- so the question is not whether a commit
+/// reaches the per-token path but **how many more** a batched eager release
+/// adds to the ones already there. See [`Self::commits`].
+///
+/// # These count calls, not effects, and that bound is measured
+///
+/// Each field is incremented **beside** the Metal call rather than derived from
+/// it, so they say the call site ran and not that Metal acted. Mutation-tested:
+/// deleting `set.commit()` from `remove_batch` while leaving the increment
+/// **survives every test in this tree**. That is recorded rather than fixed
+/// because no cheap oracle exists -- `MTLResidencySet` exposes `allocationCount`
+/// but not a commit count, so the only instrument that can see a dropped commit
+/// is `MTLDevice.currentAllocatedSize` over a long run, which is #206's
+/// measurement and not a unit test. Treat a `commits` figure as *"the code
+/// intended this many"*.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResidencyCounters {
+    /// `MTLResidencySet::commit()` calls, from every path that makes one.
+    ///
+    /// **This is the quantity §6.3d's cost argument is about**, and the one to
+    /// compare between arms. A batched eager release adds *one* commit per
+    /// eviction round, against the one already paid per allocation.
+    pub commits: u64,
+    /// Allocations added, i.e. `addAllocation` calls actually made.
+    pub added: u64,
+    /// Allocations removed via `removeAllocation`.
+    pub removed: u64,
+    /// Membership keys forgotten **without** a Metal call -- the retention
+    /// (§6.3e). Nonzero here while `removed` stays at zero is the behaviour
+    /// that shipped, and it is what reached 48 GB at long context.
+    pub retired: u64,
+    /// Calls into `insert_batch`, whether or not anything was added.
+    pub insert_batches: u64,
+    /// Calls into `remove_batch`, whether or not anything was removed.
+    pub remove_batches: u64,
+}
 
 /// Keeps Metal buffers resident in GPU memory, removing the need for `useResource` calls.
 ///
@@ -32,12 +79,17 @@ use std::sync::Mutex;
 /// membership test would be a real regression where a per-allocation one is
 /// free.
 ///
-/// **The `HashSet` is not the cost; the Metal call is** — measured, and it is
-/// why [`Self::retire_batch`] exists. An ablation keeping the bookkeeping and
-/// skipping `removeAllocation` reads baseline non-GPU time, while unregistering
-/// evicted buffers eagerly costs **+0.062 ms/token even batched**, because
-/// `removeAllocation` is documented as marking an allocation *"to be removed on
-/// the next commit"* and decode evicts ~11.6 buffers per token (§6.3b).
+/// **The `HashSet` is not the cost; the Metal call is** -- measured (#167's
+/// ablation, §6.3d), and it is why [`Self::retire_batch`] exists at all.
+///
+/// **What that measurement did not price is the retention, and it is 48 GB**
+/// (§6.3e, #206). Retiring a key without calling `removeAllocation` leaves
+/// Metal holding the allocation until the device drops; at §6.3b's 11.6
+/// evictions per token that is harmless, and at `KvAppend=Cat`'s ~220 per token
+/// at long context it exhausts a 64 GB device. **So the eager path is what
+/// ships as of #210** -- see [`Self::remove_batch`] and
+/// `ResidencyEvictionObserver`, and [`ResidencyCounters`] for the rate that
+/// decides it.
 pub struct ResidencySet {
     raw: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
 
@@ -51,6 +103,18 @@ pub struct ResidencySet {
     /// precisely the double-unregister #165's audit found reachable in
     /// principle.
     members: Mutex<HashSet<usize>>,
+
+    /// See [`ResidencyCounters`]. Atomics rather than fields inside `members`
+    /// so a reader never contends with an allocation for the lock, and
+    /// `Relaxed` because these are diagnostics: no other state is published
+    /// through them, and the only ordering that matters -- that a commit is
+    /// counted on the path that makes it -- is program order on one thread.
+    commits: AtomicU64,
+    added: AtomicU64,
+    removed: AtomicU64,
+    retired: AtomicU64,
+    insert_batches: AtomicU64,
+    remove_batches: AtomicU64,
 }
 
 unsafe impl Send for ResidencySet {}
@@ -67,7 +131,36 @@ impl ResidencySet {
         ResidencySet {
             raw,
             members: Mutex::new(HashSet::new()),
+            commits: AtomicU64::new(0),
+            added: AtomicU64::new(0),
+            removed: AtomicU64::new(0),
+            retired: AtomicU64::new(0),
+            insert_batches: AtomicU64::new(0),
+            remove_batches: AtomicU64::new(0),
         }
+    }
+
+    /// What this set has done. See [`ResidencyCounters`].
+    pub fn counters(&self) -> ResidencyCounters {
+        ResidencyCounters {
+            commits: self.commits.load(Ordering::Relaxed),
+            added: self.added.load(Ordering::Relaxed),
+            removed: self.removed.load(Ordering::Relaxed),
+            retired: self.retired.load(Ordering::Relaxed),
+            insert_batches: self.insert_batches.load(Ordering::Relaxed),
+            remove_batches: self.remove_batches.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zeroes the counters, so a caller can measure a window rather than a
+    /// process. Used to exclude model load from a decode figure.
+    pub fn reset_counters(&self) {
+        self.commits.store(0, Ordering::Relaxed);
+        self.added.store(0, Ordering::Relaxed);
+        self.removed.store(0, Ordering::Relaxed);
+        self.retired.store(0, Ordering::Relaxed);
+        self.insert_batches.store(0, Ordering::Relaxed);
+        self.remove_batches.store(0, Ordering::Relaxed);
     }
 
     pub fn raw(&self) -> Option<&ProtocolObject<dyn MTLResidencySet>> {
@@ -98,6 +191,7 @@ impl ResidencySet {
         let Some(set) = &self.raw else {
             return 0;
         };
+        self.insert_batches.fetch_add(1, Ordering::Relaxed);
         let Ok(mut members) = self.members.lock() else {
             return 0;
         };
@@ -110,6 +204,8 @@ impl ResidencySet {
         }
         if added > 0 {
             set.commit();
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.added.fetch_add(added as u64, Ordering::Relaxed);
         }
         added
     }
@@ -129,6 +225,7 @@ impl ResidencySet {
         let Some(set) = &self.raw else {
             return 0;
         };
+        self.remove_batches.fetch_add(1, Ordering::Relaxed);
         let Ok(mut members) = self.members.lock() else {
             return 0;
         };
@@ -141,6 +238,8 @@ impl ResidencySet {
         }
         if removed > 0 {
             set.commit();
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.removed.fetch_add(removed as u64, Ordering::Relaxed);
         }
         removed
     }
@@ -154,14 +253,26 @@ impl ResidencySet {
     ///
     /// Returns how many keys were retired.
     ///
-    /// # Why forgetting is the right operation here
+    /// # This is no longer the eviction path -- kept as the measured arm
     ///
-    /// The pool destroys free buffers to stay inside its byte budget (§6.3b),
-    /// ~11.6 per decode token. `removeAllocation` is documented as marking an
-    /// allocation *"to be removed on the next commit"*, so unregistering them
-    /// eagerly puts a `commit()` on the per-token path — measured at
-    /// **+0.062 ms/token of non-GPU time even when batched**, against §11.2's
-    /// whole 6.1 % budget.
+    /// It **was** the eviction path (§6.3d, #166), on the argument that
+    /// `removeAllocation` marks an allocation *"to be removed on the next
+    /// commit"* and so puts a `commit()` on the per-token path -- priced at
+    /// **+0.062 ms/token even batched** against §11.2's whole 6.1 % budget.
+    /// That pricing is real and it was taken at §6.3b's **11.6 evictions per
+    /// token**.
+    ///
+    /// **What it did not price is what the retention weighs.** Under
+    /// `KvAppend=Cat` at long context the eviction rate is **~220 per token**
+    /// and the retention reaches **48 GB**, exhausting the device at 97 % of
+    /// `recommendedMaxWorkingSetSize` (§6.3e, #206). A retention that is safe is
+    /// not thereby bounded.
+    ///
+    /// So eviction calls [`Self::remove_batch`] as of #210, and this stays
+    /// **selectable** rather than deleted: it is the arm the +0.062 ms was
+    /// measured on, so a re-measurement has something to measure against, and
+    /// §12.3's rule -- variants coexist and are swappable -- applies to an
+    /// allocator policy as much as to a kernel.
     ///
     /// What the membership record is *for* is deciding whether a later
     /// `removeAllocation` may be issued. Retiring the key discharges that job
@@ -170,10 +281,9 @@ impl ResidencySet {
     /// cleared at teardown by [`Self::remove_all`], which uses
     /// `removeAllAllocations` and therefore names no object at all.
     ///
-    /// The cost of deferring is that Metal's set keeps the allocation resident
-    /// until the device drops. That is a **retention**, not a dangling
-    /// reference — and it is precisely why the deferral is safe rather than a
-    /// smaller version of the bug.
+    /// The residual is a **retention**, not a dangling reference -- which is why
+    /// the deferral was safe, and is exactly the property that made its size
+    /// easy not to ask about.
     pub fn retire_batch<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) -> usize {
         if self.raw.is_none() {
             return 0;
@@ -181,9 +291,12 @@ impl ResidencySet {
         let Ok(mut members) = self.members.lock() else {
             return 0;
         };
-        bufs.into_iter()
+        let n = bufs
+            .into_iter()
             .filter(|buf| members.remove(&allocation_key(buf)))
-            .count()
+            .count();
+        self.retired.fetch_add(n as u64, Ordering::Relaxed);
+        n
     }
 
     /// How many allocations the set currently holds.
@@ -242,6 +355,7 @@ impl ResidencySet {
         let n = members.len();
         set.removeAllAllocations();
         set.commit();
+        self.commits.fetch_add(1, Ordering::Relaxed);
         members.clear();
         n
     }

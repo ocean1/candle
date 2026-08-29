@@ -468,6 +468,31 @@ fn growing_allocations_do_not_grow_the_pool_without_bound() -> Result<()> {
          {ceiling} byte ceiling the two capped free lists allow; the free list \
          is not bounded"
     );
+
+    // **The free lists specifically, which is what the bound is on.**
+    //
+    // The assertion above is on `total_bytes()` -- live + free + pending -- so
+    // its 64 MiB slack term has to cover a whole in-flight window, and that
+    // window is a property of the machine's scheduling rather than of the
+    // bound. Measured, it does not always: this test fails intermittently on
+    // `lloom/integration` at 088d7249, **6 of 30** interleaved against **9 of
+    // 30** on issue #210's branch, always at the same figure -- 622 962 688
+    // bytes, 86.1 MB of live+pending against 67.1 MB of slack. Both arms, one
+    // population, and §1.3 says a difference that size at that sample is not
+    // evidence of anything.
+    //
+    // So the free-list bound gets its own assertion, on the quantity the bound
+    // is actually enforced against. This one cannot be perturbed by how far the
+    // CPU has run ahead of the GPU, which is what makes it the sharper half.
+    let (s, p) = metal.pool_occupancy();
+    let cap = 256 * 1024 * 1024;
+    assert!(
+        s.free_bytes <= cap && p.free_bytes <= cap,
+        "a free list is past its {cap} byte budget: shared {}, private {} \
+         (`DESIGN.md` §6.3b)",
+        s.free_bytes,
+        p.free_bytes
+    );
     Ok(())
 }
 
@@ -660,7 +685,7 @@ fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
     Ok(())
 }
 
-/// Evicting a buffer retires it from the residency set's membership record.
+/// Evicting a buffer removes it from the residency set's membership record.
 ///
 /// The pool bounds its free list by **destroying** buffers whose size will not
 /// be asked for again (§6.3b). That is a second place a buffer's existence
@@ -668,12 +693,12 @@ fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
 /// allocations whose handles were gone, on the steady-state decode path rather
 /// than only at teardown.
 ///
-/// What is asserted is the *record*, not a Metal call, and that is the design
-/// rather than a weaker test: unregistering eagerly puts a `commit()` on the
-/// per-token path and measured **+0.062 ms/token** against §11.2's 6.1 %
-/// budget, where retiring the key is free and is what makes a later remove a
-/// no-op. Teardown clears Metal's side with `removeAllAllocations`, which names
-/// no object. See `ResidencyEvictionObserver`.
+/// **This asserts the record, and it holds on both arms** — `retire_batch` and
+/// `remove_batch` both drop the key, and that is deliberate: the record is what
+/// decides whether a later `removeAllocation` may be issued, so the panic guard
+/// (§6.3c) must not depend on which arm ships. What the arms differ in is
+/// whether Metal is *told*, which is bytes rather than membership and is pinned
+/// by `evicting_a_free_buffer_releases_the_allocation_to_metal` below.
 #[test]
 fn evicting_a_free_buffer_retires_it_from_the_membership_record() -> Result<()> {
     let _guard = lock();
@@ -727,5 +752,140 @@ fn evicting_a_free_buffer_retires_it_from_the_membership_record() -> Result<()> 
         after,
         "a trim after an eviction must not remove anything further"
     );
+    Ok(())
+}
+
+/// **Eviction tells Metal, so the allocation is released rather than retained**
+/// (`DESIGN.md` §6.3e, lloom issue #210).
+///
+/// This is the change, and it is the half the membership test above structurally
+/// cannot see: both arms drop the key, and only one calls `removeAllocation`.
+/// The retention the other leaves is safe — it is a retention, not a dangling
+/// reference — and it reached **48 GB** at long context under `KvAppend=Cat`,
+/// exhausting a 64 GB device at 97 % of `recommendedMaxWorkingSetSize`.
+///
+/// Asserted on the counters rather than on `currentAllocatedSize`, deliberately.
+/// The driver figure is what #206 measured the defect with and it is the right
+/// instrument for a *long-context run*; here it would make a unit test depend on
+/// Metal's own release timing, which `removeAllocation` documents as *"on the
+/// next commit"* and which is not ours to assert. What is ours is that the call
+/// was made, batched, and that is exactly what `removed` and `commits` say.
+#[test]
+fn evicting_a_free_buffer_releases_the_allocation_to_metal() -> Result<()> {
+    let _guard = lock();
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+
+    for i in 1..=8 {
+        let t = Tensor::zeros((256, 512 + i), DType::F32, &device)?;
+        drop(t);
+    }
+    metal.wait_until_completed()?;
+
+    let before = metal.residency_counters();
+    let evicted_before = {
+        let (s, p) = metal.pool_counters();
+        s.evicted + p.evicted
+    };
+
+    metal.set_free_budget(0);
+
+    let (s, p) = metal.pool_counters();
+    let evicted = (s.evicted + p.evicted) - evicted_before;
+    assert!(
+        evicted > 0,
+        "expected the budget change to evict something; with nothing evicted \
+         this test asserts nothing"
+    );
+
+    let after = metal.residency_counters();
+    let removed = after.removed - before.removed;
+    let retired = after.retired - before.retired;
+
+    // THE ASSERTION. Every evicted buffer is unregistered from Metal, not
+    // merely forgotten by us.
+    assert_eq!(
+        removed, evicted,
+        "eviction must release the allocation to Metal: {evicted} evicted but \
+         only {removed} removed. A buffer forgotten without a `removeAllocation` \
+         is retained by Metal until the device drops, which is the 48 GB of \
+         §6.3e."
+    );
+    assert_eq!(
+        retired, 0,
+        "the retaining arm ran: {retired} allocations were forgotten without \
+         telling Metal"
+    );
+
+    // **And it is batched.** The number of Metal calls is what §6.3d's cost
+    // argument is about: #166 measured the per-buffer form at +0.087 ms/token
+    // and the per-batch form at +0.062, and the difference between them IS the
+    // commit count. A regression to one commit per buffer would be invisible to
+    // every assertion above.
+    let commits = after.commits - before.commits;
+    assert!(
+        commits <= 2,
+        "one eviction round must cost at most one commit per pool, got \
+         {commits} for {evicted} buffers -- a per-buffer commit is the +0.087 \
+         ms/token form (§6.3d)"
+    );
+    Ok(())
+}
+
+/// **A residency commit was already on the allocation path**, which is the fact
+/// that makes the eager arm affordable (`DESIGN.md` §6.3e, issue #210).
+///
+/// §6.3d attributes eager unregistration's cost to putting a `commit()` on the
+/// per-token path, and §6.3e wonders whether a sweep folded into the existing
+/// completion handler could avoid one because *"the `commit()` may not be
+/// additional"*. Both are reasoning about the same quantity and neither had
+/// counted it. Counted: `ResidencySet::insert` is one buffer and one commit, and
+/// every pool **miss** calls it — so allocation already commits at the
+/// allocation rate, and what eviction adds is one commit per *round*.
+///
+/// Pinned as a test because it is the load-bearing premise of the choice #210
+/// made, and because a future change routing allocation through `insert_batch`
+/// would improve it — at which point this test says so by failing rather than
+/// leaving the reasoning stale.
+#[test]
+fn allocation_already_commits_the_residency_set() -> Result<()> {
+    let _guard = lock();
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+
+    // Warm the pool so the sizes below are genuine misses rather than hits: a
+    // hit allocates nothing and registers nothing, which is the property
+    // `a_pool_hit_is_not_subject_to_the_cap` pins one layer down.
+    let before = metal.residency_counters();
+
+    // Distinct, unusual sizes so each one misses.
+    let mut held = Vec::new();
+    for i in 0..4 {
+        held.push(Tensor::zeros((37, 1024 + i * 7), DType::F32, &device)?);
+    }
+    let after = metal.residency_counters();
+
+    let added = after.added - before.added;
+    let commits = after.commits - before.commits;
+    assert!(
+        added > 0,
+        "no allocation registered, so this test measured nothing"
+    );
+    assert_eq!(
+        commits, added,
+        "expected one commit per registered allocation, got {commits} for \
+         {added} additions. This is the figure the eviction cost is compared \
+         against (§6.3e): if allocation batched its commits, the eager \
+         eviction arm's relative cost would be larger than #210 measured."
+    );
+    drop(held);
     Ok(())
 }

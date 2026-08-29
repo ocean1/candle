@@ -60,44 +60,68 @@ pub(crate) struct DeviceTeardown {
     residency_set: Arc<ResidencySet>,
 }
 
-/// Retires an evicted buffer's key from the residency set's membership record,
-/// so a later remove cannot name an allocation that is gone
-/// (`DESIGN.md` §6.3c).
+/// Unregisters an evicted buffer from the residency set, so Metal releases the
+/// allocation the pool has just destroyed (`DESIGN.md` §6.3c, §6.3e).
 ///
 /// The pool bounds its free list by **destroying** buffers whose size will not
 /// be asked for again (§6.3b), which is a second place a buffer's existence
 /// ends -- and unlike a trim, nothing was telling the residency set about it.
 ///
-/// # Why this retires the key rather than calling `removeAllocation`
+/// # Why this calls `removeAllocation` as of #210, having retired the key before
 ///
-/// Because the eager form is a measurable decode-path regression and this one
-/// is free, and because the guard does not need the eager form to be correct.
+/// #166 retired the membership key **without** the Metal call, on a measurement:
+/// eager unregistration cost **+0.062 ms/token even batched** against §11.2's
+/// whole 6.1 % non-GPU budget, and the residual was named *"a retention, not a
+/// dangling reference"*. Both halves were right. **What was never asked is what
+/// the retention weighs**, and the answer is **48 GB** (§6.3e, #206): the
+/// pricing was taken at §6.3b's **11.6 evictions per token**, and under
+/// `KvAppend=Cat` at long context the rate is **~220 per token**, at which the
+/// shipping default exhausts a 64 GB device at 97 % of
+/// `recommendedMaxWorkingSetSize`.
 ///
-/// Measured on LFM2 decode, `--n 200`, quiet machine, non-GPU ms/token:
+/// **The structural fact that decides the shape, and it is read from this file
+/// rather than argued.** §6.3e offers three: eager always, eager above a
+/// retention threshold, or a sweep folded into the per-command-buffer
+/// completion handler. **The first and the third are the same code.**
+/// `on_evict` is reached only from `PoolInner::drain_completed`, which is
+/// subscribed to `Commands::on_command_buffer_complete` -- so every
+/// steady-state eviction **already runs inside** that handler, once per command
+/// buffer, batched over everything it freed. There is no third site to fold
+/// anything into and no sweep to add; `evict_over_budget`'s only other caller is
+/// `set_free_budget`, which is setup-time.
+///
+/// **And the commit is not additional in the sense the cost argument assumed.**
+/// `ResidencySet::insert` is one buffer and one `commit()`, called from every
+/// pool miss -- so a residency commit is *already* on the per-token path at the
+/// allocation rate, and what a batched eager release adds is **one more per
+/// eviction round**, not one per evicted buffer. §6.3e's *"the `commit()` may
+/// not be additional"* is right about the mechanism and located it in the wrong
+/// place: it is the *allocation* commit that was already there.
+///
+/// **The threshold shape is rejected on evidence rather than on taste.** It
+/// needs a retention figure nobody has measured a threshold against, and §9.1a
+/// is the worked case of what that costs -- three policies, all built, none
+/// chosen, because the separating axis was never exercised. A threshold here
+/// would also be a knob whose wrong setting reproduces exactly this defect
+/// silently, where the unconditional form has no setting to get wrong.
+///
+/// # The measurement that put it here
+///
+/// #166's figures, which stand and are the bar this had to beat:
 ///
 /// ```text
 ///   baseline                                        0.928  0.936  0.932
 ///   unregister eagerly, one call per buffer         1.009  1.016  1.050   +0.087
 ///   unregister eagerly, one call per batch          0.993  0.998  0.993   +0.062
-///   retire the key, remove at teardown  (this)      0.941  0.928  0.945    +0.00
+///   retire the key, remove at teardown              0.941  0.928  0.945    +0.00
 /// ```
 ///
-/// The cost is entirely Metal's: an ablation keeping this observer wired and
-/// the `HashSet` work but skipping the Metal call reads 0.938, i.e. baseline.
-/// `removeAllocation` is documented as marking an allocation *"to be removed on
-/// the next commit"*, and decode evicts ~11.6 buffers per token, so any eager
-/// scheme puts a `commit()` on the per-token path. §11.2's whole non-GPU budget
-/// is 6.1 % of a token and #145 has decode at 86 % of a real roofline, so
-/// +0.062 ms is a genuine regression rather than a rounding error.
-///
-/// **What is given up is nothing the guard relies on.** Teardown empties the
-/// set with `removeAllAllocations`, which takes no object argument and so
-/// cannot name a freed one however stale the set has become; and every
-/// per-buffer remove is membership-tested, so retiring the key here is exactly
-/// what makes a later `trim_unused_buffers` or double-unregister a no-op
-/// instead of a call. The residual is that Metal's set holds a reference to an
-/// allocation the pool has dropped until the device goes -- a retention, not a
-/// dangling reference, and the reason the allocation is still safe to name.
+/// **A per-allocation Metal call is forbidden and this is not one** (§9.5e's
+/// premise, from #167's own ablation: *accounting is cheap, calling into Metal
+/// is not*). The call is per eviction **round**, batched by
+/// `BufferEvictionObserver::on_evict`'s contract, which exists for exactly this
+/// reason -- #166 measured the per-buffer form at +0.087 and the batched form at
+/// +0.062, and the difference between them is the commit count.
 pub(crate) struct ResidencyEvictionObserver {
     residency_set: Arc<ResidencySet>,
 }
@@ -110,45 +134,48 @@ impl ResidencyEvictionObserver {
 
 impl candle_metal_kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver {
     fn on_evict(&self, buffers: &[Buffer]) {
-        // PROBE, not a fix, and off unless asked for (lloom issue #206).
+        // One Metal call per eviction ROUND, never per buffer: `on_evict` is
+        // handed everything one round destroys, and `remove_batch` issues one
+        // `commit()` for the lot.
         //
-        // The comment above prices the eager form at +0.062 ms/token against a
-        // retention it calls safe, and that pricing was taken at §6.3b's
-        // **11.6 evictions per token**. Measured at long context under
-        // `KvAppend=Cat` the rate is **~220 per token**, and the retention
-        // reaches **48 GB** -- `device_allocated` climbs 11.0 -> 54.0 GB while
-        // the pool stays flat at 5.47, until the run dies of
-        // `kIOGPUCommandBufferCallbackErrorOutOfMemory` at 97 % of
-        // `recommendedMaxWorkingSetSize`.
-        //
-        // So the two arms answer different questions and both are needed: the
-        // default arm is what shipped and is what the cost was measured on, and
-        // this arm tests whether the retention is *the* mechanism rather than a
-        // quantity that merely correlates with it. If unregistering eagerly
-        // holds `device_allocated` flat, the retention is causal; if it climbs
-        // anyway, something else holds the bytes and this rules the set out.
-        //
-        // An environment variable rather than a feature so both arms come from
-        // one binary -- #122's `MathMode` shape -- and so a bisect cannot
-        // attribute a build difference to the arm.
-        if eager_residency_release() {
-            self.residency_set.remove_batch(buffers.iter());
-        } else {
+        // Both arms stay selectable (§12.3, §7.1a): `retire_batch` is the arm
+        // #166's +0.062 ms was measured on, so a re-measurement has something to
+        // measure against, and an operator hitting an unforeseen cost can get
+        // the old behaviour back without a rebuild. The old arm's failure mode
+        // is now documented rather than latent -- it is an unbounded retention,
+        // not a safe deferral.
+        if retain_evicted_allocations() {
             self.residency_set.retire_batch(buffers.iter());
+        } else {
+            self.residency_set.remove_batch(buffers.iter());
         }
     }
 }
 
-/// Whether an evicted buffer is unregistered from the residency set eagerly.
+/// Whether an evicted buffer's allocation is **retained** by Metal rather than
+/// released (`DESIGN.md` §6.3d's behaviour, superseded by §6.3e/#210).
 ///
-/// `false` is what ships (`DESIGN.md` §6.3d). Read once: a per-eviction
-/// `var()` would put an environment lookup on the decode path, which is the
-/// shape §6.4a prices and this probe exists to measure around.
-fn eager_residency_release() -> bool {
+/// `false` is what ships: eviction unregisters. Setting
+/// `CANDLE_METAL_RETAIN_EVICTED=1` restores the pre-#210 arm, which is the one
+/// §6.3d priced and the one that reaches **48 GB of retention** at long context
+/// under `KvAppend=Cat` -- so it is a measurement arm and an escape hatch, not a
+/// tuning knob.
+///
+/// Read once: a per-eviction `var()` would put an environment lookup on the
+/// decode path, which is the shape §6.4a prices.
+fn retain_evicted_allocations() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CANDLE_METAL_EAGER_RESIDENCY_RELEASE")
+        // `CANDLE_METAL_EAGER_RESIDENCY_RELEASE=0` is #206's probe spelled the
+        // other way round, and it selected the arm that is now the default.
+        // Honoured so an existing script that pins the arm explicitly still
+        // selects the arm it names rather than silently getting the new default
+        // -- an A/B whose arms both moved is worse than one that fails.
+        if let Ok(v) = std::env::var("CANDLE_METAL_EAGER_RESIDENCY_RELEASE") {
+            return !(v == "1" || v.eq_ignore_ascii_case("true"));
+        }
+        std::env::var("CANDLE_METAL_RETAIN_EVICTED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -351,6 +378,25 @@ impl MetalDevice {
     /// wants to check the set was emptied has to be holding the set itself.
     pub fn residency_set_handle(&self) -> Arc<ResidencySet> {
         Arc::clone(&self.residency_set)
+    }
+
+    /// What the residency set has done — commits, adds, removes, retirements
+    /// (`DESIGN.md` §6.3e).
+    ///
+    /// **`commits` is the quantity §6.3d's cost argument is about.** That
+    /// section attributes eager unregistration's +0.062 ms/token to putting a
+    /// `commit()` on the per-token path; this reports how many there are on
+    /// each arm, so the argument can be checked against a rate rather than
+    /// restated. `retired` nonzero with `removed` zero is the pre-#210
+    /// behaviour, and it is the retention that reached 48 GB.
+    pub fn residency_counters(&self) -> candle_metal_kernels::metal::ResidencyCounters {
+        self.residency_set.counters()
+    }
+
+    /// Zeroes the residency counters, so a caller can measure decode rather
+    /// than decode-plus-load.
+    pub fn reset_residency_counters(&self) {
+        self.residency_set.reset_counters();
     }
 
     /// Sets the cap on bytes each pool retains in its free list, evicting
