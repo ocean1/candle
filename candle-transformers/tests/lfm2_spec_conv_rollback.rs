@@ -267,3 +267,187 @@ fn every_position_of_a_verify_pass_matches_its_decode_step() -> Result<()> {
     }
     Ok(())
 }
+
+/// **Consecutive windows, with a rejection in the first.**
+///
+/// The single-window tests above show a rollback lands in the right place. They
+/// do not show the *next* window starts from it correctly, and that is a
+/// separate claim: a verify pass reads the ring at a phase the previous
+/// `resolve` set, so an off-by-one in the phase is invisible until a second
+/// window runs against it.
+///
+/// Found by the real model diverging at step 3 — the first window that had a
+/// rejection in it — while every single-window test passed. Two windows is the
+/// smallest fixture that can see it.
+#[test]
+fn a_window_after_a_rejection_starts_from_the_rolled_back_state() -> Result<()> {
+    let dev = Device::Cpu;
+    let cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    // Two windows' worth of tokens.
+    let seq: Vec<u32> = vec![6, 7, 8, 9, 10, 11, 12, 13];
+    let k = 4usize;
+    let n = 2usize; // the first window accepts 2 of 4
+
+    // Reference: n + k decode steps, one at a time.
+    let mut rc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
+    model.forward(&inp, 0, &mut rc)?;
+    let mut want = Vec::new();
+    for (i, t) in seq.iter().take(n + k).enumerate() {
+        let inp = Tensor::new(&[*t], &dev)?.reshape((1, 1))?;
+        want.push(
+            model
+                .forward(&inp, prompt.len() + i, &mut rc)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+        );
+    }
+
+    // Speculative: a k-window resolved to n, then a second k-window.
+    let mut sc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
+    model.forward(&inp, 0, &mut sc)?;
+
+    let tok = sc.advance(k)?;
+    let w1 = Tensor::new(&seq[..k], &dev)?.reshape((1, k))?;
+    model.forward_all(&w1, prompt.len(), &mut sc)?;
+    sc.resolve(tok, n)?;
+
+    let tok = sc.advance(k)?;
+    let w2 = Tensor::new(&seq[n..n + k], &dev)?.reshape((1, k))?;
+    let got = model.forward_all(&w2, prompt.len() + n, &mut sc)?;
+    sc.resolve(tok, k)?;
+
+    // The second window's positions must match decode steps n..n+k.
+    for j in 0..k {
+        let g = got.i(0)?.i(j)?.flatten_all()?.to_vec1::<f32>()?;
+        let worst = g
+            .iter()
+            .zip(want[n + j].iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "second window position {j} must match decode step {}: worst |Δ| = {worst}",
+            n + j
+        );
+    }
+    Ok(())
+}
+
+/// Isolation: the same two-window sequence on a **conv-only** model.
+///
+/// If this passes while the mixed model fails, the defect is in the KV half; if
+/// both fail it is the conv half. Kept because "which half" is the first
+/// question any future regression here has to answer, and re-deriving it costs
+/// a build.
+#[test]
+fn two_windows_on_a_conv_only_model() -> Result<()> {
+    let dev = Device::Cpu;
+    let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+    cfg.layer_types = vec![LayerType::Conv, LayerType::Conv];
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let seq: Vec<u32> = vec![6, 7, 8, 9, 10, 11, 12, 13];
+    let k = 4usize;
+    let n = 2usize;
+
+    let mut rc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
+    model.forward(&inp, 0, &mut rc)?;
+    let mut want = Vec::new();
+    for (i, t) in seq.iter().take(n + k).enumerate() {
+        let inp = Tensor::new(&[*t], &dev)?.reshape((1, 1))?;
+        want.push(
+            model
+                .forward(&inp, prompt.len() + i, &mut rc)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+        );
+    }
+
+    let mut sc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
+    model.forward(&inp, 0, &mut sc)?;
+    let tok = sc.advance(k)?;
+    let w1 = Tensor::new(&seq[..k], &dev)?.reshape((1, k))?;
+    model.forward_all(&w1, prompt.len(), &mut sc)?;
+    sc.resolve(tok, n)?;
+    let tok = sc.advance(k)?;
+    let w2 = Tensor::new(&seq[n..n + k], &dev)?.reshape((1, k))?;
+    let got = model.forward_all(&w2, prompt.len() + n, &mut sc)?;
+    sc.resolve(tok, k)?;
+
+    for j in 0..k {
+        let g = got.i(0)?.i(j)?.flatten_all()?.to_vec1::<f32>()?;
+        let worst = g
+            .iter()
+            .zip(want[n + j].iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "conv-only second window position {j}: worst |Δ| = {worst}"
+        );
+    }
+    Ok(())
+}
+
+/// Control for the two-window test: **two windows with no rejection**.
+///
+/// If this passes and the rejection case fails, the rollback is the suspect. If
+/// both fail, the second window is wrong regardless of what the first did, and
+/// the rollback is exonerated. Named a control because it is what makes the
+/// other result attributable (§1.3).
+#[test]
+fn two_full_windows_with_no_rejection() -> Result<()> {
+    let dev = Device::Cpu;
+    let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+    cfg.layer_types = vec![LayerType::Conv, LayerType::Conv];
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let seq: Vec<u32> = vec![6, 7, 8, 9, 10, 11, 12, 13];
+    let k = 4usize;
+
+    let mut rc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
+    model.forward(&inp, 0, &mut rc)?;
+    let mut want = Vec::new();
+    for (i, t) in seq.iter().take(2 * k).enumerate() {
+        let inp = Tensor::new(&[*t], &dev)?.reshape((1, 1))?;
+        want.push(
+            model
+                .forward(&inp, prompt.len() + i, &mut rc)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+        );
+    }
+
+    let mut sc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
+    model.forward(&inp, 0, &mut sc)?;
+    let tok = sc.advance(k)?;
+    let w1 = Tensor::new(&seq[..k], &dev)?.reshape((1, k))?;
+    model.forward_all(&w1, prompt.len(), &mut sc)?;
+    sc.resolve(tok, k)?;
+    let tok = sc.advance(k)?;
+    let w2 = Tensor::new(&seq[k..2 * k], &dev)?.reshape((1, k))?;
+    let got = model.forward_all(&w2, prompt.len() + k, &mut sc)?;
+    sc.resolve(tok, k)?;
+
+    for j in 0..k {
+        let g = got.i(0)?.i(j)?.flatten_all()?.to_vec1::<f32>()?;
+        let worst = g
+            .iter()
+            .zip(want[k + j].iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "no-rejection second window position {j}: worst |Δ| = {worst}"
+        );
+    }
+    Ok(())
+}

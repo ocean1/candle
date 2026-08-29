@@ -1399,18 +1399,36 @@ impl ShortConv {
                 let w = conv_weight.squeeze(1)?;
                 let mut per_phase = Vec::with_capacity(width);
                 for phase in 0..width {
-                    // Slot `s` must meet the weight of the token it holds. Ages
-                    // run 0 = oldest .. l_cache-1 = newest, and the newest sits
-                    // at `phase`, so slot `s` holds age `s + width - phase - 1`
-                    // (mod width) -- taken over the live window only.
+                    // **The newest token is AT `phase`, and the live window is
+                    // the `l_cache` slots ending there.** Counting `d` slots
+                    // back from `phase` gives the token `d` steps older, which
+                    // the shuffle would have held at column `l_cache - 1 - d`.
+                    // Every other slot is history and gets a zero column, so a
+                    // stale value cannot contribute however many are held.
+                    //
+                    // **This is the arithmetic #141 got wrong for `K > 0`**, and
+                    // the error was invisible on the arm it shipped. Its formula
+                    // — `age = (s + width - phase - 1) % width`, live iff
+                    // `age < l_cache` — is *equivalent* to this one at
+                    // `width == l_cache`, which is `K = 0`, the default and the
+                    // only arm its digest gate ran against. At `K > 0` it selects
+                    // the `l_cache` slots **following** `phase` rather than the
+                    // ones ending at it, so the live window is read from slots
+                    // that hold history and the newest token is weighted zero.
+                    //
+                    // Measured on the CPU backend at f32 — §2.3.5a's load-bearing
+                    // discriminator — `shuffle` and `rotating:0` give an
+                    // identical token stream and `rotating:2` gives a different
+                    // one. That is a computational bug and not a reduction order,
+                    // so §16 6b's *"K is measurably inert"* held only because
+                    // nothing read the history slots yet.
                     let mut cols = Vec::with_capacity(width);
                     for s in 0..width {
-                        let age = (s + width - phase - 1) % width;
-                        // Slots outside the live window hold history (K > 0),
-                        // which nothing reads yet; give them a zero column so a
-                        // future reader cannot silently pick up a live weight.
-                        let col = if age < l_cache {
-                            w.narrow(1, age, 1)?
+                        // How many slots back from the newest, or `None` if this
+                        // slot is outside the live window.
+                        let back = (phase + width - s) % width;
+                        let col = if back < l_cache {
+                            w.narrow(1, l_cache - 1 - back, 1)?
                         } else {
                             Tensor::zeros((hidden_size, 1), w.dtype(), w.device())?
                         };

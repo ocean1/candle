@@ -442,18 +442,9 @@ mod tests {
         mark(Event::Compaction, 598);
         let out = to_jsonl("run-x");
 
-        assert!(
-            out.contains("\"signal\":\"mem/pool/live_bytes\",\"value\":1000"),
-            "{out}"
-        );
-        assert!(
-            out.contains("\"signal\":\"mem/pool/pending_bytes\",\"value\":200"),
-            "{out}"
-        );
-        assert!(
-            out.contains("\"signal\":\"event/compaction\",\"value\":598"),
-            "{out}"
-        );
+        assert!(out.contains("\"signal\":\"mem/pool/live_bytes\",\"value\":1000"), "{out}");
+        assert!(out.contains("\"signal\":\"mem/pool/pending_bytes\",\"value\":200"), "{out}");
+        assert!(out.contains("\"signal\":\"event/compaction\",\"value\":598"), "{out}");
         // Every row carries the token index, which is what the issue asks the
         // memory series to be plotted against.
         assert!(out.contains("\"token\":42"), "{out}");
@@ -470,10 +461,7 @@ mod tests {
         sample(MemClass::Arena, 1, 1, 1);
         mark(Event::ArenaInstall, 0);
         assert_eq!(accepted(), 0);
-        assert!(
-            !engaged(),
-            "a build that can record but did not is not engaged"
-        );
+        assert!(!engaged(), "a build that can record but did not is not engaged");
     }
 
     #[cfg(feature = "run-telemetry")]
@@ -521,9 +509,6 @@ mod tests {
             .unwrap()
             .as_nanos() as u64;
         // CLOCK_UPTIME_RAW is time since boot, nowhere near ns since 1970.
-        assert!(
-            b < epoch_ns / 2,
-            "looks like a wall clock (DESIGN.md §3.4b)"
-        );
+        assert!(b < epoch_ns / 2, "looks like a wall clock (DESIGN.md §3.4b)");
     }
 }
