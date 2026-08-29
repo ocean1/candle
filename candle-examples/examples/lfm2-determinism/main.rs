@@ -57,7 +57,7 @@ mod sha256;
 
 use anyhow::{Context, Result};
 use candle::metal_backend::ArenaLayout;
-use candle::{DType, Device, Tensor};
+use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::lfm2::{
@@ -163,6 +163,40 @@ struct Args {
     /// which is what the token digest conflates with everything downstream of it.
     #[arg(long)]
     force_tokens: Option<String>,
+
+    /// Decode speculatively with a `K`-position verify pass (issue #89).
+    ///
+    /// **This is the generic verifier and it carries no proposer.** Where the K
+    /// tokens come from is policy and belongs to #90/#91 (`DESIGN.md` §7.7:
+    /// policy is runtime-swappable, kernel structure is not). What this flag
+    /// supplies is the *mechanism* — propose K, verify in one pass, accept a
+    /// prefix, roll back K−n — driven by whichever proposer `--spec-proposer`
+    /// names, both of which are sequences rather than models.
+    ///
+    /// Requires `--conv-state rotating:<K'>` with `K' >= K` and
+    /// `--kv-append in-place`; `Cache::advance` refuses everything else before
+    /// any state is written, and says why.
+    ///
+    /// **Under greedy decoding the output must be identical to the
+    /// non-speculative run**, so the canonical digest pair is this mechanism's
+    /// test rather than a divergence bound — a scheme that changes the output is
+    /// a bug and not a tradeoff.
+    #[arg(long)]
+    speculate: Option<usize>,
+
+    /// Which proposer drives `--speculate`. Both are sequences; neither is a
+    /// model.
+    ///
+    /// * `oracle` — always proposes what the target would have produced, taken
+    ///   from `--force-tokens`. **The transparency arm**: acceptance is total,
+    ///   so the digests must be unmoved, which is #89's first acceptance item.
+    /// * `wrong:<N>` — the oracle with every `N`-th proposal corrupted. **The
+    ///   rollback arm**: acceptance is partial, the rollback fires on every
+    ///   window, and the digests must *still* be unmoved. That is the stronger
+    ///   of the two, because a mechanism that is transparent only when nothing
+    ///   is rejected has not been shown to roll back at all.
+    #[arg(long, default_value = "oracle")]
+    spec_proposer: String,
 
     /// Label printed with the result, to tag a run inside a batch.
     #[arg(long, default_value = "")]
@@ -436,6 +470,35 @@ fn parse_config(raw: &str) -> Result<Config> {
 /// entry silently dropped would force a *different, shorter* sequence than the
 /// one on disk, and both arms would agree on it — a comparison that is
 /// internally consistent and not the one that was asked for (§2.4).
+/// Write one step's raw logits to `--dump-logits`, in the format the ordinary
+/// decode path writes.
+///
+/// Factored out when the speculative arm (issue #89) became a second producer of
+/// steps: two copies of this would be two chances for the two arms' dumps to
+/// disagree in *format*, which `tools/logit-delta/` would then read as a
+/// difference in *values*. One writer, one format.
+fn dump_step(
+    sink: &mut Option<std::io::BufWriter<std::fs::File>>,
+    step: usize,
+    values: &[f32],
+) -> Result<()> {
+    let Some(sink) = sink.as_mut() else {
+        return Ok(());
+    };
+    use std::io::Write;
+    let mut line = String::with_capacity(values.len() * 12);
+    line.push_str(&format!("step {step}"));
+    for v in values {
+        // Hex of the bit pattern: exact, so the comparison is over the values
+        // the model produced rather than over a decimal rendering of them.
+        line.push_str(&format!(" {:08x}", v.to_bits()));
+    }
+    line.push('\n');
+    sink.write_all(line.as_bytes())
+        .context("writing --dump-logits")?;
+    Ok(())
+}
+
 fn parse_forced_tokens(raw: &str) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     for (lineno, line) in raw.lines().enumerate() {
@@ -718,6 +781,35 @@ fn main() -> Result<()> {
     let mut forced_steps = 0usize;
     let mut forced_overrides = 0usize;
 
+    // Issue #89. `windows` and `proposed`/`accepted` are the acceptance rate,
+    // which is what a cost model needs beside a timing; `corrupted` is the
+    // wrong-proposer arm's engagement proof, in the shape §2.4 requires — an arm
+    // named `wrong` that corrupted nothing would be the oracle arm wearing the
+    // rollback arm's name, which is #69's vacuous run in a new quantity.
+    let mut spec_windows = 0usize;
+    let mut spec_proposed = 0usize;
+    let mut spec_accepted = 0usize;
+    let mut spec_corrupted = 0usize;
+    let spec_wrong_every: Option<usize> = match args.spec_proposer.as_str() {
+        "oracle" => None,
+        s => match s.strip_prefix("wrong:") {
+            Some(n) => {
+                let n: usize = n.parse().map_err(|_| {
+                    anyhow::anyhow!("--spec-proposer wrong:<N> needs an integer, got {s:?}")
+                })?;
+                if n == 0 {
+                    anyhow::bail!("--spec-proposer wrong:0 would corrupt nothing");
+                }
+                Some(n)
+            }
+            None => anyhow::bail!(
+                "--spec-proposer must be `oracle` or `wrong:<N>`, got {:?}",
+                args.spec_proposer
+            ),
+        },
+    };
+    let vocab_size = config.vocab_size as u32;
+
     let mut token_hasher = sha256::Sha256::new();
     let mut logits_hasher = sha256::Sha256::new();
     let mut tokens: Vec<u32> = Vec::with_capacity(args.n);
@@ -831,6 +923,190 @@ fn main() -> Result<()> {
         kv_len += turn_ids.len();
         turns_run = turn + 1;
 
+        // ---- the speculative arm (issue #89) -------------------------------
+        //
+        // A separate loop rather than a branch inside the one below, because the
+        // shapes genuinely differ: an ordinary step consumes one token and emits
+        // one, where a verify pass consumes K and emits between 1 and K. Folding
+        // them would put a `seq_len`-dependent branch on the path every recorded
+        // digest belongs to, to serve a caller that path does not have — which is
+        // §11.3l finding 4's shape.
+        if let Some(k) = args.speculate {
+            let Some(oracle) = forced.as_ref() else {
+                anyhow::bail!(
+                    "--speculate needs --force-tokens: the proposer is a known-correct \
+                     sequence, which is what lets the mechanism be measured without a \
+                     draft model (issue #89)"
+                );
+            };
+            // **A position predicts the token that FOLLOWS the one it reads**,
+            // and getting the resulting off-by-one wrong is the failure this
+            // loop is shaped to avoid. Spelled out, because it is the whole of
+            // why a `k`-position pass yields `k` tokens rather than `k - 1`:
+            //
+            // * the prediction for the *next* step is already in hand — it is
+            //   `logits`, carried from the prefill or from the previous pass's
+            //   last position. That token costs nothing and is emitted first.
+            //   Feeding it back is what conditions the pass on it.
+            // * the pass then feeds `[emitted, prop_1, .., prop_{w-1}]`, so
+            //   position `j` reads `ids[j]` and predicts step `d + j + 1`. It
+            //   verifies `w - 1` proposals and predicts one more — the bonus.
+            //
+            // A first draft compared position `j`'s argmax against `window[j]`
+            // rather than against the proposal for the step it predicts. The
+            // symptom was not a crash or a wrong shape: it produced a full,
+            // stable token stream with `accept_rate = 0.26` under a **perfect**
+            // oracle, which reads as a bad proposer rather than as a
+            // misalignment. That is why the oracle arm is the first gate and why
+            // its acceptance rate is asserted rather than merely printed —
+            // §2.4's rule that an instrument must be shown to have engaged, in
+            // the one quantity that can distinguish these two.
+            loop {
+                let done = per_step.len();
+                if tokens.len() >= args.n || done >= oracle.len() {
+                    break 'turns;
+                }
+
+                // Step `done`'s token, from the logits already in hand.
+                let carried = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                let mut carried_bytes = Vec::with_capacity(carried.len() * 4);
+                for v in &carried {
+                    carried_bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+                let carried_digest = sha256::digest_hex(&carried_bytes);
+                dump_step(&mut logits_sink, per_step.len(), &carried)?;
+                let emitted = logits_processor.sample(&logits).context("sampling")?;
+                forced_steps += 1;
+                if emitted != oracle[done] {
+                    forced_overrides += 1;
+                }
+                logits_hasher.update(&carried_bytes);
+                token_hasher.update(&emitted.to_le_bytes());
+                tokens.push(emitted);
+                per_step.push((emitted, carried_digest, kv_len));
+
+                if tokens.len() >= args.n || per_step.len() >= oracle.len() {
+                    break 'turns;
+                }
+
+                // **The proposals are indexed by the step they propose, and the
+                // oracle is indexed the same way — which is only sound because
+                // the emitted stream and the oracle agree.**
+                //
+                // Under greedy that identity is the mechanism's own guarantee:
+                // every emitted token is the target's argmax, which is what
+                // non-speculative decoding emits, which is what the oracle
+                // recorded. A rejection changes *which proposals are wasted*,
+                // never *what is emitted*. So a divergence here is not a wrong
+                // proposal — it is the mechanism failing, and the assertion says
+                // so rather than letting the run continue against proposals for
+                // positions the model never reached.
+                anyhow::ensure!(
+                    emitted == oracle[done],
+                    "speculative decoding diverged from the non-speculative sequence at \
+                     step {done}: emitted {emitted}, reference {}. Under greedy decoding \
+                     these are identical by construction (issue #89), so this is a defect \
+                     in the verifier and not a rejected proposal.",
+                    oracle[done]
+                );
+
+                // The proposals for the steps after it, clipped to the oracle.
+                let want = k.min(oracle.len() - per_step.len());
+                let mut props: Vec<u32> = oracle[done + 1..done + 1 + want].to_vec();
+                if let Some(every) = spec_wrong_every {
+                    // The deliberately-wrong proposer: corrupt every `N`-th
+                    // proposal, so a rejection happens on a schedule rather than
+                    // by chance and the rollback is exercised on most windows.
+                    for (j, p) in props.iter_mut().enumerate() {
+                        if (done + 1 + j) % every == every - 1 {
+                            *p = p.wrapping_add(1) % vocab_size;
+                            spec_corrupted += 1;
+                        }
+                    }
+                }
+
+                // `[emitted, props[..want-1]]` — `want` positions, verifying
+                // `want - 1` proposals and predicting one bonus token.
+                let width = props.len();
+                let mut ids = Vec::with_capacity(width);
+                ids.push(emitted);
+                ids.extend_from_slice(&props[..width - 1]);
+
+                let tok = cache.advance(width)?;
+                let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
+                let all = model
+                    .forward_all(&input, kv_len, &mut cache)
+                    .context("speculative verify pass")?
+                    .squeeze(0)?;
+                kv_len += width;
+
+                // Find the accepted prefix first, *then* emit it.
+                //
+                // **The last accepted position's prediction is carried, not
+                // emitted**, and separating the two loops is what makes that
+                // hard to get wrong. A single loop that both emitted position
+                // `j` and assigned `logits = row` emitted the same prediction
+                // twice — once from the pass and once from the next iteration's
+                // carried-emit — which showed up as two consecutive steps with
+                // an *identical logits digest* and an acceptance rate that
+                // looked like a mediocre proposer. Two loops make the invariant
+                // structural: exactly one row is carried and every other
+                // accepted row is emitted.
+                let mut accepted = 0usize; // positions whose state survives
+                for j in 0..width {
+                    accepted += 1;
+                    let target = logits_processor.sample(&all.i(j)?).context("sampling")?;
+                    if target != props[j] {
+                        break;
+                    }
+                }
+                // Emit every accepted position except the last, whose logits
+                // become the carried prediction for the next window's first
+                // token. Clipped so a run stops mid-window at `--n`.
+                let mut carry = None;
+                for j in 0..accepted {
+                    let row = all.i(j)?;
+                    if j + 1 == accepted {
+                        carry = Some(row);
+                        break;
+                    }
+                    if tokens.len() >= args.n || per_step.len() >= oracle.len() {
+                        break;
+                    }
+                    let step_logits = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    let mut step_bytes = Vec::with_capacity(step_logits.len() * 4);
+                    for v in &step_logits {
+                        step_bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    let step_digest = sha256::digest_hex(&step_bytes);
+                    dump_step(&mut logits_sink, per_step.len(), &step_logits)?;
+                    let target = logits_processor.sample(&row).context("sampling")?;
+                    forced_steps += 1;
+                    if target != oracle[per_step.len()] {
+                        forced_overrides += 1;
+                    }
+                    logits_hasher.update(&step_bytes);
+                    token_hasher.update(&target.to_le_bytes());
+                    tokens.push(target);
+                    per_step.push((target, step_digest, kv_len));
+                }
+                if let Some(row) = carry {
+                    logits = row;
+                }
+
+                // The pass appended `width` positions and `accepted` of them
+                // produced tokens that were kept, so `width - accepted` are
+                // discarded — a length decrement and a phase move, neither of
+                // which clears a byte (`DESIGN.md` §10.2a).
+                cache.resolve(tok, accepted)?;
+                kv_len -= width - accepted;
+                spec_windows += 1;
+                spec_accepted += accepted;
+                spec_proposed += width;
+                decode_steps += 1;
+            }
+        }
+
         loop {
             if tokens.len() >= args.n {
                 break 'turns;
@@ -856,20 +1132,7 @@ fn main() -> Result<()> {
             let step_digest = sha256::digest_hex(&step_bytes);
             logits_hasher.update(&step_bytes);
 
-            if let Some(sink) = logits_sink.as_mut() {
-                use std::io::Write;
-                let mut line = String::with_capacity(step_logits.len() * 12);
-                line.push_str(&format!("step {}", per_step.len()));
-                for v in &step_logits {
-                    // Hex of the bit pattern: exact, so the comparison is over
-                    // the values the model produced rather than over a decimal
-                    // rendering of them.
-                    line.push_str(&format!(" {:08x}", v.to_bits()));
-                }
-                line.push('\n');
-                sink.write_all(line.as_bytes())
-                    .context("writing --dump-logits")?;
-            }
+            dump_step(&mut logits_sink, per_step.len(), &step_logits)?;
 
             // The sampler runs either way. Under `--force-tokens` its choice is
             // recorded and then discarded, which is what makes `overrides` a
@@ -1176,6 +1439,49 @@ fn main() -> Result<()> {
         forced_overrides,
         elapsed.as_millis(),
     );
+
+    // Issue #89. On its own line rather than folded into `RESULT`, because every
+    // committed artifact's `RESULT` line has that shape and #171 records what
+    // widening it costs an ingest of the existing corpus.
+    //
+    // `windows` and `accepted/proposed` are the acceptance rate the cost model
+    // needs beside a timing; `corrupted` is the wrong-proposer arm's engagement
+    // proof (§2.4), since an arm named `wrong` that corrupted nothing would be
+    // the oracle arm wearing the rollback arm's name.
+    if let Some(k) = args.speculate {
+        println!(
+            "SPEC k={} proposer={} windows={} proposed={} accepted={} corrupted={} \
+             accept_rate={:.4} tokens_per_window={:.4}",
+            k,
+            args.spec_proposer,
+            spec_windows,
+            spec_proposed,
+            spec_accepted,
+            spec_corrupted,
+            if spec_proposed > 0 {
+                spec_accepted as f64 / spec_proposed as f64
+            } else {
+                0.0
+            },
+            if spec_windows > 0 {
+                spec_accepted as f64 / spec_windows as f64
+            } else {
+                0.0
+            },
+        );
+        anyhow::ensure!(
+            spec_windows > 0,
+            "--speculate was passed and no verify window ran, so the digest above is the \
+             ordinary decode path's result wearing the speculative arm's name (§2.4)"
+        );
+        if spec_wrong_every.is_some() {
+            anyhow::ensure!(
+                spec_corrupted > 0,
+                "--spec-proposer wrong:<N> corrupted nothing, so this arm is the oracle \
+                 arm and the rollback was never exercised"
+            );
+        }
+    }
 
     // The raw stream, so the reported hash is independently checkable with
     // `shasum` rather than trusted.

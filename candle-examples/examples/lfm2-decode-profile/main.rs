@@ -1291,15 +1291,17 @@ fn main() -> Result<()> {
                 .iter()
                 .zip(step_stamps.iter())
                 .enumerate()
-                .map(|(i, ((wall, gpu, disp), (t_end_ns, kv)))| run_record::Step {
-                    index: i,
-                    warmup: i < warmup,
-                    wall_ms: wall * 1e3,
-                    gpu_ms: if profiling { Some(gpu * 1e3) } else { None },
-                    dispatches: if profiling { Some(*disp) } else { None },
-                    t_end_ns: *t_end_ns,
-                    kv_len: *kv,
-                })
+                .map(
+                    |(i, ((wall, gpu, disp), (t_end_ns, kv)))| run_record::Step {
+                        index: i,
+                        warmup: i < warmup,
+                        wall_ms: wall * 1e3,
+                        gpu_ms: if profiling { Some(gpu * 1e3) } else { None },
+                        dispatches: if profiling { Some(*disp) } else { None },
+                        t_end_ns: *t_end_ns,
+                        kv_len: *kv,
+                    },
+                )
                 .collect(),
             telemetry_path: args.telemetry_path.clone(),
         };
