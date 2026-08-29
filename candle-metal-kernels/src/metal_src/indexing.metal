@@ -30,11 +30,18 @@ inline uint8_t max_value<uint8_t>() {
 // §11.3b names two layout hazards -- over-aligning vector types and `bool` at 1
 // byte -- and #40 recorded that the second "does not fire" in any of the four
 // elementwise families, checked by enumerating their parameters. It fires here:
-// `index` takes a `constant bool &contiguous` between five `size_t` and a
-// sixth, so `contiguous` sits at offset 40, `src_num_dims` pads to 48, and the
-// struct is 56 bytes where its fields sum to 49. `conv.metal`'s
+// `index` takes a `constant bool &contiguous` between four `size_t` and a
+// fifth, so `contiguous` sits at offset 32, `src_num_dims` pads to 40, and the
+// struct is 48 bytes where its fields sum to 41. `conv.metal`'s
 // `UpsampleBilinear2dParams` is the only other struct in the crate with a
 // `bool` in it, and that one is off the decode path entirely.
+//
+// **`left_size` is gone from all four structs as of #219**, having been bound by
+// all five kernels and read by none since before the packed conversion -- §11.3k
+// finding 3 found it with a mutation that survived. Each struct is one `size_t`
+// narrower and the interior padding is unchanged in kind: the `bool` still pads,
+// it simply pads at 32 rather than at 40. The figures above are post-removal;
+// before it they were 40 / 48 / 56 / 49.
 //
 // `dims` and `strides` are deliberately not fields: their length comes from the
 // tensor's layout, not from the struct. They stay separate bindings, which an
@@ -42,7 +49,6 @@ inline uint8_t max_value<uint8_t>() {
 // constraint is `setBytes` rather than buffer count (`DESIGN.md` §11.3d).
 struct IndexParams {
     size_t dst_size;
-    size_t left_size;
     size_t src_dim_size;
     size_t right_size;
     size_t ids_size;
@@ -52,7 +58,6 @@ struct IndexParams {
 
 struct GatherParams {
     size_t dst_size;
-    size_t left_size;
     size_t src_dim_size;
     size_t right_size;
     size_t ids_size;
@@ -63,7 +68,6 @@ struct GatherParams {
 // which is the body rather than the binding.
 struct ScatterParams {
     size_t dst_size;
-    size_t left_size;
     size_t src_dim_size;
     size_t right_size;
     size_t dst_dim_size;
@@ -71,7 +75,6 @@ struct ScatterParams {
 
 struct IndexAddParams {
     size_t dst_size;
-    size_t left_size;
     size_t src_dim_size;
     size_t right_size;
     size_t dst_dim_size;
@@ -176,7 +179,6 @@ METAL_FUNC void index_body(
 template<typename TYPENAME, typename INDEX_TYPENAME>
 [[kernel]] void index(
     constant size_t &dst_size,
-    constant size_t &left_size,
     constant size_t &src_dim_size,
     constant size_t &right_size,
     constant size_t &ids_size,
@@ -189,7 +191,7 @@ template<typename TYPENAME, typename INDEX_TYPENAME>
     device TYPENAME *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    IndexParams p { dst_size, left_size, src_dim_size, right_size, ids_size,
+    IndexParams p { dst_size, src_dim_size, right_size, ids_size,
                     contiguous, src_num_dims };
     index_body<TYPENAME, INDEX_TYPENAME, constant size_t *>(
         p, src_dims, src_strides, input, input_ids, output, tid);
@@ -239,7 +241,6 @@ METAL_FUNC void gather_body(
 template<typename TYPENAME, typename INDEX_TYPENAME>
 [[kernel]] void gather(
     constant size_t &dst_size,
-    constant size_t &left_size,
     constant size_t &src_dim_size,
     constant size_t &right_size,
     constant size_t &ids_size,
@@ -248,7 +249,7 @@ template<typename TYPENAME, typename INDEX_TYPENAME>
     device TYPENAME *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    GatherParams p { dst_size, left_size, src_dim_size, right_size, ids_size };
+    GatherParams p { dst_size, src_dim_size, right_size, ids_size };
     gather_body<TYPENAME, INDEX_TYPENAME>(p, input, input_ids, output, tid);
 }
 
@@ -294,7 +295,6 @@ METAL_FUNC void scatter_body(
 template<typename TYPENAME, typename INDEX_TYPENAME>
 [[kernel]] void scatter(
     constant size_t &dst_size,
-    constant size_t &left_size,
     constant size_t &src_dim_size,
     constant size_t &right_size,
     constant size_t &dst_dim_size,
@@ -303,7 +303,7 @@ template<typename TYPENAME, typename INDEX_TYPENAME>
     device TYPENAME *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    ScatterParams p { dst_size, left_size, src_dim_size, right_size, dst_dim_size };
+    ScatterParams p { dst_size, src_dim_size, right_size, dst_dim_size };
     scatter_body<TYPENAME, INDEX_TYPENAME>(p, input, input_ids, output, tid);
 }
 
@@ -349,7 +349,6 @@ METAL_FUNC void scatter_add_body(
 template<typename TYPENAME, typename INDEX_TYPENAME>
 [[kernel]] void scatter_add(
     constant size_t &dst_size,
-    constant size_t &left_size,
     constant size_t &src_dim_size,
     constant size_t &right_size,
     constant size_t &dst_dim_size,
@@ -358,7 +357,7 @@ template<typename TYPENAME, typename INDEX_TYPENAME>
     device TYPENAME *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    ScatterParams p { dst_size, left_size, src_dim_size, right_size, dst_dim_size };
+    ScatterParams p { dst_size, src_dim_size, right_size, dst_dim_size };
     scatter_add_body<TYPENAME, INDEX_TYPENAME>(p, input, input_ids, output, tid);
 }
 
@@ -405,7 +404,6 @@ METAL_FUNC void index_add_body(
 template<typename TYPENAME, typename INDEX_TYPENAME>
 [[kernel]] void index_add(
     constant size_t &dst_size,
-    constant size_t &left_size,
     constant size_t &src_dim_size,
     constant size_t &right_size,
     constant size_t &dst_dim_size,
@@ -415,7 +413,7 @@ template<typename TYPENAME, typename INDEX_TYPENAME>
     device TYPENAME *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    IndexAddParams p { dst_size, left_size, src_dim_size, right_size,
+    IndexAddParams p { dst_size, src_dim_size, right_size,
                        dst_dim_size, ids_dim_size };
     index_add_body<TYPENAME, INDEX_TYPENAME>(p, input, input_ids, output, tid);
 }
@@ -445,19 +443,23 @@ template<typename TYPENAME, typename INDEX_TYPENAME>
 // compared against Rust's `offset_of!`, which is the stronger check regardless
 // -- a `static_assert` on either side proves only that side agrees with itself.
 //
-// `IndexParams` is 56 rather than the 49 its fields sum to: the `bool` at 40
+// `IndexParams` is 48 rather than the 41 its fields sum to: the `bool` at 32
 // leaves seven bytes before `src_num_dims` can start at its own 8-byte
 // alignment. That is the number this file exists to ship across the boundary.
-static_assert(sizeof(IndexParams) == 56, "IndexParams layout");
+//
+// All four shrank by one `size_t` when #219 removed `left_size` -- 56/40/40/48
+// became 48/32/32/40. The padding argument is untouched by that: what pads is
+// the `bool`, and it pads wherever it lands.
+static_assert(sizeof(IndexParams) == 48, "IndexParams layout");
 static_assert(alignof(IndexParams) == 8, "IndexParams alignment");
 
-static_assert(sizeof(GatherParams) == 40, "GatherParams layout");
+static_assert(sizeof(GatherParams) == 32, "GatherParams layout");
 static_assert(alignof(GatherParams) == 8, "GatherParams alignment");
 
-static_assert(sizeof(ScatterParams) == 40, "ScatterParams layout");
+static_assert(sizeof(ScatterParams) == 32, "ScatterParams layout");
 static_assert(alignof(ScatterParams) == 8, "ScatterParams alignment");
 
-static_assert(sizeof(IndexAddParams) == 48, "IndexAddParams layout");
+static_assert(sizeof(IndexAddParams) == 40, "IndexAddParams layout");
 static_assert(alignof(IndexAddParams) == 8, "IndexAddParams alignment");
 
 // The offset is taken from a real `thread` instance rather than the usual
@@ -478,34 +480,30 @@ static_assert(alignof(IndexAddParams) == 8, "IndexAddParams alignment");
 
     out[0]  = sizeof(IndexParams);
     out[1]  = offsetof_rt(IndexParams, dst_size);
-    out[2]  = offsetof_rt(IndexParams, left_size);
-    out[3]  = offsetof_rt(IndexParams, src_dim_size);
-    out[4]  = offsetof_rt(IndexParams, right_size);
-    out[5]  = offsetof_rt(IndexParams, ids_size);
-    out[6]  = offsetof_rt(IndexParams, contiguous);
-    out[7]  = offsetof_rt(IndexParams, src_num_dims);
+    out[2]  = offsetof_rt(IndexParams, src_dim_size);
+    out[3]  = offsetof_rt(IndexParams, right_size);
+    out[4]  = offsetof_rt(IndexParams, ids_size);
+    out[5]  = offsetof_rt(IndexParams, contiguous);
+    out[6]  = offsetof_rt(IndexParams, src_num_dims);
 
-    out[8]  = sizeof(GatherParams);
-    out[9]  = offsetof_rt(GatherParams, dst_size);
-    out[10] = offsetof_rt(GatherParams, left_size);
-    out[11] = offsetof_rt(GatherParams, src_dim_size);
-    out[12] = offsetof_rt(GatherParams, right_size);
-    out[13] = offsetof_rt(GatherParams, ids_size);
+    out[7]  = sizeof(GatherParams);
+    out[8]  = offsetof_rt(GatherParams, dst_size);
+    out[9]  = offsetof_rt(GatherParams, src_dim_size);
+    out[10] = offsetof_rt(GatherParams, right_size);
+    out[11] = offsetof_rt(GatherParams, ids_size);
 
-    out[14] = sizeof(ScatterParams);
-    out[15] = offsetof_rt(ScatterParams, dst_size);
-    out[16] = offsetof_rt(ScatterParams, left_size);
-    out[17] = offsetof_rt(ScatterParams, src_dim_size);
-    out[18] = offsetof_rt(ScatterParams, right_size);
-    out[19] = offsetof_rt(ScatterParams, dst_dim_size);
+    out[12] = sizeof(ScatterParams);
+    out[13] = offsetof_rt(ScatterParams, dst_size);
+    out[14] = offsetof_rt(ScatterParams, src_dim_size);
+    out[15] = offsetof_rt(ScatterParams, right_size);
+    out[16] = offsetof_rt(ScatterParams, dst_dim_size);
 
-    out[20] = sizeof(IndexAddParams);
-    out[21] = offsetof_rt(IndexAddParams, dst_size);
-    out[22] = offsetof_rt(IndexAddParams, left_size);
-    out[23] = offsetof_rt(IndexAddParams, src_dim_size);
-    out[24] = offsetof_rt(IndexAddParams, right_size);
-    out[25] = offsetof_rt(IndexAddParams, dst_dim_size);
-    out[26] = offsetof_rt(IndexAddParams, ids_dim_size);
+    out[17] = sizeof(IndexAddParams);
+    out[18] = offsetof_rt(IndexAddParams, dst_size);
+    out[19] = offsetof_rt(IndexAddParams, src_dim_size);
+    out[20] = offsetof_rt(IndexAddParams, right_size);
+    out[21] = offsetof_rt(IndexAddParams, dst_dim_size);
+    out[22] = offsetof_rt(IndexAddParams, ids_dim_size);
 }
 
 // Explicit instantiation. `decltype(func<...>)` restates the template's own

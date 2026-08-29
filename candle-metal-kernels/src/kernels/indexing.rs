@@ -26,7 +26,7 @@ const INDEX_ADD_PARAMS_ALIGN: usize = core::mem::align_of::<IndexAddParams>();
 // A note on widths, since #38 found a latent mismatch of exactly this kind in
 // `reduce.metal`'s callers and predicted it in the remaining files.
 //
-// `indexing.metal` declares 29 `constant size_t &` -- 8 bytes -- and one
+// `indexing.metal` declares 24 `constant size_t &` -- 8 bytes -- and one
 // `constant bool &`. Every `call_*` below binds a `usize` (8) or a `bool`
 // respectively, so the mismatch #38 describes (a `usize` bound to a
 // `constant uint &`, benign under `setBytes` because it writes 8 bytes and a
@@ -38,6 +38,20 @@ const INDEX_ADD_PARAMS_ALIGN: usize = core::mem::align_of::<IndexAddParams>();
 // points passes `()` for an optional buffer, so nothing here binds nothing
 // while consuming no slot -- the failure that shifts every later binding one
 // slot low and hangs the GPU rather than corrupting silently.
+//
+// # `left_size` is a host-side local and never was a kernel parameter's worth
+//
+// It was 29 `constant size_t &` before #219, and the five it loses are the
+// `left_size` one per kernel. **The name survives in this file** -- four times,
+// as a local -- and that is the finding rather than an oversight: `left_size`
+// is a *factor of the grid extent*, `dst_el`, which the host computes and
+// `linear_split` consumes. The kernel never needed the factor because it is
+// handed the product; every body recovers what it wants from `tid /
+// right_size`, which is why the mutation in §11.3k finding 3 survived.
+//
+// So removing it takes nothing away from the GPU side. The value that was bound
+// is still computed, still used, and still on the host, one line above the call
+// that no longer passes it.
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_index_select(
@@ -148,7 +162,6 @@ pub fn call_index_select_with(
         encoder,
         (
             dst_el,
-            left_size,
             src_dim_size,
             right_size,
             ids_size,
@@ -230,7 +243,6 @@ pub fn call_gather_with(
         encoder,
         (
             dst_el,
-            left_size,
             src_dim_size,
             right_size,
             ids_size,
@@ -313,7 +325,6 @@ pub fn call_scatter_with(
         encoder,
         (
             dst_el,
-            left_size,
             src_dim_size,
             right_size,
             dst_dim_size,
@@ -395,7 +406,6 @@ pub fn call_index_add_with(
         encoder,
         (
             dst_el,
-            left_size,
             src_dim_size,
             right_size,
             dst_dim_size,
