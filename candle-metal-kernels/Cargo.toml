@@ -21,6 +21,19 @@ debug-labels = []
 # function, following `debug-labels`'s shape, so there is no call to elide and
 # no state to allocate.
 run-telemetry = []
+# Strict ordering verification: reconstruct the dependency graph at runtime and
+# assert every RAW/WAW/WAR edge is covered by a barrier, a fence, or an
+# encoder-session boundary (#185).
+#
+# Composes with a RELEASE build, following `run-telemetry`. Off, every entry
+# point in `metal::hazard_audit` is an empty inline function that drops its
+# arguments, so there is no call to elide and no state to allocate.
+#
+# Diagnostic rather than a gate: §15.1's gates each exist because a specific
+# failure demanded them, and this answers a question the digest gate
+# structurally cannot -- #144 measured a wrong predicate leaving both canonical
+# digest pairs byte-identical over three runs.
+hazard-audit = []
 
 [dependencies]
 half = { version = "2.5.0", features = [

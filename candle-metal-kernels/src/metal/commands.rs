@@ -265,6 +265,11 @@ impl Commands {
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).
             crate::metal::trace::record_encoder_begin();
             crate::metal::profile::record_encoder();
+            // The audit needs the seam as a first-class ordering primitive, not
+            // only as context for a count: a cross-session edge is ordered by
+            // `prev_ce_outputs` + `wait_for_buffer` and by no barrier, and #144
+            // found 11 real edges that survive on that alone (issue #185).
+            crate::metal::hazard_audit::record_encoder_begin();
             state_guard.current_encoder = Some(enc);
         }
 

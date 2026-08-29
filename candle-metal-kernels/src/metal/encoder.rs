@@ -653,20 +653,36 @@ impl ComputeCommandEncoder {
         }
     }
 
-    /// Attribute this dispatch to the currently bound pipeline, when profiling.
+    /// Attribute this dispatch to the currently bound pipeline, for the
+    /// profiler and for the hazard audit.
     ///
-    /// Both dispatch entry points funnel through here so the count cannot drift
-    /// from the number of dispatches actually encoded.
+    /// Both dispatch entry points funnel through here so neither consumer's
+    /// count can drift from the number of dispatches actually encoded.
+    ///
+    /// **The two consumers are asked separately, and the profiler's early
+    /// return is deliberately not shared.** Folding the audit in behind
+    /// `profile::enabled()` would make it silently record nothing whenever
+    /// profiling happened to be off -- an instrument reporting a different
+    /// quantity than its name, which §11.3n records live in this very file
+    /// (`record_dispatch`'s own doc comment was falsified by #115 adding
+    /// suppression without editing it). With the `hazard-audit` feature off,
+    /// `hazard_audit::record_dispatch` is an empty inline function, so the
+    /// separation costs nothing.
     #[inline]
     fn record_dispatch(&self) {
-        if !crate::metal::profile::enabled() {
+        let profiling = crate::metal::profile::enabled();
+        if !profiling && !cfg!(feature = "hazard-audit") {
             return;
         }
         let name = {
             let s = self.state.lock().unwrap();
             s.current_pipeline.clone()
         };
-        crate::metal::profile::record_dispatch(name.as_deref().unwrap_or("<unnamed>"));
+        let name = name.as_deref().unwrap_or("<unnamed>");
+        if profiling {
+            crate::metal::profile::record_dispatch(name);
+        }
+        crate::metal::hazard_audit::record_dispatch(name);
     }
 
     fn auto_barrier(&self) {
@@ -725,6 +741,11 @@ impl ComputeCommandEncoder {
                 // keeping the latch would attribute the eventual emission to
                 // only the directions seen after this point (issue #185).
                 trace::record_barrier_suppressed();
+                // The audit must know a barrier was *not* emitted here: a
+                // suppressed barrier is not a surviving fence, and whether the
+                // ICB's `setBarrier` and the session seams cover what it would
+                // have ordered is the whole question #144 poses (issue #185).
+                crate::metal::hazard_audit::record_barrier_suppressed();
                 return;
             }
             self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
@@ -737,8 +758,10 @@ impl ComputeCommandEncoder {
             // (issue #185): which directions this barrier is *for* is known here
             // and nowhere downstream, because `prev_*` is replaced two lines
             // below and the evidence is gone.
-            trace::record_barrier_kinds(s.pending_kinds.take());
+            let kinds = s.pending_kinds.take();
+            trace::record_barrier_kinds(kinds);
             trace::record_barrier();
+            crate::metal::hazard_audit::record_barrier(kinds);
             s.needs_barrier = false;
             // Replaced, not extended: everything bound before the barrier is
             // now ordered against everything after it.
@@ -796,6 +819,7 @@ impl ComputeCommandEncoder {
                 s.pending_kinds.merge(kinds);
             }
             s.next_inputs.insert(key, range);
+            crate::metal::hazard_audit::record_binding(&range, false);
             s.all_inputs.insert(ptr);
             drop(s);
             if !self.executor.is_classical() {
@@ -831,6 +855,7 @@ impl ComputeCommandEncoder {
                 s.pending_kinds.merge(kinds);
             }
             s.next_outputs.insert(key, range);
+            crate::metal::hazard_audit::record_binding(&range, true);
             s.all_outputs.insert(ptr);
             drop(s);
             if !self.executor.is_classical() {
