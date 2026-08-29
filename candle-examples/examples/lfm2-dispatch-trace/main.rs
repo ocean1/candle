@@ -222,6 +222,24 @@ struct Args {
     /// that replayed zero dispatches.
     #[arg(long)]
     icb: bool,
+
+    /// Exit non-zero unless the `metal-hazard-audit` feature reached this
+    /// binary (issue #185).
+    ///
+    /// **An unused feature flag reads exactly like a correct one.** §9.5l
+    /// finding 5 is the worked case one crate over: admission compiled to its
+    /// non-Metal stub in every harness because `candle-examples`' `metal`
+    /// feature did not enable `candle-transformers/metal`, and nothing said so.
+    /// #205 exists because `metal-run-telemetry` stops at `candle-core` and was
+    /// therefore never reachable from any example.
+    ///
+    /// So the propagation is asserted by a **run**, not by reading four
+    /// `Cargo.toml` files and believing them. `cfg!` is evaluated in *this*
+    /// crate, so a `true` here means the chain
+    /// `candle-examples -> candle -> candle-metal-kernels` resolved -- which is
+    /// exactly the link that was missing.
+    #[arg(long)]
+    assert_hazard_audit: bool,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -450,6 +468,28 @@ fn render(step: &Step) -> String {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Before anything that needs a model or a GPU: did the feature arrive?
+    // Checked first so the answer costs nothing and cannot be confused with a
+    // load failure (issue #185).
+    if args.assert_hazard_audit {
+        let reached = cfg!(feature = "metal-hazard-audit");
+        println!(
+            "metal-hazard-audit reached candle-examples: {}",
+            if reached { "YES" } else { "NO" }
+        );
+        if !reached {
+            anyhow::bail!(
+                "the `metal-hazard-audit` feature did not reach this binary.\n\
+                 Build with:  cargo build --release --features metal,metal-hazard-audit \
+                 --example lfm2-dispatch-trace\n\
+                 If it was already in the command line, the propagation chain is \
+                 broken in a Cargo.toml -- which is #205's defect, and the reason \
+                 this flag exists rather than a comment claiming the wiring is right."
+            );
+        }
+        return Ok(());
+    }
 
     if !trace::trace_requested() {
         anyhow::bail!(
