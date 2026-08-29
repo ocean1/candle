@@ -110,15 +110,29 @@ metal = [
     "dep:candle-metal-kernels",
 ]
 metal-debug-labels = ["metal", "candle/metal-debug-labels", "candle-nn/metal-debug-labels", "candle-transformers/metal-debug-labels"]
-# Strict ordering verification (#185). Wired through all four crates
-# deliberately, following `metal-debug-labels` above rather than
-# `metal-run-telemetry` -- which #205 is fixing precisely because it stops at
-# `candle-core` and so was never reachable from any harness here. An unused
-# feature flag reads exactly like a correct one, so this is asserted by a test
-# rather than by this line: see `examples/lfm2-dispatch-trace`'s
-# `--assert-hazard-audit`, which exits non-zero when the feature it names did
-# not reach the binary.
-metal-hazard-audit = ["metal", "candle/metal-hazard-audit", "candle-nn/metal-hazard-audit", "candle-transformers/metal-hazard-audit"]
+# Strict ordering verification (#185, `DESIGN.md` §11.3t), reachable from a
+# harness because this line exists -- #205's defect, avoided rather than
+# repeated.
+#
+# **Only `candle` is named, and that is the whole propagation.** The first
+# version of this line named `candle-nn` and `candle-transformers` too, by
+# symmetry with `metal-debug-labels` above; #205 landed the rule that corrects
+# it, and it was checked here rather than accepted on authority.
+# `grep -rn 'feature = "hazard-audit"'` over the tree hits
+# `candle-metal-kernels` **30 times and no other crate**, so those two names
+# would have propagated to no gated code -- exactly the shape #205 counted for
+# `metal-debug-labels`, whose `#[cfg]` sites are 6 in `candle-core`, 10 in
+# `candle-metal-kernels` and **0** in each of the two it also names.
+#
+# The rule is per-feature and mechanical: **name the crate that gates code on
+# it, found by grep, not the crate a sibling feature happens to name.**
+#
+# The reach is `candle/metal-hazard-audit` -> `candle-metal-kernels/hazard-audit`,
+# and it is asserted by a **run** rather than by this comment:
+# `lfm2-dispatch-trace --assert-hazard-audit` evaluates `cfg!` in this crate and
+# exits non-zero when the feature did not arrive. An unused feature flag reads
+# exactly like a correct one (§9.5l finding 5).
+metal-hazard-audit = ["metal", "candle/metal-hazard-audit"]
 microphone = ["cpal", "rubato"]
 encodec = ["cpal", "symphonia", "rubato"]
 mimi = ["cpal", "symphonia", "rubato"]
