@@ -4,6 +4,7 @@ pub const BINARY: &str = include_str!("metal_src/binary.metal");
 pub const CAST: &str = include_str!("metal_src/cast.metal");
 pub const CONV: &str = include_str!("metal_src/conv.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
+pub const FLASH_DECODING: &str = include_str!("metal_src/flash_decoding.metal");
 pub const INDEXING: &str = include_str!("metal_src/indexing.metal");
 pub const GEMV: &str = include_str!("metal_src/gemv.metal");
 pub const MLX_GEMM: &str = include_str!("metal_src/mlx_gemm.metal");
@@ -27,6 +28,12 @@ pub enum Source {
     Cast,
     Conv,
     Fill,
+    /// FlashDecoding: attention split over independent contiguous KV chunks,
+    /// with an index-ordered combine (`DESIGN.md` §10.4, §17 Phase 5 item 16,
+    /// issue #116). A **new** kernel rather than a rewiring of
+    /// `sdpa_vector_2pass`, whose blocks read a strided interleave at a fixed
+    /// count of 32 and therefore do not own a contiguous range (§10.3b).
+    FlashDecoding,
     Gemm,
     Gemv,
     Indexing,

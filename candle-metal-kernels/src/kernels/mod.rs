@@ -6,6 +6,7 @@ pub mod conv_names;
 pub mod convolution;
 pub mod elementwise_names;
 pub mod fill;
+pub mod flash_decoding;
 pub mod indexing;
 pub mod indexing_names;
 mod macros;
@@ -35,6 +36,9 @@ pub use cast::{
 pub use conv_names::ConvKernel;
 pub use convolution::*;
 pub use fill::*;
+pub use flash_decoding::{
+    call_flash_decoding, flash_chunk_count, ChunkTable, FlashDType, FlashKernel, FLASH_HEAD_DIMS,
+};
 pub use indexing::*;
 pub use indexing_names::IndexingKernel;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_with, GemmDType};

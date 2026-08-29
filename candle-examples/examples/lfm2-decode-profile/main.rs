@@ -522,6 +522,26 @@ struct Args {
     #[arg(long, default_value = "generic")]
     attn: String,
 
+    /// KV tokens per page for `--attn flash` — the **allocation** granularity.
+    ///
+    /// §10.4 proposes 256 and marks it **UNVERIFIED**. A flag rather than a
+    /// constant because §10.3d establishes page size as two dispatch-tier
+    /// numbers, so 16, 256 and 1024 are one field apart — which is what
+    /// *"must not foreclose it"* requires. Verifying which wins is #61's axis.
+    #[arg(long, default_value_t = 256)]
+    flash_page_size: usize,
+
+    /// Pages per chunk for `--attn flash` — the `k` of
+    /// `chunk_size = k * page_size`.
+    ///
+    /// §10.4 fixes the page and the chunk equal **by fiat**; §9.1d records that
+    /// a page (allocation) and a tile (computation) are optimised against
+    /// disjoint cost functions, so **a sweep holding `k = 1` cannot separate a
+    /// page-size effect from a tile-size one**. 1 is what §10.4 specifies; the
+    /// flag is what makes the two separable.
+    #[arg(long, default_value_t = 1)]
+    flash_k: usize,
+
     /// KV cache growth: `cat` (the default `Tensor::cat` reallocation) or
     /// `in-place` (pre-allocated, written at a moving offset -- issue #142).
     #[arg(long, default_value = "cat")]
@@ -744,8 +764,14 @@ fn main() -> Result<()> {
     config.attn_impl = match args.attn.as_str() {
         "generic" => candle_transformers::models::lfm2::AttnImpl::Generic,
         "sdpa" => candle_transformers::models::lfm2::AttnImpl::Sdpa,
-        other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
+        // Issue #116. Selectable and never a default: 10.4's argument for it
+        // is structural rather than measured, and the kv_len at which it pays
+        // is #61's to find.
+        "flash" => candle_transformers::models::lfm2::AttnImpl::FlashDecoding,
+        other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
+    config.flash_page_size = args.flash_page_size;
+    config.flash_pages_per_chunk = args.flash_k;
     // Refused rather than defaulted, for the same reason as `--attn`.
     config.kv_append = match args.kv_append.as_str() {
         "cat" => candle_transformers::models::lfm2::KvAppend::Cat,

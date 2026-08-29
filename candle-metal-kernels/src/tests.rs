@@ -2613,7 +2613,10 @@ fn residency_set_keys_views_to_their_parent() {
     // Two disjoint views over the same allocation.
     let a = parent.view(0, 16);
     let b = parent.view(16, 16);
-    assert!(set.contains(&a), "a view must resolve to its parent's entry");
+    assert!(
+        set.contains(&a),
+        "a view must resolve to its parent's entry"
+    );
     assert!(set.contains(&b));
 
     // Inserting a view adds nothing: the allocation is already there.
@@ -5277,6 +5280,13 @@ fn every_family_params_layout_matches_metal() {
         ("conv.metal", 65),
         ("indexing.metal", 27),
         ("scaled_dot_product_attention.metal", 7),
+        // Added by #116 (`DESIGN.md` §10.4a) — a deliberate addition, which is
+        // what this list requires. **16 slots for two structs in one file**:
+        // `flash_decoding.metal` defines both `FlashPartialParams` (13 slots:
+        // a `sizeof` and twelve fields) and `FlashCombineParams` (3), and one
+        // layout kernel reports both because a layout kernel can only see the
+        // structs its own file defines.
+        ("flash_decoding.metal", 16),
     ];
 
     let mut failures = Vec::new();
@@ -5354,6 +5364,7 @@ fn layout_registry_covers_every_family() {
             LayoutFamily::Conv => "conv",
             LayoutFamily::Indexing => "indexing",
             LayoutFamily::Sdpa => "sdpa",
+            LayoutFamily::Flash => "flash_decoding",
         }
     }
 
@@ -5367,6 +5378,7 @@ fn layout_registry_covers_every_family() {
         LayoutFamily::Conv,
         LayoutFamily::Indexing,
         LayoutFamily::Sdpa,
+        LayoutFamily::Flash,
     ];
 
     for family in expected {

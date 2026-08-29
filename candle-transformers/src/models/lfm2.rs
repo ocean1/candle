@@ -110,6 +110,8 @@ impl Lfm2Config {
             eos_token_id: self.eos_token_id,
             use_flash_attn,
             attn_impl: AttnImpl::default(),
+            flash_page_size: 256,
+            flash_pages_per_chunk: 1,
             kv_append: KvAppend::default(),
             conv_state: ConvState::default(),
             // §9.5's admission is off unless a caller asks for it, per §7.1a.
@@ -314,6 +316,23 @@ pub enum AttnImpl {
     /// Metal only, and only for `seq_len == 1`; every other case falls back to
     /// `Generic` rather than failing, so this is safe to set unconditionally.
     Sdpa,
+    /// FlashDecoding: attention split over independent contiguous KV chunks,
+    /// with an index-ordered combine (`DESIGN.md` §10.4, issue #116).
+    ///
+    /// **A selectable arm and not a replacement.** §10.4's argument for it is
+    /// *structural* rather than measured — at B=1 attention with one
+    /// threadgroup per head is 32 threadgroups on a GPU wanting hundreds, and
+    /// splitting KV *manufactures* parallelism — and the `kv_len` at which that
+    /// starts to pay is **unmeasured**, because every measurement in this
+    /// project is below the 2720 ceiling. #61's context curve is what decides
+    /// the crossover, and keeping this an arm is what lets it: #71 is the
+    /// precedent for the alternative, where three scratch sizing policies were
+    /// compiled and **none chosen**, because the axis that separates them could
+    /// not be exercised.
+    ///
+    /// Metal only, `seq_len == 1` only, f16/f32 only. Falls back to `Generic`
+    /// on any other case, as `Sdpa` does.
+    FlashDecoding,
 }
 
 /// How the KV cache grows as decode appends a token.
@@ -417,6 +436,27 @@ pub struct Config {
     /// Defaults to `Generic`, so `into_config` and every existing caller keep
     /// the path they had without naming it.
     pub attn_impl: AttnImpl,
+    /// KV tokens per **page** — the allocation granularity — for
+    /// `AttnImpl::FlashDecoding`.
+    ///
+    /// §10.4 proposes **256** and marks it **UNVERIFIED**. It is a field rather
+    /// than a constant for exactly that reason: §10.3d establishes that page
+    /// size enters as two dispatch-tier numbers, so 16, 256 and 1024 are one
+    /// field apart, which is what *"must not foreclose it"* requires. Verifying
+    /// which wins is #61's axis and is not done here.
+    pub flash_page_size: usize,
+    /// Pages per **chunk** — the `k` of `chunk_size = k * page_size`.
+    ///
+    /// §10.4 fixes the page and the chunk to one granularity **by fiat**;
+    /// §9.1d establishes the general form and that a page (allocation) and a
+    /// tile (computation) are optimised against disjoint cost functions — a
+    /// page wants to be small and a tile wants to be large enough to fill the
+    /// machine. **A sweep holding `k = 1` cannot separate a page-size effect
+    /// from a tile-size one**, which is what makes this a field.
+    ///
+    /// 1, which is what §10.4 specifies. What is new is that it is a *stated*
+    /// value on a selectable axis rather than an equality welded into a kernel.
+    pub flash_pages_per_chunk: usize,
     /// Defaults to `Cat`, for the same reason `attn_impl` defaults to `Generic`.
     pub kv_append: KvAppend,
     /// Defaults to `Shuffle`, so every existing caller keeps §6.1's path.
@@ -1153,6 +1193,8 @@ struct Attention {
     head_dim: usize,
     use_flash_attn: bool,
     attn_impl: AttnImpl,
+    flash_page_size: usize,
+    flash_pages_per_chunk: usize,
     span: tracing::Span,
     span_rot: tracing::Span,
 }
@@ -1188,6 +1230,8 @@ impl Attention {
             head_dim,
             use_flash_attn: cfg.use_flash_attn,
             attn_impl: cfg.attn_impl,
+            flash_page_size: cfg.flash_page_size,
+            flash_pages_per_chunk: cfg.flash_pages_per_chunk,
             span: tracing::span!(tracing::Level::TRACE, "attn"),
             span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
         })
@@ -1213,6 +1257,22 @@ impl Attention {
             && q.device().is_metal()
             && seq_len == 1
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
+    }
+
+    /// Whether this call can take the FlashDecoding kernels (issue #116).
+    ///
+    /// The same shape as `sdpa_applies`, and every condition is one
+    /// `ops::flash_decoding` would otherwise `bail!` on — so a false here is a
+    /// fallback and never a failure. `BF16` is absent where `sdpa_applies`
+    /// allows it: `flash_decoding.metal` does not instantiate `bfloat`, because
+    /// reaching it needs the ~500-line `_MLX_BFloat16` shim
+    /// `scaled_dot_product_attention.metal` carries, and **LFM2 ships BF16 on
+    /// disk and decode runs F16** (§9.1b).
+    fn flash_decoding_applies(&self, q: &Tensor, seq_len: usize) -> bool {
+        self.attn_impl == AttnImpl::FlashDecoding
+            && q.device().is_metal()
+            && seq_len == 1
+            && matches!(q.dtype(), DType::F16 | DType::F32)
     }
 
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
@@ -1299,7 +1359,26 @@ impl Attention {
         // the F32 upcast below are not merely unnecessary, they are the two
         // things being removed (`DESIGN.md` §6.2, §8.1 principle 4). Both
         // therefore have to stay *inside* the arm that needs them.
-        let y = if self.sdpa_applies(&q, seq_len) {
+        let y = if self.flash_decoding_applies(&q, seq_len) {
+            // Chunked attention over the contiguous cache. `page_size` is the
+            // ALLOCATION granularity and `pages_per_chunk` the `k` of
+            // `chunk_size = k * page_size` (§9.1d); both come from the config
+            // rather than being constants here, so a sweep can move either.
+            //
+            // §10.4 proposes page size 256 and marks it **UNVERIFIED**. It is
+            // still unverified: this issue makes it a field one flag apart
+            // rather than measuring it, because the axis that would decide it
+            // is `kv_len` and that is #61's.
+            candle_nn::ops::flash_decoding(
+                &q,
+                &k,
+                &v,
+                1f32 / (self.head_dim as f32).sqrt(),
+                1.0,
+                self.flash_page_size,
+                self.flash_pages_per_chunk,
+            )?
+        } else if self.sdpa_applies(&q, seq_len) {
             // Scale is applied to `q` inside the kernel before the dot product,
             // matching `att / sqrt(head_dim)` below. No mask: `seq_len == 1`
             // attends to the whole cache, which is the same reason the generic

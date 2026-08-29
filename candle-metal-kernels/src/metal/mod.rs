@@ -22,6 +22,8 @@ pub mod executor;
 #[cfg(test)]
 mod executor_tests;
 pub mod fence;
+#[cfg(test)]
+mod flash_decoding_tests;
 pub mod icb;
 #[cfg(test)]
 mod icb_executor_tests;
