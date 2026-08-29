@@ -24,9 +24,9 @@
 //! 1.1 % of the pool at B=1 and deferred to B≥4 (§10.3i) — not to get them. The
 //! chain is `#150 → #116`, and `#157 → #148`.
 
+use crate::kernel::KernelName;
 use crate::kernels::params::{FlashCombineParams, FlashPartialParams};
 use crate::utils::EncoderProvider;
-use crate::kernel::KernelName;
 use crate::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
     Output, Source,
@@ -93,11 +93,7 @@ impl FlashKernel {
         Self::name("flash_decoding_combine", dtype, head_dim)
     }
 
-    fn name(
-        stem: &str,
-        dtype: FlashDType,
-        head_dim: usize,
-    ) -> Result<String, MetalKernelError> {
+    fn name(stem: &str, dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
         if !FLASH_HEAD_DIMS.contains(&head_dim) {
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
                 variation: "flash_decoding",
@@ -316,7 +312,8 @@ pub fn call_flash_decoding(
     // Pass 1 -- partials.
     {
         let name = FlashKernel::partial(itype, head_dim)?;
-        let pipeline = kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+        let pipeline =
+            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
@@ -360,11 +357,15 @@ pub fn call_flash_decoding(
     // Pass 2 -- the index-ordered combine.
     {
         let name = FlashKernel::combine(itype, head_dim)?;
-        let pipeline = kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+        let pipeline =
+            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        debug_group!(encoder, "flash_decoding combine hd={head_dim} chunks={n_chunks}");
+        debug_group!(
+            encoder,
+            "flash_decoding combine hd={head_dim} chunks={n_chunks}"
+        );
 
         set_params!(
             encoder,

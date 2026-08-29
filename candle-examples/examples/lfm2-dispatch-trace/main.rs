@@ -470,7 +470,9 @@ fn main() -> Result<()> {
     config.attn_impl = match args.attn.as_str() {
         "generic" => AttnImpl::Generic,
         "sdpa" => AttnImpl::Sdpa,
-        other => anyhow::bail!("--attn must be `generic` or `sdpa`, got `{other}`"),
+        // Issue #116.
+        "flash" => AttnImpl::FlashDecoding,
+        other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);

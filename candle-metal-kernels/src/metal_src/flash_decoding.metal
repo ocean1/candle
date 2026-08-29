@@ -208,13 +208,20 @@ template <typename T, int D>
   // separately here, which is the loop this shape leaves room for.
   const uint first_page = chunk_table[chunk_idx];
   const int chunk_start = (int)first_page * page_size;
-  int chunk_end = chunk_start + page_size;
+  int chunk_end = chunk_start + pages_per_chunk * page_size;
   if (chunk_end > n_keys) {
     chunk_end = n_keys;
   }
-  // The last chunk is partial. `n_this_chunk` walks the LIVE count and never
-  // the reserved one -- merging over a full last chunk folds in uninitialised
-  // memory, which §9.1a records as a silent wrong answer no size check catches.
+  // The last chunk is partial, and the clamp above is what walks the LIVE
+  // count rather than the reserved one -- merging over a full last chunk folds
+  // in uninitialised memory, which §9.1a records as a silent wrong answer that
+  // no size check catches.
+  //
+  // The extent is `pages_per_chunk * page_size` and NOT `chunk_size`, though
+  // the two are equal by construction. Deriving it from the two fields the
+  // table is indexed with keeps one source for the range: `chunk_size` is
+  // carried for the descriptor's completeness and a kernel that read it here
+  // could disagree with the table if a caller ever set them inconsistently.
   (void)chunk_size;
 
   thread U q[elem_per_thread];

@@ -1521,12 +1521,7 @@ impl candle::CustomOp3 for FlashDecoding {
         )
         .map_err(candle::Error::wrap)?;
 
-        let newstorage = candle::MetalStorage::new(
-            output,
-            device.clone(),
-            elem_count,
-            q.dtype(),
-        );
+        let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
         Ok((newstorage, out_layout.shape().clone()))
     }
 }

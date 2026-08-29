@@ -414,9 +414,7 @@ fn main() -> Result<()> {
         // is structural rather than measured, and the kv_len at which it pays
         // is #61's to find.
         "flash" => AttnImpl::FlashDecoding,
-        other => anyhow::bail!(
-            "--attn must be `generic`, `sdpa` or `flash`, got `{other}`"
-        ),
+        other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
     config.flash_page_size = args.flash_page_size;
     config.flash_pages_per_chunk = args.flash_k;

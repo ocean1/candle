@@ -27,9 +27,7 @@
 //!    all, since the offline toolchain is not installed on this machine.
 
 use crate::kernels::params::{FlashCombineParams, FlashPartialParams};
-use crate::kernels::{
-    flash_chunk_count, ChunkTable, FlashDType, FlashKernel, FLASH_HEAD_DIMS,
-};
+use crate::kernels::{flash_chunk_count, ChunkTable, FlashDType, FlashKernel, FLASH_HEAD_DIMS};
 use crate::metal::{Commands, ResidencySet};
 use crate::{call_flash_decoding, Device, Kernels, Source};
 use objc2_metal::MTLResourceOptions;
@@ -179,9 +177,7 @@ fn run_flash(
     let q_buf = new_f32(device, queries);
     let k_buf = new_f32(device, keys);
     let v_buf = new_f32(device, values);
-    let out = device
-        .new_buffer(n_q_heads * head_dim * 4, SHARED)
-        .unwrap();
+    let out = device.new_buffer(n_q_heads * head_dim * 4, SHARED).unwrap();
     let partials = device
         .new_buffer(n_q_heads * n_chunks * head_dim * 4, SHARED)
         .unwrap();
@@ -195,7 +191,12 @@ fn run_flash(
     // `[b, n_kv, capacity, head_dim]`: index 1 is the head stride (the RESERVED
     // capacity) and index 2 is the token stride. Those being different numbers
     // is what lets a pre-allocated cache be read without a copy (§10.3b).
-    let k_stride = [n_kv_heads * capacity * head_dim, capacity * head_dim, head_dim, 1];
+    let k_stride = [
+        n_kv_heads * capacity * head_dim,
+        capacity * head_dim,
+        head_dim,
+        1,
+    ];
 
     let pp = write_struct(
         device,
@@ -257,7 +258,9 @@ fn flash_names_resolve() {
     for name in FlashKernel::all() {
         kernels
             .load_pipeline(&device, Source::FlashDecoding, name.clone())
-            .unwrap_or_else(|e| panic!("{name} does not resolve against flash_decoding.metal: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("{name} does not resolve against flash_decoding.metal: {e}")
+            });
     }
 }
 
@@ -362,15 +365,43 @@ fn flash_is_invariant_to_the_chunk_count() {
     let values = fill(n_kv_heads * capacity * head_dim, 9);
 
     let single = run_flash(
-        &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim, capacity,
-        n_keys, 256, 1, scale, &ChunkTable::Contiguous,
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        256,
+        1,
+        scale,
+        &ChunkTable::Contiguous,
     );
-    assert_eq!(flash_chunk_count(n_keys, 256), 1, "the degenerate arm must be one chunk");
+    assert_eq!(
+        flash_chunk_count(n_keys, 256),
+        1,
+        "the degenerate arm must be one chunk"
+    );
 
     for &page_size in &[128usize, 64, 32] {
         let split = run_flash(
-            &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim,
-            capacity, n_keys, page_size, 1, scale, &ChunkTable::Contiguous,
+            &device,
+            &kernels,
+            &queries,
+            &keys,
+            &values,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            capacity,
+            n_keys,
+            page_size,
+            1,
+            scale,
+            &ChunkTable::Contiguous,
         );
         let mut worst = 0f32;
         for (a, b) in single.iter().zip(split.iter()) {
@@ -413,13 +444,37 @@ fn flash_k_greater_than_one_agrees_with_k_one() {
 
     // k = 1 at page 64: chunk_size 64.
     let k1 = run_flash(
-        &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim, capacity,
-        n_keys, 64, 1, scale, &ChunkTable::Contiguous,
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        64,
+        1,
+        scale,
+        &ChunkTable::Contiguous,
     );
     // k = 2 at page 32: chunk_size 64, from two pages.
     let k2 = run_flash(
-        &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim, capacity,
-        n_keys, 32, 2, scale, &ChunkTable::Contiguous,
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        32,
+        2,
+        scale,
+        &ChunkTable::Contiguous,
     );
 
     let mut worst = 0f32;
@@ -472,12 +527,34 @@ fn permuted_chunk_table_is_read_by_index_not_by_walk() {
 
     // The two arms differ ONLY in the table.
     let identity = run_partials(
-        &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim, capacity,
-        n_keys, page_size, scale, &ChunkTable::Contiguous,
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        scale,
+        &ChunkTable::Contiguous,
     );
     let permuted = run_partials(
-        &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim, capacity,
-        n_keys, page_size, scale, &ChunkTable::Explicit(vec![1, 0]),
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        scale,
+        &ChunkTable::Explicit(vec![1, 0]),
     );
 
     // Under a permuted table, chunk 0's partial must be what chunk 1's was, and
@@ -494,12 +571,14 @@ fn permuted_chunk_table_is_read_by_index_not_by_walk() {
     );
     for h in 0..n_q_heads {
         assert_eq!(
-            perm_maxs[h * 2], id_maxs[h * 2 + 1],
+            perm_maxs[h * 2],
+            id_maxs[h * 2 + 1],
             "head {h}: chunk 0 under the permuted table must read what chunk 1 read under the \
              identity -- it did not, so the table was WALKED rather than INDEXED"
         );
         assert_eq!(
-            perm_maxs[h * 2 + 1], id_maxs[h * 2],
+            perm_maxs[h * 2 + 1],
+            id_maxs[h * 2],
             "head {h}: chunk 1 under the permuted table must read what chunk 0 read under the \
              identity"
         );
@@ -541,7 +620,12 @@ fn run_partials(
 
     let q_shape = [1usize, n_q_heads, 1, head_dim];
     let k_shape = [1usize, n_kv_heads, n_keys, head_dim];
-    let k_stride = [n_kv_heads * capacity * head_dim, capacity * head_dim, head_dim, 1];
+    let k_stride = [
+        n_kv_heads * capacity * head_dim,
+        capacity * head_dim,
+        head_dim,
+        1,
+    ];
 
     let pp = write_struct(
         device,
@@ -554,8 +638,27 @@ fn run_partials(
     {
         let guard = cmds.command_encoder().unwrap();
         call_flash_decoding(
-            device, &guard, kernels, 0, &q_buf, 0, &k_buf, 0, &v_buf, &out, &partials, &sums,
-            &maxs, &table_buf, &pp, &cp, &walk, n_q_heads, head_dim, n_chunks, FlashDType::F32,
+            device,
+            &guard,
+            kernels,
+            0,
+            &q_buf,
+            0,
+            &k_buf,
+            0,
+            &v_buf,
+            &out,
+            &partials,
+            &sums,
+            &maxs,
+            &table_buf,
+            &pp,
+            &cp,
+            &walk,
+            n_q_heads,
+            head_dim,
+            n_chunks,
+            FlashDType::F32,
         )
         .unwrap();
     }
@@ -598,24 +701,47 @@ fn flash_is_bit_stable_across_runs() {
     assert_eq!(flash_chunk_count(n_keys, page_size), 11);
 
     let first = run_flash(
-        &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim, capacity,
-        n_keys, page_size, 1, scale, &ChunkTable::Contiguous,
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        1,
+        scale,
+        &ChunkTable::Contiguous,
     );
     for run in 1..5 {
         let again = run_flash(
-            &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim,
-            capacity, n_keys, page_size, 1, scale, &ChunkTable::Contiguous,
+            &device,
+            &kernels,
+            &queries,
+            &keys,
+            &values,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            capacity,
+            n_keys,
+            page_size,
+            1,
+            scale,
+            &ChunkTable::Contiguous,
         );
         assert_eq!(
-            first, again,
+            first,
+            again,
             "run {run} differs from run 0 at kv_len={n_keys}, {} chunks -- a merge whose order \
              depends on completion is the first thing to suspect (DESIGN.md 10.4)",
             flash_chunk_count(n_keys, page_size)
         );
     }
 }
-
-
 
 /// **The token stride is read from the parameter, not assumed to be
 /// `head_dim`.**
@@ -663,8 +789,10 @@ fn token_stride_is_read_from_the_parameter() {
     for h in 0..n_kv_heads {
         for t in 0..capacity {
             for d in 0..head_dim {
-                padded_k[h * capacity * row + t * row + d] = tight_k[h * capacity * head_dim + t * head_dim + d];
-                padded_v[h * capacity * row + t * row + d] = tight_v[h * capacity * head_dim + t * head_dim + d];
+                padded_k[h * capacity * row + t * row + d] =
+                    tight_k[h * capacity * head_dim + t * head_dim + d];
+                padded_v[h * capacity * row + t * row + d] =
+                    tight_v[h * capacity * head_dim + t * head_dim + d];
             }
         }
     }
@@ -699,8 +827,27 @@ fn token_stride_is_read_from_the_parameter() {
     {
         let guard = cmds.command_encoder().unwrap();
         call_flash_decoding(
-            &device, &guard, &kernels, 0, &q_buf, 0, &k_buf, 0, &v_buf, &out, &partials, &sums,
-            &maxs, &table_buf, &pp, &cp, &walk, n_q_heads, head_dim, n_chunks, FlashDType::F32,
+            &device,
+            &guard,
+            &kernels,
+            0,
+            &q_buf,
+            0,
+            &k_buf,
+            0,
+            &v_buf,
+            &out,
+            &partials,
+            &sums,
+            &maxs,
+            &table_buf,
+            &pp,
+            &cp,
+            &walk,
+            n_q_heads,
+            head_dim,
+            n_chunks,
+            FlashDType::F32,
         )
         .unwrap();
     }
@@ -761,7 +908,10 @@ fn combine_walks_chunks_in_ascending_index_order() {
     let keys = fill(n_kv_heads * capacity * head_dim, 42);
     let values = fill(n_kv_heads * capacity * head_dim, 43);
     let n_chunks = flash_chunk_count(n_keys, page_size);
-    assert!(n_chunks > 2, "a one- or two-chunk fixture cannot show an order");
+    assert!(
+        n_chunks > 2,
+        "a one- or two-chunk fixture cannot show an order"
+    );
 
     let walked = walk_order_of(
         &device, &kernels, &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim, capacity,
@@ -772,7 +922,8 @@ fn combine_walks_chunks_in_ascending_index_order() {
     for h in 0..n_q_heads {
         let got = &walked[h * n_chunks..(h + 1) * n_chunks];
         assert_eq!(
-            got, &expected[..],
+            got,
+            &expected[..],
             "head {h} walked {got:?} where 10.4 requires ascending index order {expected:?}"
         );
     }
@@ -814,7 +965,12 @@ fn walk_order_of(
 
     let q_shape = [1usize, n_q_heads, 1, head_dim];
     let k_shape = [1usize, n_kv_heads, n_keys, head_dim];
-    let k_stride = [n_kv_heads * capacity * head_dim, capacity * head_dim, head_dim, 1];
+    let k_stride = [
+        n_kv_heads * capacity * head_dim,
+        capacity * head_dim,
+        head_dim,
+        1,
+    ];
 
     let pp = write_struct(
         device,
@@ -827,8 +983,27 @@ fn walk_order_of(
     {
         let guard = cmds.command_encoder().unwrap();
         call_flash_decoding(
-            device, &guard, kernels, 0, &q_buf, 0, &k_buf, 0, &v_buf, &out, &partials, &sums,
-            &maxs, &table_buf, &pp, &cp, &walk, n_q_heads, head_dim, n_chunks, FlashDType::F32,
+            device,
+            &guard,
+            kernels,
+            0,
+            &q_buf,
+            0,
+            &k_buf,
+            0,
+            &v_buf,
+            &out,
+            &partials,
+            &sums,
+            &maxs,
+            &table_buf,
+            &pp,
+            &cp,
+            &walk,
+            n_q_heads,
+            head_dim,
+            n_chunks,
+            FlashDType::F32,
         )
         .unwrap();
     }

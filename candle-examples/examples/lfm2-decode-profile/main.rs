@@ -768,9 +768,7 @@ fn main() -> Result<()> {
         // is structural rather than measured, and the kv_len at which it pays
         // is #61's to find.
         "flash" => candle_transformers::models::lfm2::AttnImpl::FlashDecoding,
-        other => anyhow::bail!(
-            "--attn must be `generic`, `sdpa` or `flash`, got `{other}`"
-        ),
+        other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
     config.flash_page_size = args.flash_page_size;
     config.flash_pages_per_chunk = args.flash_k;
@@ -1319,15 +1317,17 @@ fn main() -> Result<()> {
                 .iter()
                 .zip(step_stamps.iter())
                 .enumerate()
-                .map(|(i, ((wall, gpu, disp), (t_end_ns, kv)))| run_record::Step {
-                    index: i,
-                    warmup: i < warmup,
-                    wall_ms: wall * 1e3,
-                    gpu_ms: if profiling { Some(gpu * 1e3) } else { None },
-                    dispatches: if profiling { Some(*disp) } else { None },
-                    t_end_ns: *t_end_ns,
-                    kv_len: *kv,
-                })
+                .map(
+                    |(i, ((wall, gpu, disp), (t_end_ns, kv)))| run_record::Step {
+                        index: i,
+                        warmup: i < warmup,
+                        wall_ms: wall * 1e3,
+                        gpu_ms: if profiling { Some(gpu * 1e3) } else { None },
+                        dispatches: if profiling { Some(*disp) } else { None },
+                        t_end_ns: *t_end_ns,
+                        kv_len: *kv,
+                    },
+                )
                 .collect(),
             telemetry_path: args.telemetry_path.clone(),
         };
