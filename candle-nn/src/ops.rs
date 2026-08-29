@@ -1325,3 +1325,246 @@ pub fn sdpa(
         },
     )
 }
+
+/// FlashDecoding: attention split over independent contiguous KV chunks, with
+/// an index-ordered combine (`DESIGN.md` §10.4, issue #116).
+///
+/// # Why a second op rather than a branch inside [`Sdpa`]
+///
+/// `Sdpa::metal_fwd` already routes to `call_sdpa_vector_2pass` at
+/// `k_seq >= 1024`, so a branch here would read as *"the chunked path, now with
+/// a different chunk count"*. It is not: `sdpa_vector_2pass`'s blocks read a
+/// **strided interleave** at a **fixed count of 32**, so a block owns no
+/// contiguous range and cannot be a page (`DESIGN.md` §10.3b). A separate op
+/// keeps the existing routing untouched — the 2pass path is a legitimate
+/// long-`kv_len` optimisation and this issue does not disturb it — and makes
+/// the arm **selectable** rather than reached by a threshold, which is what
+/// lets #61's context curve decide the crossover instead of a constant deciding
+/// it now.
+#[allow(dead_code)]
+struct FlashDecoding {
+    scale: f32,
+    softcapping: f32,
+    /// KV tokens per page — the **allocation** unit.
+    page_size: usize,
+    /// Pages per chunk: the `k` of `chunk_size = k * page_size`.
+    ///
+    /// §10.4 fixes the page and the chunk to one granularity **by fiat**;
+    /// §9.1d establishes the general form and that the two are optimised
+    /// against disjoint cost functions. Carried so a sweep can separate a
+    /// page-size effect from a tile-size one, which a sweep holding `k = 1`
+    /// cannot.
+    pages_per_chunk: usize,
+}
+
+impl candle::CustomOp3 for FlashDecoding {
+    fn name(&self) -> &'static str {
+        "metal-flash-decoding"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("no cpu support for metal-flash-decoding")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        q: &candle::MetalStorage,
+        q_l: &Layout,
+        k: &candle::MetalStorage,
+        k_l: &Layout,
+        v: &candle::MetalStorage,
+        v_l: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle_metal_kernels::{flash_chunk_count, ChunkTable, FlashDType};
+
+        let device = q.device();
+
+        let out_dims = vec![q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
+        let elem_count: usize = out_dims.iter().product();
+        let out_shape = Shape::from_dims(&out_dims);
+        let out_layout = Layout::contiguous(out_shape.clone());
+
+        // Every condition below is one this kernel cannot serve, and each fails
+        // loudly rather than computing something plausible — §3.5 makes a wrong
+        // answer here silent, so the caller's fallback has to be a *decision*
+        // and not a discovery.
+        if q_l.dim(2)? != 1 {
+            candle::bail!("flash-decoding is a decode kernel: q seq must be 1");
+        }
+        if q_l.dim(D::Minus1)? != k_l.dim(D::Minus1)? {
+            candle::bail!("`q` and `k` last dims must match");
+        }
+        if v_l.dim(D::Minus(3))? != k_l.dim(D::Minus(3))? {
+            candle::bail!("`k` and `v` head dims must match");
+        }
+        if q_l.dim(D::Minus(3))? % k_l.dim(D::Minus(3))? != 0 {
+            candle::bail!("query `n_heads` must be a multiple of `n_kv_heads`");
+        }
+        for t in [k.dtype(), v.dtype()] {
+            if q.dtype() != t {
+                candle::bail!("all q, k, v dtypes must match.");
+            }
+        }
+        let itype = match q.dtype() {
+            DType::F16 => FlashDType::F16,
+            DType::F32 => FlashDType::F32,
+            other => candle::bail!("unsupported flash-decoding type {other:?}"),
+        };
+
+        let n_q_heads = q_l.dim(1)?;
+        let head_dim = q_l.dim(D::Minus1)?;
+        let n_keys = k_l.dim(2)?;
+        let chunk_size = self.page_size * self.pages_per_chunk;
+        let n_chunks = flash_chunk_count(n_keys, chunk_size);
+        if n_chunks == 0 {
+            candle::bail!("flash-decoding needs at least one key");
+        }
+
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, q.dtype())
+            .with_label("flash_decoding_o")
+            .build()?;
+
+        // The scratch class, §9.1a. Sized here rather than through
+        // `ScratchPlan` because that plan owns *the whole step's* regions and
+        // this op sees one layer — wiring the planned arena is what a
+        // `ScratchSizing` decision would need, and §9.1a records that decision
+        // as deliberately unmade because the axis that separates the policies
+        // is `kv_len` (#61's).
+        //
+        // So this is `Sizing::Grow` in effect: sized to the current `kv_len`,
+        // every step. That is a *consequence* of allocating per call and is
+        // stated rather than chosen — see the PR body.
+        let partials = device
+            .new_buffer_builder()
+            .with_size_for(n_q_heads * n_chunks * head_dim, DType::F32)
+            .with_label("flash_decoding_partials")
+            .build()?;
+        let sums = device
+            .new_buffer_builder()
+            .with_size_for(n_q_heads * n_chunks, DType::F32)
+            .with_label("flash_decoding_sums")
+            .build()?;
+        let maxs = device
+            .new_buffer_builder()
+            .with_size_for(n_q_heads * n_chunks, DType::F32)
+            .with_label("flash_decoding_maxs")
+            .build()?;
+        let walk_order = device
+            .new_buffer_builder()
+            .with_size_for(n_q_heads * n_chunks, DType::U32)
+            .with_label("flash_decoding_walk_order")
+            .build()?;
+
+        // At B=1 over a contiguous cache the table is `c * pages_per_chunk`.
+        // **It is built and bound even though it is derivable**, because a
+        // combine that computes the range instead of reading it is a *walk*,
+        // and §10.3h records that a B=1 gate structurally cannot tell a walk
+        // from an index — at B=1 the two coincide. Binding it now is what makes
+        // the permuted-table test possible and what a paged cache would fill
+        // differently.
+        let table = ChunkTable::Contiguous.entries(n_chunks, self.pages_per_chunk);
+        let chunk_table = device.new_buffer_with_data(&table)?;
+
+        let partial_params = device.new_buffer_with_data(std::slice::from_ref(
+            &candle_metal_kernels::FlashPartialParams::for_step(
+                q_l.dims(),
+                k_l.dims(),
+                k_l.stride(),
+                v_l.stride(),
+                self.page_size,
+                self.pages_per_chunk,
+                n_chunks,
+                self.scale,
+                self.softcapping,
+            ),
+        ))?;
+        let combine_params = device.new_buffer_with_data(std::slice::from_ref(
+            &candle_metal_kernels::FlashCombineParams::for_step(n_chunks, n_chunks),
+        ))?;
+
+        let encoder = q.device().command_encoder()?;
+        encoder.set_label("flash_decoding");
+        candle_metal_kernels::call_flash_decoding(
+            q.device().device(),
+            &encoder,
+            q.device().kernels(),
+            q_l.start_offset() * q.dtype().size_in_bytes(),
+            q.buffer(),
+            k_l.start_offset() * k.dtype().size_in_bytes(),
+            k.buffer(),
+            v_l.start_offset() * v.dtype().size_in_bytes(),
+            v.buffer(),
+            &output,
+            &partials,
+            &sums,
+            &maxs,
+            &chunk_table,
+            &partial_params,
+            &combine_params,
+            &walk_order,
+            n_q_heads,
+            head_dim,
+            n_chunks,
+            itype,
+        )
+        .map_err(candle::Error::wrap)?;
+
+        let newstorage = candle::MetalStorage::new(
+            output,
+            device.clone(),
+            elem_count,
+            q.dtype(),
+        );
+        Ok((newstorage, out_layout.shape().clone()))
+    }
+}
+
+/// FlashDecoding attention over a contiguous KV cache.
+///
+/// `q` is `[b, n_q_heads, 1, head_dim]` — a decode step. `k`/`v` are
+/// `[b, n_kv_heads, kv_len, head_dim]`, and may be a `narrow` of a
+/// pre-allocated cache: the kernel takes the head stride and the token stride
+/// as parameters, so the reserved capacity and the live length are separate
+/// numbers (`DESIGN.md` §10.3b).
+///
+/// `page_size` is the **allocation** granularity and `pages_per_chunk` is the
+/// `k` of `chunk_size = k * page_size` — the **computation** granularity. §10.4
+/// fixes them equal by fiat and §9.1d records that they are optimised against
+/// disjoint cost functions; both are parameters here so a sweep can separate
+/// them.
+///
+/// Metal only, `seq == 1` only. Every other case is an error rather than a
+/// fallback: the caller decides, because a silent fallback is what makes an
+/// A/B arm measure the wrong thing (§2.4).
+pub fn flash_decoding(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    page_size: usize,
+    pages_per_chunk: usize,
+) -> Result<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &FlashDecoding {
+            scale,
+            softcapping,
+            page_size,
+            pages_per_chunk,
+        },
+    )
+}

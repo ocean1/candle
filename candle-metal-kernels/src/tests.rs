@@ -5354,6 +5354,7 @@ fn layout_registry_covers_every_family() {
             LayoutFamily::Conv => "conv",
             LayoutFamily::Indexing => "indexing",
             LayoutFamily::Sdpa => "sdpa",
+            LayoutFamily::Flash => "flash_decoding",
         }
     }
 
@@ -5367,6 +5368,7 @@ fn layout_registry_covers_every_family() {
         LayoutFamily::Conv,
         LayoutFamily::Indexing,
         LayoutFamily::Sdpa,
+        LayoutFamily::Flash,
     ];
 
     for family in expected {

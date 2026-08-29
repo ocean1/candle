@@ -14,7 +14,8 @@ pub use kernel::Kernels;
 pub use kernels::{
     affine::*, arena_alloc::*, call_binary_contiguous, call_binary_contiguous_with,
     call_binary_strided, call_binary_strided_with, call_mlx_gemm, call_mlx_gemv_with, cast::*,
-    convolution::*, fill::*, indexing::*, quantized::*, random::*, reduce::*, scratch::*, sdpa::*,
+    convolution::*, fill::*, flash_decoding::*, indexing::*, quantized::*, random::*,
+    reduce::*, scratch::*, sdpa::*,
     sort::*, ternary::*, unary, unary::*, ConvKernel, GemmDType, GgmlDType, IndexingKernel,
     ParamStyle, ReduceKernel,
 };
@@ -26,7 +27,7 @@ pub use kernels::{
 // sites.
 pub use kernels::params::{
     constants_pool, default_param_style, set_constants_pool_enabled, set_default_param_style,
-    ConstantsPool,
+    ConstantsPool, FlashCombineParams, FlashPartialParams,
 };
 // The arena's GPU-side allocator vocabulary (`DESIGN.md` §9.2d, issue #70).
 // Named rather than arriving through a glob, because `ARENA_DECLINED` is a

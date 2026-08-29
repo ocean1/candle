@@ -27,6 +27,8 @@ pub mod icb;
 mod icb_executor_tests;
 #[cfg(test)]
 mod icb_tests;
+#[cfg(test)]
+mod flash_decoding_tests;
 pub mod library;
 pub mod profile;
 pub mod residency_set;

@@ -882,6 +882,142 @@ pub fn expected_sdpa_layout() -> Vec<(&'static str, u32)> {
     ]
 }
 
+/// `flash_decoding_partial`'s scalars (`DESIGN.md` §10.4, issue #116).
+///
+/// # Two fields carry decisions rather than values
+///
+/// **`k_token_stride`/`v_token_stride` are the parameter #200 could not vary.**
+/// `sdpa_vector` steps keys with `constexpr int stride = BN * D` — compile
+/// time, no token-stride parameter — so a dim-outer KV order is not merely
+/// worse there, it is inexpressible, and #200's stated blocker is that there is
+/// no second arm to time. §9.1d records that **#116's kernel is where that is
+/// decided**, and this is the field that decides it: a different dimension
+/// order becomes a different *number* here rather than a different kernel.
+///
+/// **`pages_per_chunk` is the `k` of `chunk_size = k * page_size`.** §10.4
+/// fixes the page and the chunk to one granularity **by fiat**; §9.1d
+/// establishes the general form, and a page (an allocation unit) and a tile (a
+/// computation unit) are optimised against disjoint cost functions. Shipped at
+/// 1, carried as a field so a sweep can separate a page-size effect from a
+/// tile-size one — which a sweep holding `k = 1` cannot.
+///
+/// Field order mirrors the Metal struct exactly: six `int` then four `size_t`
+/// then two `float`, so the `size_t`s land 8-aligned with no interior padding.
+/// `flash_params_layout` ships the real offsets across the boundary rather than
+/// either side asserting its own (§11.3d).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlashPartialParams {
+    pub gqa_factor: i32,
+    pub n_keys: i32,
+    pub chunk_size: i32,
+    pub n_chunks: i32,
+    pub pages_per_chunk: i32,
+    pub page_size: i32,
+    pub k_head_stride: u64,
+    pub v_head_stride: u64,
+    pub k_token_stride: u64,
+    pub v_token_stride: u64,
+    pub scale: f32,
+    pub softcapping: f32,
+}
+
+/// `flash_decoding_combine`'s scalars.
+///
+/// `n_chunks` is the **live** count and `chunk_capacity` is what the region is
+/// **sized** for, and they differ under `Sizing::Reserve` (§9.1a). The merge
+/// runs to the live count and strides by the capacity: merging over the
+/// reservation folds in uninitialised memory, which §9.1a records as a silent
+/// wrong answer that no size check catches.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlashCombineParams {
+    pub n_chunks: i32,
+    pub chunk_capacity: i32,
+}
+
+/// The kernel in `flash_decoding.metal` that reports the device-side layout.
+pub const FLASH_LAYOUT_KERNEL: &str = "flash_params_layout";
+
+/// What each slot of [`FLASH_LAYOUT_KERNEL`]'s output means, and what Rust
+/// computes for it.
+///
+/// As [`expected_sdpa_layout`], for the FlashDecoding family. Both structs are
+/// reported by one kernel because both live in one `.metal` file, and a layout
+/// kernel can only see the structs its own file defines.
+pub fn expected_flash_layout() -> Vec<(&'static str, u32)> {
+    use core::mem::{align_of, offset_of, size_of};
+
+    debug_assert_eq!(align_of::<FlashPartialParams>(), 8);
+
+    vec![
+        (
+            "sizeof(FlashPartialParams)",
+            size_of::<FlashPartialParams>() as u32,
+        ),
+        (
+            "FlashPartialParams.gqa_factor",
+            offset_of!(FlashPartialParams, gqa_factor) as u32,
+        ),
+        (
+            "FlashPartialParams.n_keys",
+            offset_of!(FlashPartialParams, n_keys) as u32,
+        ),
+        (
+            "FlashPartialParams.chunk_size",
+            offset_of!(FlashPartialParams, chunk_size) as u32,
+        ),
+        (
+            "FlashPartialParams.n_chunks",
+            offset_of!(FlashPartialParams, n_chunks) as u32,
+        ),
+        (
+            "FlashPartialParams.pages_per_chunk",
+            offset_of!(FlashPartialParams, pages_per_chunk) as u32,
+        ),
+        (
+            "FlashPartialParams.page_size",
+            offset_of!(FlashPartialParams, page_size) as u32,
+        ),
+        (
+            "FlashPartialParams.k_head_stride",
+            offset_of!(FlashPartialParams, k_head_stride) as u32,
+        ),
+        (
+            "FlashPartialParams.v_head_stride",
+            offset_of!(FlashPartialParams, v_head_stride) as u32,
+        ),
+        (
+            "FlashPartialParams.k_token_stride",
+            offset_of!(FlashPartialParams, k_token_stride) as u32,
+        ),
+        (
+            "FlashPartialParams.v_token_stride",
+            offset_of!(FlashPartialParams, v_token_stride) as u32,
+        ),
+        (
+            "FlashPartialParams.scale",
+            offset_of!(FlashPartialParams, scale) as u32,
+        ),
+        (
+            "FlashPartialParams.softcapping",
+            offset_of!(FlashPartialParams, softcapping) as u32,
+        ),
+        (
+            "sizeof(FlashCombineParams)",
+            size_of::<FlashCombineParams>() as u32,
+        ),
+        (
+            "FlashCombineParams.n_chunks",
+            offset_of!(FlashCombineParams, n_chunks) as u32,
+        ),
+        (
+            "FlashCombineParams.chunk_capacity",
+            offset_of!(FlashCombineParams, chunk_capacity) as u32,
+        ),
+    ]
+}
+
 /// The kernel in `reduce.metal` that reports the device-side layout.
 pub const REDUCE_LAYOUT_KERNEL: &str = "reduce_params_layout";
 
@@ -1748,6 +1884,10 @@ pub enum LayoutFamily {
     /// `scaled_dot_product_attention.metal` — issue #103. The family §11.3h
     /// deferred and #97 made decode-path, 8 dispatches per token.
     Sdpa,
+    /// `flash_decoding.metal` — issue #116. Two structs in one file, both
+    /// reported by one layout kernel: a layout kernel can only see the structs
+    /// its own file defines.
+    Flash,
 }
 
 /// Everything the layout check needs to know about one family.
@@ -1798,6 +1938,7 @@ impl LayoutFamily {
         LayoutFamily::Conv,
         LayoutFamily::Indexing,
         LayoutFamily::Sdpa,
+        LayoutFamily::Flash,
     ];
 
     /// The name of the `.metal` file this family lives in, for error messages.
@@ -1812,6 +1953,7 @@ impl LayoutFamily {
             LayoutFamily::Conv => "conv.metal",
             LayoutFamily::Indexing => "indexing.metal",
             LayoutFamily::Sdpa => "scaled_dot_product_attention.metal",
+            LayoutFamily::Flash => "flash_decoding.metal",
         }
     }
 
@@ -1867,6 +2009,11 @@ impl LayoutFamily {
                 crate::Source::Sdpa,
                 SDPA_LAYOUT_KERNEL,
                 expected_sdpa_layout(),
+            ),
+            LayoutFamily::Flash => (
+                crate::Source::FlashDecoding,
+                FLASH_LAYOUT_KERNEL,
+                expected_flash_layout(),
             ),
         };
         LayoutDescriptor {
