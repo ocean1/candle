@@ -111,28 +111,55 @@ metal = [
 ]
 metal-debug-labels = ["metal", "candle/metal-debug-labels", "candle-nn/metal-debug-labels", "candle-transformers/metal-debug-labels"]
 # Strict ordering verification (#185, `DESIGN.md` §11.3t), reachable from a
-# harness because this line exists -- #205's defect, avoided rather than
+# harness because this line exists -- #205's defect below, avoided rather than
 # repeated.
 #
-# **Only `candle` is named, and that is the whole propagation.** The first
-# version of this line named `candle-nn` and `candle-transformers` too, by
-# symmetry with `metal-debug-labels` above; #205 landed the rule that corrects
-# it, and it was checked here rather than accepted on authority.
+# **Only `candle` is named**, per the rule the next entry states and counts:
 # `grep -rn 'feature = "hazard-audit"'` over the tree hits
-# `candle-metal-kernels` **30 times and no other crate**, so those two names
-# would have propagated to no gated code -- exactly the shape #205 counted for
-# `metal-debug-labels`, whose `#[cfg]` sites are 6 in `candle-core`, 10 in
-# `candle-metal-kernels` and **0** in each of the two it also names.
-#
-# The rule is per-feature and mechanical: **name the crate that gates code on
-# it, found by grep, not the crate a sibling feature happens to name.**
+# `candle-metal-kernels` **30 times and no other crate**. The first version of
+# this line also named `candle-nn` and `candle-transformers`, by symmetry with
+# `metal-debug-labels` above; those two names propagated to no gated code, which
+# is exactly what that rule predicts and why it is stated once below rather than
+# twice.
 #
 # The reach is `candle/metal-hazard-audit` -> `candle-metal-kernels/hazard-audit`,
-# and it is asserted by a **run** rather than by this comment:
+# asserted by a **run** rather than by this comment:
 # `lfm2-dispatch-trace --assert-hazard-audit` evaluates `cfg!` in this crate and
-# exits non-zero when the feature did not arrive. An unused feature flag reads
-# exactly like a correct one (§9.5l finding 5).
+# exits non-zero when the feature did not arrive, and `cargo metadata` resolves
+# `candle-metal-kernels` to `['default', 'hazard-audit']` against `['default']`
+# under `--features metal` alone.
 metal-hazard-audit = ["metal", "candle/metal-hazard-audit"]
+# Per-memory-class and event telemetry (#171, `DESIGN.md` §3.4a-iv), reachable
+# from a harness for the first time (#205).
+#
+# **This is §9.5l finding 5's shape one crate over, and the line above is what
+# makes it an oversight rather than a decision.** `candle-core` has declared
+# `metal-run-telemetry` since #171 and nothing above it did, so
+# `grep -rn 'metal-run-telemetry' --include=Cargo.toml` returned exactly one
+# line and no example could be built with `run_telemetry` compiled in. §16 P0 #7
+# recorded the instrument as *"never run at long context"*, which read as *has
+# not yet been* where it was *cannot currently be*.
+#
+# Only `candle` is named, and that is the whole propagation rather than an
+# omission: every `run_telemetry` entry point lives in
+# `candle-metal-kernels::metal::run_telemetry`, reached as
+# `candle/metal-run-telemetry` -> `candle-metal-kernels/run-telemetry`.
+# Checked rather than assumed, since asserting a propagation nobody verified is
+# the defect this line exists to fix: `grep -rn 'feature = "run-telemetry"'`
+# over the tree hits `candle-metal-kernels/src/metal/run_telemetry.rs` and
+# nothing else, and `cargo metadata --features metal-run-telemetry` resolves
+# `candle-metal-kernels` to `['default', 'run-telemetry']` where `--features
+# metal` resolves it to `['default']`.
+#
+# **`metal-debug-labels` above names three crates and that is NOT the shape to
+# copy here** -- counted, its `#[cfg]` sites are 6 in `candle-core` and 10 in
+# `candle-metal-kernels` and **0 in both `candle-nn` and
+# `candle-transformers`**, so two of its three names propagate to no gated code
+# today. Following it by symmetry would have added two more such names. The
+# rule that survives is per-feature and mechanical: **name the crate that gates
+# code on it, found by grep, not the crate that a sibling feature happens to
+# name.**
+metal-run-telemetry = ["metal", "candle/metal-run-telemetry"]
 microphone = ["cpal", "rubato"]
 encodec = ["cpal", "symphonia", "rubato"]
 mimi = ["cpal", "symphonia", "rubato"]

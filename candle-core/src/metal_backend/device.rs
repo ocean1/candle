@@ -110,8 +110,48 @@ impl ResidencyEvictionObserver {
 
 impl candle_metal_kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver {
     fn on_evict(&self, buffers: &[Buffer]) {
-        self.residency_set.retire_batch(buffers.iter());
+        // PROBE, not a fix, and off unless asked for (lloom issue #206).
+        //
+        // The comment above prices the eager form at +0.062 ms/token against a
+        // retention it calls safe, and that pricing was taken at §6.3b's
+        // **11.6 evictions per token**. Measured at long context under
+        // `KvAppend=Cat` the rate is **~220 per token**, and the retention
+        // reaches **48 GB** -- `device_allocated` climbs 11.0 -> 54.0 GB while
+        // the pool stays flat at 5.47, until the run dies of
+        // `kIOGPUCommandBufferCallbackErrorOutOfMemory` at 97 % of
+        // `recommendedMaxWorkingSetSize`.
+        //
+        // So the two arms answer different questions and both are needed: the
+        // default arm is what shipped and is what the cost was measured on, and
+        // this arm tests whether the retention is *the* mechanism rather than a
+        // quantity that merely correlates with it. If unregistering eagerly
+        // holds `device_allocated` flat, the retention is causal; if it climbs
+        // anyway, something else holds the bytes and this rules the set out.
+        //
+        // An environment variable rather than a feature so both arms come from
+        // one binary -- #122's `MathMode` shape -- and so a bisect cannot
+        // attribute a build difference to the arm.
+        if eager_residency_release() {
+            self.residency_set.remove_batch(buffers.iter());
+        } else {
+            self.residency_set.retire_batch(buffers.iter());
+        }
     }
+}
+
+/// Whether an evicted buffer is unregistered from the residency set eagerly.
+///
+/// `false` is what ships (`DESIGN.md` §6.3d). Read once: a per-eviction
+/// `var()` would put an environment lookup on the decode path, which is the
+/// shape §6.4a prices and this probe exists to measure around.
+fn eager_residency_release() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CANDLE_METAL_EAGER_RESIDENCY_RELEASE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 impl DeviceTeardown {
