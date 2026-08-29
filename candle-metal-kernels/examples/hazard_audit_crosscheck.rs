@@ -48,15 +48,45 @@ struct Raw {
     binds: Vec<(usize, bool, u64, u64)>, // index, is_output, buf_id, offset
 }
 
+/// A decompressed reader over a trace, gzipped or not.
+///
+/// The child is returned alongside its pipe and reaped when the reader drops,
+/// rather than left for the OS. A `gunzip` that fails midway would otherwise
+/// look like a short file, and a truncated trace silently changes every count
+/// this harness exists to check.
+struct Gunzip {
+    child: std::process::Child,
+    out: std::process::ChildStdout,
+}
+
+impl Read for Gunzip {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.out.read(buf)
+    }
+}
+
+impl Drop for Gunzip {
+    fn drop(&mut self) {
+        match self.child.wait() {
+            Ok(status) if !status.success() => {
+                panic!("gunzip failed with {status}; the trace may be truncated")
+            }
+            Ok(_) => {}
+            Err(e) => panic!("could not reap gunzip: {e}"),
+        }
+    }
+}
+
 fn open(path: &str) -> Box<dyn Read> {
     if path.ends_with(".gz") {
-        let child = Command::new("gunzip")
+        let mut child = Command::new("gunzip")
             .arg("-c")
             .arg(path)
             .stdout(Stdio::piped())
             .spawn()
             .expect("gunzip");
-        Box::new(child.stdout.expect("stdout"))
+        let out = child.stdout.take().expect("stdout");
+        Box::new(Gunzip { child, out })
     } else {
         Box::new(std::fs::File::open(path).expect("open"))
     }
