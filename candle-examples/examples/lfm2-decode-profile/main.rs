@@ -254,6 +254,22 @@ struct MemProbe {
     lookups: u64,
     buckets_probed: u64,
     residency: u64,
+    /// Residency-set activity, cumulative (`DESIGN.md` §6.3e, issue #210).
+    ///
+    /// **`residency_commits` is the quantity §6.3d's cost argument is about.**
+    /// That section attributes eager unregistration's +0.062 ms/token to putting
+    /// a `commit()` on the per-token path; these report how many there are, so
+    /// the argument travels with a rate instead of being restated. Differenced
+    /// between two samples they give commits per token, which is the figure the
+    /// arms differ in.
+    ///
+    /// `residency_retired` nonzero with `residency_removed` at zero is the
+    /// pre-#210 arm -- the 48 GB retention -- so the two together say which arm
+    /// a run belongs to without trusting the environment.
+    residency_commits: u64,
+    residency_added: u64,
+    residency_removed: u64,
+    residency_retired: u64,
     device_allocated: u64,
     phys_footprint: u64,
     resident: u64,
@@ -264,6 +280,7 @@ impl MemProbe {
     fn read(dev: &candle::MetalDevice, token: u64, kv_len: u64, wall: f64) -> Self {
         let (shared, private) = dev.pool_occupancy();
         let (cs, cp) = dev.pool_counters();
+        let rc = dev.residency_counters();
         let (phys, resident) = proc_footprint().unwrap_or((0, 0));
         Self {
             token,
@@ -283,6 +300,10 @@ impl MemProbe {
             lookups: cs.lookups + cp.lookups,
             buckets_probed: cs.buckets_probed + cp.buckets_probed,
             residency: dev.residency_set_len() as u64,
+            residency_commits: rc.commits,
+            residency_added: rc.added,
+            residency_removed: rc.removed,
+            residency_retired: rc.retired,
             device_allocated: dev.metal_device().current_allocated_size() as u64,
             phys_footprint: phys,
             resident,
@@ -377,7 +398,8 @@ impl MemProbe {
         format!(
             "progress: token {:>7}  kv_len {:>7}  wall {:7.3} ms  \
              pool live {:6.3} free {:6.3} pending {:6.3} GB  \
-             dev {:6.3} GB  phys {:6.3} GB  resid {:>6}  alloc {:>9}  evict {:>9}",
+             dev {:6.3} GB  phys {:6.3} GB  resid {:>6}  alloc {:>9}  evict {:>9}  \
+             rm {:>9}  ret {:>9}  commits {:>9}",
             self.token,
             self.kv_len,
             self.wall_ms,
@@ -389,6 +411,9 @@ impl MemProbe {
             self.residency,
             self.allocations,
             self.evicted,
+            self.residency_removed,
+            self.residency_retired,
+            self.residency_commits,
         )
     }
 
@@ -406,7 +431,9 @@ impl MemProbe {
              \"pool_free_buckets\":{},\"pool_pending_buffers\":{},\
              \"allocations\":{},\"allocated_bytes\":{},\"evicted\":{},\
              \"hits\":{},\"lookups\":{},\"buckets_probed\":{},\
-             \"residency\":{},\"device_allocated\":{},\
+             \"residency\":{},\"residency_commits\":{},\
+             \"residency_added\":{},\"residency_removed\":{},\
+             \"residency_retired\":{},\"device_allocated\":{},\
              \"phys_footprint\":{},\"resident\":{}}}",
             self.token,
             self.kv_len,
@@ -425,6 +452,10 @@ impl MemProbe {
             self.lookups,
             self.buckets_probed,
             self.residency,
+            self.residency_commits,
+            self.residency_added,
+            self.residency_removed,
+            self.residency_retired,
             self.device_allocated,
             self.phys_footprint,
             self.resident,
