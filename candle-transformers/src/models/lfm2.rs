@@ -382,6 +382,12 @@ pub struct MemoryBudget {
     /// through a `VarBuilder` whose backing store this type cannot see, and a
     /// text-only request legitimately drops the 0.86 GB vision tower (#162).
     /// The caller knows which; this does not.
+    ///
+    /// **This field is the one admission cannot check on its own, and §9.5m
+    /// (#244) is the check that it is right.** A caller passing the language
+    /// figure for a load that also brings the tower under-predicts by 0.825 GB,
+    /// and §3.5 reports no overrun — so the error is silent. `weight_tolerance`
+    /// is what governs when the divergence is reported.
     pub weight_bytes: usize,
     /// Concurrent sequences. Every measurement in this project is B=1 (§13.2).
     pub batch: usize,
@@ -391,6 +397,16 @@ pub struct MemoryBudget {
     /// chooses it; it is a default that is visible and settable for that
     /// reason.
     pub fraction: f64,
+    /// How far `weight_bytes` may diverge from what was allocated before
+    /// §9.5m's reconciliation reports it (#244).
+    ///
+    /// **256 MB by default, and it is a bound on the unaccounted rather than a
+    /// round number.** #162 measured the whole attributable non-weight residual
+    /// at 42 MB — the RoPE `cos`/`sin` tables at 16.4 MB plus KV, conv state and
+    /// activations — so the default clears that by ~6×, while the vision tower
+    /// it exists to catch is 3.2× larger than the tolerance. A caller that knows
+    /// its own load better may tighten it.
+    pub weight_tolerance: usize,
 }
 
 impl MemoryBudget {
@@ -404,6 +420,15 @@ impl MemoryBudget {
     /// smallest possible scale.
     pub const DEFAULT_FRACTION: f64 = 0.65;
 
+    /// §9.5m's default tolerance for the weight reconciliation (#244).
+    ///
+    /// Duplicated from `admission::WEIGHT_RECONCILE_TOLERANCE` for the same
+    /// reason `DEFAULT_FRACTION` is — this type exists on every backend and
+    /// that constant is Metal-only — and asserted equal by
+    /// `default_weight_tolerance_matches_admissions` under the `metal` feature,
+    /// so the copy cannot drift.
+    pub const DEFAULT_WEIGHT_TOLERANCE: usize = 256 * 1_000_000;
+
     /// A B=1 budget at §9.5k's fraction, for a model whose weights are
     /// `weight_bytes`.
     pub fn new(weight_bytes: usize) -> Self {
@@ -411,8 +436,25 @@ impl MemoryBudget {
             weight_bytes,
             batch: 1,
             fraction: Self::DEFAULT_FRACTION,
+            weight_tolerance: Self::DEFAULT_WEIGHT_TOLERANCE,
         }
     }
+}
+
+/// Report a weight-term divergence §9.5m has detected (#244).
+///
+/// **Reported on `stderr` rather than returned as an error**, and the choice is
+/// argued rather than defaulted. By the time this fires every caller has already
+/// loaded the weights — the bytes are spent — so failing the `Cache` build would
+/// turn a bookkeeping error into a refusal to run a model that fits, which is a
+/// worse outcome than the silence §3.5 currently offers. What was missing is the
+/// *report*, and that is what this is.
+///
+/// **Metal-only, like the check that calls it.** CPU and CUDA compile none of
+/// admission (§14.1), so this is gated the same way the rest of it is.
+#[cfg(feature = "metal")]
+pub fn report_weight_divergence(r: &candle::metal_backend::admission::WeightReconciliation) {
+    eprintln!("lfm2: {}", r.describe());
 }
 
 #[derive(Debug, Clone)]
@@ -861,12 +903,51 @@ impl Cache {
             );
         }
 
+        // §9.5m (#244): check the weight term against what was ACTUALLY
+        // allocated, which is the check §3.5 says does not exist.
+        //
+        // **`weight_bytes` is a byte count the caller passes**, and its own doc
+        // comment says a text-only request drops the vision tower -- so
+        // admission is correct by construction only if the caller knows which,
+        // and until now nothing told it. Over-prediction fails loudly by
+        // refusing something that would have fit; **under-prediction fails
+        // silently**, because §3.5's Metal has no dependency analysis and
+        // nothing anywhere reports an overrun.
+        //
+        // The reading is the pool's own counters, deliberately from outside the
+        // model's arithmetic -- #162 declined to cite the harness's computed
+        // `weight_bytes` for this, since a prediction agreeing with itself is
+        // not an observation.
+        let f = &admission.footprint;
+        let (_, private) = metal.pool_occupancy();
+        let reconciliation = admission::reconcile_weights(
+            budget.weight_bytes,
+            &private,
+            // The non-weight classes `private_buffers` also serves (§9.5k, and
+            // §6.3a's correction that it is not the weight pool but where both
+            // weights and intermediates live).
+            f.scratch,
+            budget.weight_tolerance,
+        );
+        // **Reported, not refused, and the asymmetry is deliberate.** Refusing
+        // here would turn a caller's bookkeeping error into a failure to build
+        // a model that fits -- and this check runs where every caller has
+        // already loaded the weights, so the bytes are spent either way.
+        // Reporting is what §3.5 lacks; refusing is a policy nobody has argued.
+        //
+        // A caller that builds the `Cache` BEFORE loading the model sees an
+        // empty pool. `reconcile_weights` floors at zero there, so that case
+        // reports nothing rather than reporting a spurious under-prediction --
+        // the direction that matters cannot be manufactured by call order.
+        if reconciliation.under_predicted() {
+            crate::models::lfm2::report_weight_divergence(&reconciliation);
+        }
+
         // Install §9.5k's derived cap. `planned` differs per pool because the
         // two hold different classes and `live_bytes` already contains them:
         // the KV reserve is served from `buffers`, the weights from
         // `private_buffers`. The arena is in neither -- `install_arena` calls
         // the raw device.
-        let f = &admission.footprint;
         metal.set_residual_cap(
             admission.residual,
             /* shared  */ f.kv + f.conv,

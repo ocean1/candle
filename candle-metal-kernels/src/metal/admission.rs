@@ -434,6 +434,158 @@ pub fn planned_in_pool(footprint: &Footprint) -> usize {
     footprint.weights + footprint.kv + footprint.scratch + footprint.conv
 }
 
+/// What the weight prediction was, measured against what was actually
+/// allocated (`DESIGN.md` §9.5m, issue #244).
+///
+/// # The term this checks is the one nothing validated
+///
+/// [`Budget::weights`] is a **byte count the caller passes**, and its own doc
+/// comment says *"text-only drops the 0.86 GB vision tower"* — so admission is
+/// correct by construction only if the caller knows which, and nothing told it.
+/// The arithmetic above is correct for whatever it is handed; this is the check
+/// on **what it is handed**.
+///
+/// # Two errors, and only one of them is loud
+///
+/// **Over-prediction** — the full checkpoint's 6.25 GB passed for a text-only
+/// process — over-predicts by 0.825 GB (#162). It fails *loudly*: a
+/// configuration is refused that would have fit, and somebody notices.
+///
+/// **Under-prediction is the dangerous one.** A caller passing the *language*
+/// figure for a process that later does run the tower under-predicts by the
+/// same 0.825 GB, and §3.5 says **nothing reports an overrun**: Metal does no
+/// dependency analysis and there is no safety net. A budget that under-predicts
+/// does not refuse anything — it simply is not the bound it claims to be, on a
+/// machine this project has kernel-panicked twice (§6.3c, §6.3d).
+///
+/// So the direction is not symmetric and this type does not treat it as though
+/// it were. [`WeightReconciliation::under_predicted`] is the one that means the
+/// budget is not a bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WeightReconciliation {
+    /// What the caller passed as [`Budget::weights`].
+    pub predicted: usize,
+    /// What the weight-bearing pool actually holds, less the non-weight classes
+    /// it also serves. See [`reconcile_weights`] for why this is a floor.
+    pub observed: usize,
+    /// `observed − predicted`, signed. Positive is **under**-prediction.
+    pub divergence: i128,
+    /// The tolerance the verdict was taken at.
+    pub tolerance: usize,
+}
+
+impl WeightReconciliation {
+    /// The caller passed **fewer** bytes than were allocated, by more than the
+    /// tolerance. **This is the silent direction** — see the type docs.
+    pub fn under_predicted(&self) -> bool {
+        self.divergence > self.tolerance as i128
+    }
+
+    /// The caller passed **more** bytes than were allocated, by more than the
+    /// tolerance. Wasteful, and loud when it refuses something.
+    pub fn over_predicted(&self) -> bool {
+        self.divergence < -(self.tolerance as i128)
+    }
+
+    /// Neither direction exceeded the tolerance.
+    pub fn agrees(&self) -> bool {
+        !self.under_predicted() && !self.over_predicted()
+    }
+
+    /// The report, in §9.5g's shape: the arithmetic, then what it means.
+    pub fn describe(&self) -> String {
+        let gb = |b: i128| b as f64 / 1e9;
+        let head = format!(
+            "weight prediction {:.3} GB against {:.3} GB allocated \
+             (divergence {:+.3} GB, tolerance {:.3} GB)",
+            gb(self.predicted as i128),
+            gb(self.observed as i128),
+            gb(self.divergence),
+            gb(self.tolerance as i128),
+        );
+        if self.under_predicted() {
+            format!(
+                "{head}\n  UNDER-PREDICTED: admission was given a smaller weight \
+                 figure than the process allocated, so the budget it computed is \
+                 not a bound on this run. §3.5: nothing else reports an overrun. \
+                 A caller passing the language-model figure for a load that also \
+                 brings the vision tower is short by 0.825 GB (#162)."
+            )
+        } else if self.over_predicted() {
+            format!(
+                "{head}\n  over-predicted: admission was given a larger weight \
+                 figure than the process allocated, so it may refuse a \
+                 configuration that would have fit. A caller passing the full \
+                 checkpoint for a text-only load is long by 0.825 GB (#162)."
+            )
+        } else {
+            head
+        }
+    }
+}
+
+/// Compare admission's weight term against what the weight-bearing pool holds
+/// (`DESIGN.md` §9.5m, issue #244).
+///
+/// # Why this is measurable at all, and where the number comes from
+///
+/// **#162 established the reading and this uses the same one.** `pool_live`
+/// read **5.436 GB** against the language model's 5.394 GB, and the 42 MB
+/// residual is attributable — the RoPE `cos`/`sin` tables at 16.4 MB, plus KV,
+/// conv state and activations. The instrument is the pool's own counters, which
+/// come from **outside** the model's arithmetic: #162 declined to cite the
+/// `RESULT` line's `weight_bytes` for exactly this reason, since that figure is
+/// *computed* from the config geometry and agreeing with a prediction is not
+/// observing one.
+///
+/// `observed` is `live + free + pending` less the non-weight classes the same
+/// pool serves. Under §9.5k's mapping the weight-bearing pool is
+/// `private_buffers`, which holds weights **and** scratch and every activation
+/// intermediate (§6.3a's correction), so the caller passes what it knows those
+/// come to and this subtracts them.
+///
+/// # It is a floor, not an equality, and the tolerance is why
+///
+/// `observed` cannot be exact and is not claimed to be. It is a **floor on what
+/// was allocated** taken at a moment: intermediates come and go, and the 42 MB
+/// #162 measured is real and attributable. So the verdict is taken at a
+/// tolerance, and the tolerance is the caller's to set from what it knows is
+/// unaccounted — [`WEIGHT_RECONCILE_TOLERANCE`] is the default and states what
+/// it is made of.
+///
+/// **The asymmetry is the point.** A tolerance that hides the 0.825 GB vision
+/// tower would defeat the check; one that fires on 42 MB of RoPE tables would
+/// cry wolf. The default sits between them by an order of magnitude at each end.
+pub fn reconcile_weights(
+    predicted_weights: usize,
+    occupancy: &PoolOccupancySnapshot,
+    non_weight_classes_in_pool: usize,
+    tolerance: usize,
+) -> WeightReconciliation {
+    let held = occupancy.live_bytes + occupancy.free_bytes + occupancy.pending_bytes;
+    let observed = held.saturating_sub(non_weight_classes_in_pool);
+    WeightReconciliation {
+        predicted: predicted_weights,
+        observed,
+        divergence: observed as i128 - predicted_weights as i128,
+        tolerance,
+    }
+}
+
+/// The default tolerance for [`reconcile_weights`], and what it is made of.
+///
+/// **256 MB, and it is a bound on the unaccounted rather than a round number.**
+/// #162 measured the whole unattributed residual at **42 MB** — RoPE `cos`/`sin`
+/// at 16.4 MB plus KV, conv and activations — on a live decode. This is ~6× that
+/// figure, which leaves room for a larger `max_position_embeddings` to grow the
+/// RoPE term and for intermediates in flight at the moment of the reading.
+///
+/// **What it must not do is hide a tower.** The quantity this check exists to
+/// catch is 0.825 GB (#162), which is **3.2× this tolerance** — so the default
+/// cannot mask the error it was written for, and that ratio is asserted by
+/// `tolerance_cannot_hide_the_vision_tower` rather than left as a claim.
+pub const WEIGHT_RECONCILE_TOLERANCE: usize = 256 * 1_000_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +809,164 @@ mod tests {
         // less than the planned set, and a wrapping subtraction would report a
         // colossal figure and refuse a run that is fine.
         assert_eq!(unplanned_bytes(&occ, 10_000), 0);
+    }
+
+    // ---- #244: the weight term is caller-supplied, and this is the check ----
+
+    /// §5.5's language-model weights: what a text-only LFM2 load carries.
+    const WEIGHTS_LANGUAGE: usize = 5_394_397_184;
+    /// #162 §1, from the safetensors header: the vision tower alone.
+    const VISION_TOWER: usize = 825_299_424;
+
+    /// A pool holding `weights` plus #162's measured 42 MB of attributable
+    /// non-weight residual, which is what a live decode actually looks like.
+    fn pool_holding(weights: usize) -> PoolOccupancySnapshot {
+        PoolOccupancySnapshot {
+            live_bytes: weights + 42_000_000,
+            ..Default::default()
+        }
+    }
+
+    /// **A caller passing the WRONG constant must be caught — issue #244's
+    /// whole point, in the direction that fails silently.**
+    ///
+    /// A caller that passes the *language* figure for a process that also loads
+    /// the vision tower under-predicts by 0.825 GB, and §3.5 says nothing
+    /// reports an overrun. The arithmetic in this module is correct for whatever
+    /// it is handed; this is the check on what it is handed.
+    #[test]
+    fn a_caller_passing_the_language_figure_for_a_vl_load_is_caught() {
+        // The process actually allocated the language model AND the tower.
+        let occ = pool_holding(WEIGHTS_LANGUAGE + VISION_TOWER);
+        // The caller told admission it would only be the language model.
+        let r = reconcile_weights(WEIGHTS_LANGUAGE, &occ, 0, WEIGHT_RECONCILE_TOLERANCE);
+
+        assert!(
+            r.under_predicted(),
+            "under-prediction is the silent direction and MUST be caught:\n{}",
+            r.describe()
+        );
+        assert!(!r.over_predicted(), "{}", r.describe());
+        assert!(!r.agrees(), "{}", r.describe());
+
+        // It is short by the tower, and the report says so in bytes rather than
+        // in a boolean (§9.5g).
+        let short = r.divergence - 42_000_000;
+        assert!(
+            (short - VISION_TOWER as i128).abs() < 1_000_000,
+            "#162: short by the tower's 0.825 GB, got {:.3} GB",
+            short as f64 / 1e9
+        );
+        assert!(r.describe().contains("UNDER-PREDICTED"), "{}", r.describe());
+    }
+
+    /// **The other bound, and without it the check above is worthless**
+    /// (§8.1g, #184's precedent — both arms in one test so neither can be
+    /// dropped without the other going red).
+    ///
+    /// A check that reports every caller wrong is not a check. The correct
+    /// caller must be quiet, and the *opposite* error must read as the opposite
+    /// error rather than as this one.
+    #[test]
+    fn the_correct_caller_is_quiet_and_over_prediction_reads_as_over() {
+        // Correct: told the truth about a text-only load.
+        let occ = pool_holding(WEIGHTS_LANGUAGE);
+        let right = reconcile_weights(WEIGHTS_LANGUAGE, &occ, 0, WEIGHT_RECONCILE_TOLERANCE);
+        assert!(
+            right.agrees(),
+            "a caller that got it right must not be reported wrong:\n{}",
+            right.describe()
+        );
+        assert!(!right.under_predicted() && !right.over_predicted());
+
+        // #162's own case: the full checkpoint passed for a text-only process.
+        // Real, and it fails LOUDLY -- so it must not be reported as the silent
+        // direction.
+        let over = reconcile_weights(
+            WEIGHTS_LANGUAGE + VISION_TOWER,
+            &occ,
+            0,
+            WEIGHT_RECONCILE_TOLERANCE,
+        );
+        assert!(over.over_predicted(), "{}", over.describe());
+        assert!(
+            !over.under_predicted(),
+            "over-prediction must NOT be reported as the dangerous direction:\n{}",
+            over.describe()
+        );
+        assert!(
+            over.describe().contains("over-predicted"),
+            "{}",
+            over.describe()
+        );
+    }
+
+    /// **The tolerance must not be able to hide the thing it exists to catch.**
+    ///
+    /// #162 measured the unattributed residual at 42 MB (RoPE at 16.4 MB plus
+    /// KV, conv and activations) and the vision tower at 0.825 GB. The tolerance
+    /// has to sit between them, and this asserts the ratio at both ends rather
+    /// than leaving it as a claim in a doc comment.
+    #[test]
+    fn tolerance_cannot_hide_the_vision_tower() {
+        // A `const` block, so the lower bound is checked at COMPILE time: the
+        // tolerance is a constant and a constant relation between constants
+        // wants no test run to establish it.
+        const {
+            assert!(
+                WEIGHT_RECONCILE_TOLERANCE > 42_000_000 * 4,
+                "the tolerance must clear #162's measured 42 MB residual"
+            );
+        }
+        assert!(
+            (VISION_TOWER as f64 / WEIGHT_RECONCILE_TOLERANCE as f64) > 3.0,
+            "the tower must be at least 3x the tolerance or the check is \
+             defeated by its own slack: ratio {:.2}",
+            VISION_TOWER as f64 / WEIGHT_RECONCILE_TOLERANCE as f64
+        );
+        // And #162's residual alone must be quiet: an instrument that fires on
+        // the RoPE tables would be turned off within a week.
+        let occ = pool_holding(WEIGHTS_LANGUAGE);
+        let r = reconcile_weights(WEIGHTS_LANGUAGE, &occ, 0, WEIGHT_RECONCILE_TOLERANCE);
+        assert!(
+            r.agrees(),
+            "42 MB of RoPE and KV must not fire:\n{}",
+            r.describe()
+        );
+    }
+
+    /// The non-weight classes the same pool serves are subtracted.
+    ///
+    /// §9.5k's mapping puts scratch and every activation intermediate in
+    /// `private_buffers` alongside the weights (§6.3a's correction), so a check
+    /// that did not subtract them would read them as under-prediction and
+    /// report a correct caller as wrong.
+    #[test]
+    fn non_weight_classes_in_the_same_pool_are_subtracted() {
+        let scratch = 33 * 1024 * 1024;
+        let occ = pool_holding(WEIGHTS_LANGUAGE + scratch);
+
+        let unsubtracted = reconcile_weights(WEIGHTS_LANGUAGE, &occ, 0, WEIGHT_RECONCILE_TOLERANCE);
+        let subtracted =
+            reconcile_weights(WEIGHTS_LANGUAGE, &occ, scratch, WEIGHT_RECONCILE_TOLERANCE);
+        assert!(
+            subtracted.agrees(),
+            "scratch is planned and must not read as under-prediction:\n{}",
+            subtracted.describe()
+        );
+        assert_eq!(
+            subtracted.divergence + scratch as i128,
+            unsubtracted.divergence,
+            "the subtraction is exactly the classes the caller named"
+        );
+
+        // And it saturates: early in a run the pool holds less than the classes
+        // named, and a wrapping subtraction would report a colossal observed
+        // figure and call a fine run under-predicted.
+        let empty = PoolOccupancySnapshot::default();
+        let early = reconcile_weights(WEIGHTS_LANGUAGE, &empty, 10_000, WEIGHT_RECONCILE_TOLERANCE);
+        assert_eq!(early.observed, 0);
+        assert!(!early.under_predicted(), "{}", early.describe());
     }
 
     /// The scratch class is sized from **query** heads, not KV heads.
