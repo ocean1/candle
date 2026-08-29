@@ -118,6 +118,157 @@ pub fn hazard_key() -> HazardKey {
     }
 }
 
+/// Which of the three orderable hazards a binding just detected.
+///
+/// **The direction is computed at both emission sites and was discarded into a
+/// `bool`** (issue #185). `set_input_buffer` tests one set and can only be
+/// read-after-write; `set_output_buffer` tests two and is write-after-write or
+/// write-after-read. Read-after-read is absent by construction -- two reads
+/// never conflict -- which is why 5.394 GB of weights, bound on every dispatch,
+/// contributes **zero** of the barriers.
+///
+/// Retaining it costs nothing on the default path: it is produced inside the
+/// branch that has already decided a barrier is needed, and it is consumed only
+/// by [`trace`] and by the `hazard-audit` feature, both of which are off unless
+/// asked for.
+///
+/// This is `DESIGN.md` §6.7 **L2** -- *if a mechanism records information it
+/// does not consume, either consume it or stop recording it* -- applied to a
+/// value that was computed and then not even recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HazardKind {
+    /// Read-after-write: this dispatch reads bytes an earlier one wrote.
+    Raw,
+    /// Write-after-write: this dispatch overwrites bytes an earlier one wrote.
+    Waw,
+    /// Write-after-read: this dispatch overwrites bytes an earlier one read.
+    War,
+}
+
+impl HazardKind {
+    /// A stable lowercase tag, for traces and assertion messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HazardKind::Raw => "raw",
+            HazardKind::Waw => "waw",
+            HazardKind::War => "war",
+        }
+    }
+
+    fn bit(self) -> u8 {
+        match self {
+            HazardKind::Raw => 1,
+            HazardKind::Waw => 2,
+            HazardKind::War => 4,
+        }
+    }
+}
+
+/// Which directions a **read** binding conflicts in, given the state before it.
+///
+/// A read can only ever be RAW: read-after-read is not a hazard, which is why
+/// `prev_inputs` is not consulted and why the weights -- 5.394 GB, read on every
+/// dispatch and never written -- contribute **zero** barriers.
+///
+/// Split out of [`ComputeCommandEncoder::set_input_buffer`] so that a test can
+/// exercise **this** function rather than a re-implementation of it. #8.1d
+/// records what the alternative costs: a script that reproduced the intended
+/// name instead of asking the compiler *"validated the intent instead of the
+/// artifact"*, and every one of the 48 variants was absent from the metallib.
+#[inline]
+pub(crate) fn read_hazards(
+    prev_outputs: &BoundSet,
+    key: HazardKey,
+    range: &BoundRange,
+) -> HazardKinds {
+    let mut kinds = HazardKinds::NONE;
+    if prev_outputs.conflicts(key, range) {
+        kinds.insert(HazardKind::Raw);
+    }
+    kinds
+}
+
+/// Which directions a **write** binding conflicts in, given the state before it.
+///
+/// **Both tests run; this must not become `||`.** The original site was
+/// `if prev_outputs.conflicts(..) || prev_inputs.conflicts(..)`, which is
+/// correct for a `bool` and lossy for an attribution: `||` stops at the first
+/// true operand, so at any position where WAW fires WAR is never tested, and WAR
+/// is under-reported exactly where the two coincide (issue #185).
+///
+/// `conflicts` takes `&self` and only reads, so evaluating both is
+/// behaviour-identical for the barrier decision -- the extra lookup happens only
+/// on positions already emitting a barrier, where the barrier dominates.
+#[inline]
+pub(crate) fn write_hazards(
+    prev_outputs: &BoundSet,
+    prev_inputs: &BoundSet,
+    key: HazardKey,
+    range: &BoundRange,
+) -> HazardKinds {
+    let mut kinds = HazardKinds::NONE;
+    if prev_outputs.conflicts(key, range) {
+        kinds.insert(HazardKind::Waw);
+    }
+    if prev_inputs.conflicts(key, range) {
+        kinds.insert(HazardKind::War);
+    }
+    kinds
+}
+
+/// The set of hazard directions behind one pending barrier.
+///
+/// A three-bit set rather than a collection: a barrier is a latch that any
+/// number of bindings may set before it fires, so the honest attribution is
+/// *which directions contributed*, not *which one was last*. One `u8` in
+/// `EncoderState` and three bit operations per detected hazard, so retaining the
+/// direction is free where it is produced -- which is the property that lets
+/// this be on by default rather than behind the audit feature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HazardKinds(u8);
+
+impl HazardKinds {
+    /// The empty set.
+    pub const NONE: HazardKinds = HazardKinds(0);
+
+    /// Add `kind` to the set.
+    #[inline]
+    pub fn insert(&mut self, kind: HazardKind) {
+        self.0 |= kind.bit();
+    }
+
+    /// Add everything in `other`.
+    #[inline]
+    pub fn merge(&mut self, other: HazardKinds) {
+        self.0 |= other.0;
+    }
+
+    /// Whether `kind` contributed.
+    #[inline]
+    pub fn contains(self, kind: HazardKind) -> bool {
+        self.0 & kind.bit() != 0
+    }
+
+    /// Whether nothing has been recorded.
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Empty the set and return what it held.
+    #[inline]
+    pub fn take(&mut self) -> HazardKinds {
+        std::mem::replace(self, HazardKinds::NONE)
+    }
+
+    /// The directions present, in RAW, WAW, WAR order.
+    pub fn iter(self) -> impl Iterator<Item = HazardKind> {
+        [HazardKind::Raw, HazardKind::Waw, HazardKind::War]
+            .into_iter()
+            .filter(move |&k| self.contains(k))
+    }
+}
+
 /// One buffer binding, as the hazard tracking sees it.
 ///
 /// Carries the range even under [`HazardKey::Pointer`], where the extra fields
@@ -216,6 +367,20 @@ pub struct EncoderState {
     pub prev_inputs: BoundSet,
     pub next_inputs: BoundSet,
     pub needs_barrier: bool,
+    /// Which hazard directions contributed to the currently pending barrier
+    /// (issue #185).
+    ///
+    /// A **set rather than one value**, because `needs_barrier` is a latch: any
+    /// number of bindings may set it before the next dispatch fires the barrier,
+    /// and they need not agree on direction. A single field would report
+    /// whichever binding happened to be last, which is an arbitrary choice
+    /// dressed as an attribution.
+    ///
+    /// Drained with `needs_barrier`, so a *deferred* barrier (§11.3r's
+    /// suppression arm) keeps its kinds exactly as it keeps `prev_*` -- the two
+    /// must roll together or the eventual emission is attributed to only the
+    /// directions seen since the suppression.
+    pub pending_kinds: HazardKinds,
     /// All inputs seen this encoder session (cross-encoder fence coordination).
     pub all_inputs: HashSet<usize>,
     /// All outputs seen this encoder session (registered in global map at end_encoding).
@@ -249,6 +414,7 @@ impl EncoderState {
             prev_inputs: BoundSet::default(),
             next_inputs: BoundSet::default(),
             needs_barrier: false,
+            pending_kinds: HazardKinds::NONE,
             all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
             waited_fences: HashSet::new(),
@@ -553,6 +719,11 @@ impl ComputeCommandEncoder {
                 s.prev_outputs.absorb(&mut next_out);
                 let mut next_in = s.next_inputs.take();
                 s.prev_inputs.absorb(&mut next_in);
+                // `pending_kinds` is deliberately NOT drained here, for exactly
+                // the reason `needs_barrier` and `prev_*` are not: a suppressed
+                // barrier is *deferred, not dropped*. Draining the kinds while
+                // keeping the latch would attribute the eventual emission to
+                // only the directions seen after this point (issue #185).
                 trace::record_barrier_suppressed();
                 return;
             }
@@ -561,6 +732,12 @@ impl ComputeCommandEncoder {
             // count `DESIGN.md` §9.2e requires is a property of this branch, and
             // deriving it from a trace of bindings would additionally have to
             // model where each encoder session began.
+            //
+            // The kinds go with it, at the same site and for the same reason
+            // (issue #185): which directions this barrier is *for* is known here
+            // and nowhere downstream, because `prev_*` is replaced two lines
+            // below and the evidence is gone.
+            trace::record_barrier_kinds(s.pending_kinds.take());
             trace::record_barrier();
             s.needs_barrier = false;
             // Replaced, not extended: everything bound before the barrier is
@@ -601,7 +778,7 @@ impl ComputeCommandEncoder {
         let offset = offset + buffer.map_or(0, Buffer::base_offset);
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
-            trace::record_binding(index, ptr, offset, false);
+            trace::record_binding(index, ptr, offset, buf.length(), false);
             // The clock a liveness recording must use: a value is live until the
             // last dispatch that binds it (`DESIGN.md` §6.7 L4).
             arena::note_bind(ptr);
@@ -611,9 +788,12 @@ impl ComputeCommandEncoder {
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock().unwrap();
             let key = s.hazard_key;
-            // Read-after-write within this encoder.
-            if s.prev_outputs.conflicts(key, &range) {
+            // Read-after-write within this encoder. See `read_hazards` for why a
+            // read has exactly one possible direction (issue #185).
+            let kinds = read_hazards(&s.prev_outputs, key, &range);
+            if !kinds.is_empty() {
                 s.needs_barrier = true;
+                s.pending_kinds.merge(kinds);
             }
             s.next_inputs.insert(key, range);
             s.all_inputs.insert(ptr);
@@ -635,16 +815,20 @@ impl ComputeCommandEncoder {
         let offset = offset + buffer.map_or(0, Buffer::base_offset);
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
-            trace::record_binding(index, ptr, offset, true);
+            trace::record_binding(index, ptr, offset, buf.length(), true);
             arena::note_bind(ptr);
             // Write-after-write or write-after-read against an earlier encoder.
             self.wait_for_buffer(ptr);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock().unwrap();
             let key = s.hazard_key;
-            // Write-after-write, and write-after-read.
-            if s.prev_outputs.conflicts(key, &range) || s.prev_inputs.conflicts(key, &range) {
+            // Write-after-write, and write-after-read. See `write_hazards` for
+            // why both tests run where the original short-circuited on `||`
+            // (issue #185).
+            let kinds = write_hazards(&s.prev_outputs, &s.prev_inputs, key, &range);
+            if !kinds.is_empty() {
                 s.needs_barrier = true;
+                s.pending_kinds.merge(kinds);
             }
             s.next_outputs.insert(key, range);
             s.all_outputs.insert(ptr);
@@ -1109,6 +1293,144 @@ mod tests {
         assert!(
             !r(1, 0, 0).overlaps(&r(2, 0, 0)),
             "zero length crossed buffers"
+        );
+    }
+
+    /// A barrier is a latch, so its attribution is a **set** of directions.
+    ///
+    /// Asserted rather than assumed because the single-value alternative is
+    /// tempting and silently lossy: it would report whichever binding happened
+    /// to be last before the dispatch, which is an arbitrary choice wearing the
+    /// clothes of an attribution (issue #185).
+    #[test]
+    fn a_barrier_can_be_owed_to_more_than_one_direction() {
+        let mut k = HazardKinds::NONE;
+        assert!(k.is_empty(), "a fresh set was not empty");
+        assert_eq!(k.iter().count(), 0);
+
+        k.insert(HazardKind::Waw);
+        k.insert(HazardKind::War);
+        assert!(k.contains(HazardKind::Waw) && k.contains(HazardKind::War));
+        assert!(
+            !k.contains(HazardKind::Raw),
+            "a direction nothing recorded was reported"
+        );
+        // Order is RAW, WAW, WAR regardless of insertion order, so a report is
+        // stable rather than dependent on which binding fired first.
+        assert_eq!(
+            k.iter().map(HazardKind::as_str).collect::<Vec<_>>(),
+            ["waw", "war"]
+        );
+
+        // Idempotent: two WAW hazards before one barrier are one direction, not
+        // two. The set counts *which* directions, never how many bindings.
+        let mut twice = HazardKinds::NONE;
+        twice.insert(HazardKind::Raw);
+        twice.insert(HazardKind::Raw);
+        assert_eq!(twice.iter().count(), 1);
+
+        // `take` drains, so a barrier cannot inherit the previous one's kinds.
+        let drained = k.take();
+        assert!(k.is_empty(), "take did not drain");
+        assert_eq!(drained.iter().count(), 2, "take did not return the set");
+    }
+
+    /// **The write path must evaluate both hazard tests, not short-circuit.**
+    ///
+    /// `set_output_buffer` was `if prev_outputs.conflicts(..) ||
+    /// prev_inputs.conflicts(..)`, which is correct for a `bool` and wrong for
+    /// an attribution: at any position where WAW fires, `||` stops and WAR is
+    /// never tested, so WAR would be under-reported exactly where the two
+    /// coincide. This pins the case, since it is the one a future
+    /// simplification back to `||` would silently reintroduce.
+    ///
+    /// **Calls `write_hazards`, the function the encoder calls.** Asserting over
+    /// a re-implementation would validate the intent instead of the artifact --
+    /// §8.1d's recorded failure, where a script reproduced the intended
+    /// lowercase name rather than asking the preprocessor and reported all 90
+    /// variants matching while 48 were absent from the metallib. Verified by
+    /// mutation: restoring the `||` short-circuit in production source turns
+    /// this red.
+    #[test]
+    fn a_write_can_be_both_waw_and_war_and_both_must_be_seen() {
+        let slot = r(9, 0, 128);
+
+        // One earlier dispatch wrote the slot and another read it, so a later
+        // write to the same bytes is WAW *and* WAR at once.
+        let mut prev_outputs = BoundSet::default();
+        prev_outputs.insert(HazardKey::Range, slot);
+        let mut prev_inputs = BoundSet::default();
+        prev_inputs.insert(HazardKey::Range, slot);
+
+        let kinds = write_hazards(&prev_outputs, &prev_inputs, HazardKey::Range, &slot);
+        assert_eq!(
+            kinds.iter().map(HazardKind::as_str).collect::<Vec<_>>(),
+            ["waw", "war"],
+            "a write that is both WAW and WAR reported only one direction"
+        );
+
+        // Each direction alone, so the test cannot pass by always reporting both
+        // -- the mutation a "report everything" simplification would introduce.
+        let only_waw = write_hazards(&prev_outputs, &BoundSet::default(), HazardKey::Range, &slot);
+        assert_eq!(
+            only_waw.iter().map(HazardKind::as_str).collect::<Vec<_>>(),
+            ["waw"],
+            "a pure WAW reported a direction nothing supports"
+        );
+        let only_war = write_hazards(&BoundSet::default(), &prev_inputs, HazardKey::Range, &slot);
+        assert_eq!(
+            only_war.iter().map(HazardKind::as_str).collect::<Vec<_>>(),
+            ["war"],
+            "a pure WAR reported a direction nothing supports"
+        );
+        // And a write to bytes nobody touched orders nothing.
+        assert!(
+            write_hazards(
+                &prev_outputs,
+                &prev_inputs,
+                HazardKey::Range,
+                &r(9, 4096, 128)
+            )
+            .is_empty(),
+            "a disjoint write manufactured a hazard"
+        );
+    }
+
+    /// Read-after-read is not a hazard, and that is why the weights are free.
+    ///
+    /// 5.394 GB is bound on every dispatch and read every time; if RAR ordered,
+    /// every dispatch would conflict with every other and the barrier count
+    /// would be the dispatch count. `read_hazards` therefore consults
+    /// `prev_outputs` **only**, and this pins that asymmetry against a
+    /// symmetry-restoring "cleanup" (issue #185).
+    #[test]
+    fn two_reads_never_conflict() {
+        let weight = r(11, 0, 4096);
+
+        // The whole of `prev_inputs` is reads. Whatever it holds, a read against
+        // it is RAR and must order nothing -- so `read_hazards` does not take it
+        // and cannot be made to consult it by accident.
+        let mut prev_outputs = BoundSet::default();
+        assert!(
+            read_hazards(&prev_outputs, HazardKey::Range, &weight).is_empty(),
+            "a read conflicted against an empty write set"
+        );
+
+        prev_outputs.insert(HazardKey::Range, r(11, 8192, 128));
+        assert!(
+            read_hazards(&prev_outputs, HazardKey::Range, &weight).is_empty(),
+            "a read conflicted with a write to disjoint bytes"
+        );
+
+        // ... but a read of bytes something did write is RAW, and only RAW.
+        prev_outputs.insert(HazardKey::Range, weight);
+        assert_eq!(
+            read_hazards(&prev_outputs, HazardKey::Range, &weight)
+                .iter()
+                .map(HazardKind::as_str)
+                .collect::<Vec<_>>(),
+            ["raw"],
+            "a genuine read-after-write was missed, or mis-attributed"
         );
     }
 

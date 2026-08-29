@@ -40,6 +40,28 @@ pub struct Binding {
     pub buffer_addr: usize,
     /// Byte offset into the buffer.
     pub offset: usize,
+    /// Bytes the handle addresses from `offset` -- an arena view's slot rather
+    /// than the whole arena.
+    ///
+    /// **Added by issue #185, and its absence was a recorded wall.** §9.2j
+    /// finding 3 hit it (*"`record_binding` carries `ptr`, `offset` and
+    /// `is_output` but no length, and an interval test needs the extent on both
+    /// sides"*) and #144's `edge-cover.py` documents the consequence it had to
+    /// accept: keyed on `(buffer, offset)`, equality is *sufficient* for overlap
+    /// and not *necessary*, so two bindings at different offsets that genuinely
+    /// overlap are missed and the model **under-reports edges**. That is why
+    /// that script reads its verdict only against mutation controls and never as
+    /// a proof of safety.
+    ///
+    /// With the extent recorded the offline test can be the same interval test
+    /// `BoundRange::overlaps` runs, so the audit stops resting on absence of
+    /// evidence.
+    ///
+    /// Zero means an unknown extent, and consumers must treat it as covering the
+    /// whole allocation -- failing toward ordering, exactly as
+    /// `BoundRange::overlaps` does, since a spurious edge costs a false positive
+    /// in a report and a missed one costs silent corruption (§3.5).
+    pub len: usize,
     /// Whether the binding was made as an input or an output.
     pub is_output: bool,
 }
@@ -73,6 +95,18 @@ pub struct Dispatch {
     /// over-counts. Observing the barrier directly removes the modelling
     /// question entirely.
     pub barrier: bool,
+    /// Which hazard directions that barrier was for (issue #185).
+    ///
+    /// Empty when `barrier` is false. **This is the field that makes a barrier
+    /// count attributable**: §11.3p had to attribute the 505 by *position* --
+    /// covered non-head, run head, gap -- because the kind was computed at the
+    /// two emission sites and discarded into a `bool`. *"These N are WAR, and WAR
+    /// is the one a different layout would remove"* is not a sentence any prior
+    /// artifact could produce.
+    ///
+    /// A set rather than one value: a barrier is a latch and any number of
+    /// bindings may set it before it fires. See `HazardKinds`.
+    pub kinds: crate::metal::encoder::HazardKinds,
     /// Which encoder session this dispatch belongs to, counted from the start of
     /// the trace.
     ///
@@ -170,6 +204,8 @@ struct TraceState {
     /// Set by `record_barrier` when `auto_barrier` emits one, consumed by the
     /// dispatch that immediately follows it.
     pending_barrier: bool,
+    /// The directions behind `pending_barrier`, consumed with it (issue #185).
+    pending_kinds: crate::metal::encoder::HazardKinds,
     /// Encoder sessions begun so far, so a dispatch can name the one it is in.
     encoder: u64,
 }
@@ -185,6 +221,7 @@ impl TraceState {
             region: None,
             next_seq: 0,
             pending_barrier: false,
+            pending_kinds: crate::metal::encoder::HazardKinds::NONE,
             encoder: 0,
         }
     }
@@ -282,6 +319,24 @@ pub fn record_barrier() {
     }
 }
 
+/// Record which hazard directions the barrier about to be emitted is for
+/// (issue #185).
+///
+/// Called from `auto_barrier` immediately before [`record_barrier`], because
+/// this is the only point where the answer exists: `prev_outputs` and
+/// `prev_inputs` are replaced two lines later, so the evidence a downstream
+/// reconstruction would need is gone. §9.2f's rule that the barrier count cannot
+/// be simulated applies with more force to its attribution.
+#[inline]
+pub fn record_barrier_kinds(kinds: crate::metal::encoder::HazardKinds) {
+    if !is_recording() {
+        return;
+    }
+    if let Ok(mut s) = state().lock() {
+        s.pending_kinds = kinds;
+    }
+}
+
 /// Record that `auto_barrier` had a barrier pending and **did not emit it**,
 /// because the position is being replayed from the ICB (issue #144,
 /// `ReplayBarriers::SkipReplayed`).
@@ -354,7 +409,7 @@ pub fn record_encoder_begin() {
 
 /// Record a buffer binding against the dispatch that will consume it.
 #[inline]
-pub fn record_binding(index: usize, addr: usize, offset: usize, is_output: bool) {
+pub fn record_binding(index: usize, addr: usize, offset: usize, len: usize, is_output: bool) {
     if !is_recording() {
         return;
     }
@@ -365,6 +420,7 @@ pub fn record_binding(index: usize, addr: usize, offset: usize, is_output: bool)
             buffer_id,
             buffer_addr: addr,
             offset,
+            len,
             is_output,
         });
     }
@@ -392,6 +448,7 @@ pub fn record_dispatch(
             // dispatch's barrier must not be attributed to the first recorded
             // one.
             s.pending_barrier = false;
+            s.pending_kinds = crate::metal::encoder::HazardKinds::NONE;
         }
         return;
     }
@@ -407,6 +464,7 @@ pub fn record_dispatch(
             .unwrap_or_else(|| "<unknown>".to_string());
         let region = s.region.clone();
         let barrier = std::mem::take(&mut s.pending_barrier);
+        let kinds = s.pending_kinds.take();
         let encoder = s.encoder;
         s.dispatches.push(Dispatch {
             seq,
@@ -416,6 +474,7 @@ pub fn record_dispatch(
             by_threadgroups,
             bindings,
             barrier,
+            kinds,
             encoder,
             region,
         });
