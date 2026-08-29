@@ -1,3 +1,9 @@
+/// The memory budget: predict the peak before allocating, and refuse (§9.5).
+///
+/// Deliberately **not** in the glob re-export below: `Budget` and `Footprint`
+/// are general names, and a caller reaching for them should say `admission::`
+/// rather than acquire them from a `metal::*`.
+pub mod admission;
 pub mod arena;
 pub mod arena_cursor;
 #[cfg(test)]

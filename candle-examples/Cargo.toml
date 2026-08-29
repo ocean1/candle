@@ -92,7 +92,23 @@ mkl = [
 ]
 nccl = ["cuda", "cudarc/nccl", "dep:half"]
 onnx = ["candle-onnx"]
-metal = ["candle/metal", "candle-nn/metal", "dep:candle-metal-kernels"]
+# `candle-transformers/metal` is here because a model may carry Metal-only
+# behaviour, and without it that behaviour silently compiles to its non-Metal
+# stub in every example. `lfm2::Cache::admit_memory_budget` (§9.5l) is the case
+# that found it: the check is `#[cfg(feature = "metal")]`, so every harness was
+# building the inert arm and admission never ran however it was configured.
+#
+# **Pre-existing, and invisible because nothing in `candle-transformers` was
+# gated on `metal` before** -- an unused feature flag reads exactly like a
+# correct one. Note the line below already propagates
+# `candle-transformers/metal-debug-labels`, which is what makes the omission
+# here an oversight rather than a decision.
+metal = [
+    "candle/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+    "dep:candle-metal-kernels",
+]
 metal-debug-labels = ["metal", "candle/metal-debug-labels", "candle-nn/metal-debug-labels", "candle-transformers/metal-debug-labels"]
 microphone = ["cpal", "rubato"]
 encodec = ["cpal", "symphonia", "rubato"]

@@ -112,6 +112,8 @@ impl Lfm2Config {
             attn_impl: AttnImpl::default(),
             kv_append: KvAppend::default(),
             conv_state: ConvState::default(),
+            // §9.5's admission is off unless a caller asks for it, per §7.1a.
+            memory_budget: None,
         }
     }
 }
@@ -347,6 +349,53 @@ pub enum KvAppend {
 /// `Cache::new_with` documentation for why, and for what would decide it.
 pub const DEFAULT_KV_CAPACITY: usize = 4096;
 
+/// What admission needs that `Config` does not already carry (`DESIGN.md`
+/// §9.5d).
+///
+/// Present on `Config` as an `Option`, defaulting to `None`, so every existing
+/// caller keeps the path it had without naming it — the shape `AttnImpl`,
+/// `KvAppend` and `ConvState` all use (§7.1a).
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryBudget {
+    /// Total weight bytes, from the checkpoint header (§5.5).
+    ///
+    /// Taken as a number rather than read here: the model's weights are loaded
+    /// through a `VarBuilder` whose backing store this type cannot see, and a
+    /// text-only request legitimately drops the 0.86 GB vision tower (#162).
+    /// The caller knows which; this does not.
+    pub weight_bytes: usize,
+    /// Concurrent sequences. Every measurement in this project is B=1 (§13.2).
+    pub batch: usize,
+    /// Fraction of `recommendedMaxWorkingSetSize` this process may claim.
+    ///
+    /// **0.65 is §9.5k's table value and not a measurement.** No evidence
+    /// chooses it; it is a default that is visible and settable for that
+    /// reason.
+    pub fraction: f64,
+}
+
+impl MemoryBudget {
+    /// The fraction §9.5k's residual table is computed at.
+    ///
+    /// Duplicated from `admission::DEFAULT_BUDGET_FRACTION` rather than
+    /// referenced, because this type exists on every backend and that constant
+    /// is Metal-only. The two are asserted equal by
+    /// `default_fraction_matches_admissions` under the `metal` feature, so the
+    /// copy cannot drift — which is §8.1b's checked-registry argument at the
+    /// smallest possible scale.
+    pub const DEFAULT_FRACTION: f64 = 0.65;
+
+    /// A B=1 budget at §9.5k's fraction, for a model whose weights are
+    /// `weight_bytes`.
+    pub fn new(weight_bytes: usize) -> Self {
+        Self {
+            weight_bytes,
+            batch: 1,
+            fraction: Self::DEFAULT_FRACTION,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vocab_size: usize,
@@ -372,6 +421,10 @@ pub struct Config {
     pub kv_append: KvAppend,
     /// Defaults to `Shuffle`, so every existing caller keeps §6.1's path.
     pub conv_state: ConvState,
+    /// `DESIGN.md` §9.5's memory budget. `None` — admission off — by default,
+    /// per §7.1a's rule that no default is flipped without its own argued
+    /// decision. See `Cache::admit_memory_budget`.
+    pub memory_budget: Option<MemoryBudget>,
 }
 
 impl Config {
@@ -571,6 +624,18 @@ impl Cache {
         device: &Device,
         kv_capacity: usize,
     ) -> Result<Self> {
+        // `DESIGN.md` §9.5d: admission at configuration time, BEFORE the first
+        // allocation. It is `Ok(())` unless a caller has asked for it -- see
+        // `admit_memory_budget` for why it is opt-in and what it costs.
+        //
+        // **The ordering is the point.** The RoPE `cos`/`sin` tables below are
+        // built from `max_position_embeddings` through `Tensor` ops, i.e.
+        // through the pool: at the shipped 128000 that is 16.4 MB resident and
+        // ~49 MB transient (§9.5k). They are not one of §9.1's five classes,
+        // and an admission check placed after them would not see them. Running
+        // first means the refusal happens before any of it is allocated.
+        Self::admit_memory_budget(config, device, kv_capacity)?;
+
         let theta = calculate_default_inv_freq(config);
         let theta = Tensor::new(theta, device)?;
 
@@ -597,6 +662,118 @@ impl Cache {
             cos,
             sin,
         })
+    }
+
+    /// `DESIGN.md` §9.5's admission check: predict the peak, refuse before
+    /// allocating, and install §9.5k's derived residual as a runtime cap.
+    ///
+    /// # Opt-in, and why
+    ///
+    /// Returns `Ok(())` unless [`Config::memory_budget`] is set. Three reasons
+    /// it is not on by default, and the first is this project's own rule:
+    ///
+    /// * **§7.1a: no default is flipped without its own argued decision.** A
+    ///   budget that refuses is a behaviour change for every consumer of this
+    ///   model, and the evidence for a *fraction* does not exist — 0.65 is
+    ///   §9.5k's table value, not a measurement.
+    /// * **The denominator is only meaningful on Metal.**
+    ///   `recommendedMaxWorkingSetSize` has no CPU or CUDA analogue, so a
+    ///   non-Metal device is admitted unconditionally rather than being given a
+    ///   number that means nothing (§9.5c).
+    /// * **§9.5f: admission is necessary and not sufficient.** Every reachable
+    ///   B=1 configuration predicts under 8.71 GB and the machine died with
+    ///   54.91 GB wired, so this would have refused nothing on the run that
+    ///   crashed. Making it the default would suggest a guarantee it does not
+    ///   give.
+    ///
+    /// # What it costs
+    ///
+    /// Once per process, and it is six multiplies and a comparison against a
+    /// figure the device already exposes. **Free by inspection: it is not on
+    /// any per-token path** (§9.5e). The residual cap it installs is one branch
+    /// on counters the pool already maintains, and it calls into Metal nowhere.
+    #[cfg(not(feature = "metal"))]
+    fn admit_memory_budget(_: &Config, _: &Device, _: usize) -> Result<()> {
+        // No Metal, no `recommendedMaxWorkingSetSize`, nothing to check
+        // against. The CPU and CUDA backends compile none of the above, which
+        // is the constraint upstreaming imposes (§14.1).
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn admit_memory_budget(config: &Config, device: &Device, kv_capacity: usize) -> Result<()> {
+        use candle::metal_backend::admission;
+
+        let Some(budget) = config.memory_budget else {
+            return Ok(());
+        };
+        // Non-Metal device with the metal feature built in: no denominator
+        // exists, so there is nothing to check against. Silent rather than an
+        // error -- a CPU run is a legitimate thing to do and refusing it here
+        // would be an unrelated regression.
+        let Ok(metal) = device.as_metal_device() else {
+            return Ok(());
+        };
+
+        let mut b = admission::Budget::new(
+            budget.weight_bytes,
+            kv_capacity,
+            config.max_position_embeddings,
+        );
+        b.batch = budget.batch;
+        b.fraction = budget.fraction;
+        // §10.2g: `Shuffle` and `RotatingRing` hold exactly `l_cache` columns
+        // (264 KiB); `SlidingRing` holds the slack it slides through as well,
+        // which is 1.63 MiB at the default. Taken from `ConvState::width`
+        // rather than recomputed, so the budget cannot disagree with the
+        // allocation about how wide the state is -- the hand-sync §8.1b exists
+        // to remove.
+        b.conv_state_bytes = admission::CONV_STATE_BYTES
+            * config.conv_state.width(config.conv_l_cache)
+            / config.conv_l_cache;
+        // The RoPE `cos`/`sin` tables (§9.5k's "sixth allocation the five
+        // classes do not name"). Two f16 tables of
+        // `max_position_embeddings x head_dim/2`, built through the pool in
+        // this very function. Accounted rather than excluded: they are
+        // negligible against the budget at 16.4 MB, and they **scale with the
+        // context axis #161 sweeps**, which is the reason §9.5k records them
+        // instead of folding them in silently.
+        let rope_resident = 2 * config.max_position_embeddings * (config.head_dim() / 2) * 2;
+        // The transient peak is larger than the resident figure -- an f32
+        // `idx_theta` plus f32 `cos`/`sin` before the cast, ~49 MB at 128000 --
+        // and it is the one that has to fit, since it is live inside this call.
+        let rope_transient = 3 * config.max_position_embeddings * (config.head_dim() / 2) * 4;
+        let rope = rope_resident + rope_transient;
+
+        let admission = b.admit(metal.device().recommended_max_working_set_size());
+        // The RoPE tables come out of the residual rather than being added to
+        // the predicted classes: they are exactly the kind of allocation the
+        // residual exists to cover (§9.5k -- "an allocation nothing planned"),
+        // and putting them in `Footprint` would make its rows stop matching
+        // §9.1's five classes.
+        if !admission.fits || admission.residual < rope {
+            candle::bail!(
+                "{}\n  (plus {:.2} MB for the RoPE cos/sin tables at \
+                 max_position_embeddings={}, which are built before the first \
+                 token and are not one of §9.1's five classes)",
+                admission.describe(),
+                rope as f64 / 1e6,
+                config.max_position_embeddings,
+            );
+        }
+
+        // Install §9.5k's derived cap. `planned` differs per pool because the
+        // two hold different classes and `live_bytes` already contains them:
+        // the KV reserve is served from `buffers`, the weights from
+        // `private_buffers`. The arena is in neither -- `install_arena` calls
+        // the raw device.
+        let f = &admission.footprint;
+        metal.set_residual_cap(
+            admission.residual,
+            /* shared  */ f.kv + f.conv,
+            /* private */ f.weights + f.scratch,
+        );
+        Ok(())
     }
 
     fn mask(&mut self, seq_len: usize, index_pos: usize) -> Result<Tensor> {

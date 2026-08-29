@@ -29,6 +29,14 @@ pub use candle_metal_kernels::metal::{
     hazard_key, set_hazard_key, ArenaCounters, ArenaLayout, HazardKey, Slot, StepPlan,
 };
 
+/// The memory budget: predict the peak before allocating, and refuse (§9.5).
+///
+/// Re-exported for the same reason `trace` is: a model deciding whether its
+/// configuration fits should not need a direct dependency on
+/// `candle-metal-kernels`. It is the model that knows its own geometry, and it
+/// is `candle-core` that both it and the pools already depend on.
+pub use candle_metal_kernels::metal::admission;
+
 /// Per-dispatch recording of the Metal command stream.
 ///
 /// Re-exported so a measurement harness can drive it without taking a direct
