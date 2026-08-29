@@ -24,6 +24,13 @@ mod executor_tests;
 pub mod fence;
 #[cfg(test)]
 mod flash_decoding_tests;
+/// Strict ordering verification (issue #185). Every entry point is inert
+/// without the `hazard-audit` feature, so the module is declared
+/// unconditionally and compiles to nothing when the feature is off --
+/// `run_telemetry`'s shape, for its reasons.
+pub mod hazard_audit;
+#[cfg(test)]
+mod hazard_audit_tests;
 pub mod icb;
 #[cfg(test)]
 mod icb_executor_tests;

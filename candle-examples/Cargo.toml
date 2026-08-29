@@ -110,6 +110,25 @@ metal = [
     "dep:candle-metal-kernels",
 ]
 metal-debug-labels = ["metal", "candle/metal-debug-labels", "candle-nn/metal-debug-labels", "candle-transformers/metal-debug-labels"]
+# Strict ordering verification (#185, `DESIGN.md` §11.3t), reachable from a
+# harness because this line exists -- #205's defect below, avoided rather than
+# repeated.
+#
+# **Only `candle` is named**, per the rule the next entry states and counts:
+# `grep -rn 'feature = "hazard-audit"'` over the tree hits
+# `candle-metal-kernels` **30 times and no other crate**. The first version of
+# this line also named `candle-nn` and `candle-transformers`, by symmetry with
+# `metal-debug-labels` above; those two names propagated to no gated code, which
+# is exactly what that rule predicts and why it is stated once below rather than
+# twice.
+#
+# The reach is `candle/metal-hazard-audit` -> `candle-metal-kernels/hazard-audit`,
+# asserted by a **run** rather than by this comment:
+# `lfm2-dispatch-trace --assert-hazard-audit` evaluates `cfg!` in this crate and
+# exits non-zero when the feature did not arrive, and `cargo metadata` resolves
+# `candle-metal-kernels` to `['default', 'hazard-audit']` against `['default']`
+# under `--features metal` alone.
+metal-hazard-audit = ["metal", "candle/metal-hazard-audit"]
 # Per-memory-class and event telemetry (#171, `DESIGN.md` §3.4a-iv), reachable
 # from a harness for the first time (#205).
 #
