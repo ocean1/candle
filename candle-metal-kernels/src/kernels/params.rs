@@ -607,7 +607,6 @@ pub fn expected_conv_layout() -> Vec<(&'static str, u32)> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexParams {
     pub dst_size: u64,
-    pub left_size: u64,
     pub src_dim_size: u64,
     pub right_size: u64,
     pub ids_size: u64,
@@ -620,7 +619,6 @@ pub struct IndexParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GatherParams {
     pub dst_size: u64,
-    pub left_size: u64,
     pub src_dim_size: u64,
     pub right_size: u64,
     pub ids_size: u64,
@@ -636,7 +634,6 @@ pub struct GatherParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScatterParams {
     pub dst_size: u64,
-    pub left_size: u64,
     pub src_dim_size: u64,
     pub right_size: u64,
     pub dst_dim_size: u64,
@@ -647,7 +644,6 @@ pub struct ScatterParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexAddParams {
     pub dst_size: u64,
-    pub left_size: u64,
     pub src_dim_size: u64,
     pub right_size: u64,
     pub dst_dim_size: u64,
@@ -661,8 +657,12 @@ pub const INDEXING_LAYOUT_KERNEL: &str = "indexing_params_layout";
 /// computes for it.
 ///
 /// As [`expected_reduce_layout`], for `indexing.metal`. The interesting rows
-/// are [`IndexParams`]'s: `contiguous` at 40 and `src_num_dims` at 48 with a
-/// `sizeof` of 56, which is the padding rule rather than any field width.
+/// are [`IndexParams`]'s: `contiguous` at 32 and `src_num_dims` at 40 with a
+/// `sizeof` of 48, which is the padding rule rather than any field width.
+///
+/// Those were 40 / 48 / 56 before #219 removed `left_size`; the rule they
+/// illustrate is unchanged, since what pads is the `bool` and it pads wherever
+/// it lands.
 pub fn expected_indexing_layout() -> Vec<(&'static str, u32)> {
     use core::mem::{align_of, offset_of, size_of};
 
@@ -676,10 +676,6 @@ pub fn expected_indexing_layout() -> Vec<(&'static str, u32)> {
         (
             "IndexParams.dst_size",
             offset_of!(IndexParams, dst_size) as u32,
-        ),
-        (
-            "IndexParams.left_size",
-            offset_of!(IndexParams, left_size) as u32,
         ),
         (
             "IndexParams.src_dim_size",
@@ -707,10 +703,6 @@ pub fn expected_indexing_layout() -> Vec<(&'static str, u32)> {
             offset_of!(GatherParams, dst_size) as u32,
         ),
         (
-            "GatherParams.left_size",
-            offset_of!(GatherParams, left_size) as u32,
-        ),
-        (
             "GatherParams.src_dim_size",
             offset_of!(GatherParams, src_dim_size) as u32,
         ),
@@ -728,10 +720,6 @@ pub fn expected_indexing_layout() -> Vec<(&'static str, u32)> {
             offset_of!(ScatterParams, dst_size) as u32,
         ),
         (
-            "ScatterParams.left_size",
-            offset_of!(ScatterParams, left_size) as u32,
-        ),
-        (
             "ScatterParams.src_dim_size",
             offset_of!(ScatterParams, src_dim_size) as u32,
         ),
@@ -747,10 +735,6 @@ pub fn expected_indexing_layout() -> Vec<(&'static str, u32)> {
         (
             "IndexAddParams.dst_size",
             offset_of!(IndexAddParams, dst_size) as u32,
-        ),
-        (
-            "IndexAddParams.left_size",
-            offset_of!(IndexAddParams, left_size) as u32,
         ),
         (
             "IndexAddParams.src_dim_size",

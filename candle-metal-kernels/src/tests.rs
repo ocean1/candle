@@ -5278,7 +5278,11 @@ fn every_family_params_layout_matches_metal() {
         ("affine.metal", 16),
         ("gemv.metal", 8),
         ("conv.metal", 65),
-        ("indexing.metal", 27),
+        // 27 until #219, which removed `left_size` from all four of this
+        // file's structs — four `offsetof` rows, one per struct. A **removal**
+        // is as deliberate as an addition and moves this number the same way;
+        // the guard fired on it, which is what it is for.
+        ("indexing.metal", 23),
         ("scaled_dot_product_attention.metal", 7),
         // Added by #116 (`DESIGN.md` §10.4a) — a deliberate addition, which is
         // what this list requires. **16 slots for two structs in one file**:
@@ -5968,21 +5972,35 @@ fn indexing_packed_matches_split_for_index_add() {
 /// is the `include_str!`'d text the GPU is actually asked to compile, not a
 /// copy written for the test.
 ///
-/// The mutation **swaps `IndexParams.dst_size` and `.left_size`**, two adjacent
-/// `size_t`. That case is chosen over inserting or removing a field because it
-/// is the one nothing else catches:
+/// The mutation **swaps `IndexParams.src_dim_size` and `.right_size`**, two
+/// adjacent `size_t`. That case is chosen over inserting or removing a field
+/// because it is the one nothing else catches:
 ///
-/// * `sizeof` is unchanged at 56, so the `static_assert` in `indexing.metal`
+/// * `sizeof` is unchanged at 48, so the `static_assert` in `indexing.metal`
 ///   still passes;
 /// * both fields are `size_t`, so the brace initializer in the classical
 ///   wrapper still type-checks — inserting a field of a *different* type is
 ///   rejected by C++11 narrowing before it ever reaches a GPU, which is a real
 ///   layer of defence but not this one;
-/// * the kernel runs and bounds-checks against the wrong number, producing a
+/// * the kernel runs and indexes against the wrong number, producing a
 ///   plausible wrong answer rather than a crash.
 ///
 /// This is `DESIGN.md` §8.1c's warning about `im2col`'s eight consecutive
-/// `constant size_t` parameters, in the family that has five.
+/// `constant size_t` parameters, in the family that has four.
+///
+/// # Why not `dst_size`/`left_size`, which this test swapped until #219
+///
+/// **Because `left_size` no longer exists, and this test is part of why.**
+/// §11.3k finding 3 found the field *with a mutation that survived*: swapping
+/// it changed nothing observable, since every body derives what it needs from
+/// `tid / right_size` and no kernel ever read it. §11.3l finding 3 then
+/// sharpened the rule this test now obeys — **both swapped fields must be read,
+/// and must hold different values** — and this test was carrying the first
+/// failure mode between #81 and #219: half its assertion was over a field the
+/// GPU ignores.
+///
+/// `src_dim_size` and `right_size` are both read by `index_body`: the first
+/// clamps the index, the second divides `tid` twice. A swap changes the answer.
 #[test]
 fn indexing_params_layout_check_detects_a_moved_field() {
     use crate::kernels::params::LayoutFamily;
@@ -5990,19 +6008,19 @@ fn indexing_params_layout_check_detects_a_moved_field() {
     let descriptor = LayoutFamily::Indexing.descriptor();
     let pipeline = mutated_layout_pipeline(
         crate::source::INDEXING,
-        "struct IndexParams {\n    size_t dst_size;\n    size_t left_size;",
-        "struct IndexParams {\n    size_t left_size;\n    size_t dst_size;",
+        "struct IndexParams {\n    size_t dst_size;\n    size_t src_dim_size;\n    size_t right_size;",
+        "struct IndexParams {\n    size_t dst_size;\n    size_t right_size;\n    size_t src_dim_size;",
         descriptor.kernel,
     );
     let d = layout_disagreements(&pipeline, &descriptor.expected);
 
     assert!(
-        d.iter().any(|x| x.starts_with("IndexParams.dst_size")),
-        "swapping dst_size must be reported; got {d:?}"
+        d.iter().any(|x| x.starts_with("IndexParams.src_dim_size")),
+        "swapping src_dim_size must be reported; got {d:?}"
     );
     assert!(
-        d.iter().any(|x| x.starts_with("IndexParams.left_size")),
-        "swapping left_size must be reported; got {d:?}"
+        d.iter().any(|x| x.starts_with("IndexParams.right_size")),
+        "swapping right_size must be reported; got {d:?}"
     );
     assert!(
         !d.iter().any(|x| x.starts_with("sizeof(IndexParams)")),
@@ -6414,8 +6432,9 @@ fn sdpa_packed_matches_split_for_sdpa_vector() {
 ///   plausible wrong answer rather than a crash.
 ///
 /// **Both swapped fields are read**, which is the condition #81's finding 3
-/// makes explicit: `left_size` in `indexing.metal` is bound by all five kernels
-/// and read by none, so a mutation swapping it proves nothing. `k_stride` and
+/// makes explicit: `left_size` in `indexing.metal` **was** bound by all five
+/// kernels and read by none, so a mutation swapping it proved nothing — which
+/// is how it was found, and #219 has since removed it. `k_stride` and
 /// `v_stride` are each dereferenced in `sdpa_vector_body`'s pointer adjustment.
 ///
 /// It is mutated on **production source** — `crate::source::SDPA` is the same
