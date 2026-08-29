@@ -416,7 +416,23 @@ fn render(step: &Step) -> String {
                 "threads"
             },
             d.encoder,
-            if d.barrier { "  BARRIER" } else { "" }
+            // The kinds are appended AFTER the `BARRIER` token, never woven
+            // into it (issue #185). `measurements/issue-144-raw/edge-cover.py`
+            // and `hazard_audit_crosscheck` both key on that literal, and
+            // #11.3h's recurring lesson is that a figure edited away from the
+            // shape its readers expect is one nobody can re-check. Appending
+            // leaves every existing parser matching and gives a new one the
+            // attribution.
+            if d.barrier {
+                let kinds: Vec<&str> = d.kinds.iter().map(|k| k.as_str()).collect();
+                if kinds.is_empty() {
+                    "  BARRIER".to_string()
+                } else {
+                    format!("  BARRIER [{}]", kinds.join(","))
+                }
+            } else {
+                String::new()
+            }
         ));
         for b in &d.bindings {
             out.push_str(&format!(
@@ -949,6 +965,58 @@ fn main() -> Result<()> {
             steady.dispatches.len(),
             100.0 * barriers as f64 / steady.dispatches.len().max(1) as f64
         );
+
+        // Per-kind attribution -- the artifact no previous instrument could
+        // produce (issue #185). §11.3p had to attribute the 505 by *position*
+        // (covered non-head, run head, gap) because the direction was computed
+        // at the two emission sites and discarded into a bool.
+        //
+        // The columns do NOT partition the total: a barrier is a latch, so one
+        // may be owed to several directions at once and is counted in each.
+        // `only` is the partition -- barriers attributable to exactly one
+        // direction -- and it is the column that answers "these N are WAR, and
+        // WAR is the one a different layout would remove."
+        use candle_metal_kernels::metal::encoder::HazardKind;
+        let mut any = [0usize; 3];
+        let mut only = [0usize; 3];
+        let mut multi = 0usize;
+        let mut unattributed = 0usize;
+        for d in steady.dispatches.iter().filter(|d| d.barrier) {
+            let ks: Vec<HazardKind> = d.kinds.iter().collect();
+            if ks.is_empty() {
+                unattributed += 1;
+                continue;
+            }
+            for k in &ks {
+                let i = match k {
+                    HazardKind::Raw => 0,
+                    HazardKind::Waw => 1,
+                    HazardKind::War => 2,
+                };
+                any[i] += 1;
+                if ks.len() == 1 {
+                    only[i] += 1;
+                }
+            }
+            if ks.len() > 1 {
+                multi += 1;
+            }
+        }
+        println!("  by direction (a barrier owed to two is counted in each):");
+        for (i, name) in ["RAW", "WAW", "WAR"].iter().enumerate() {
+            println!(
+                "    {name}: {:>4} barriers  ({:>4} owed to {name} alone)",
+                any[i], only[i]
+            );
+        }
+        println!("    owed to more than one direction: {multi}");
+        if unattributed > 0 {
+            // Not expected: a barrier fires only because a hazard set the latch,
+            // so an unattributed one means the kinds were drained somewhere the
+            // latch was not. Reported rather than hidden -- it would be a defect
+            // in this change, and a silent zero is how it would survive.
+            println!("    UNATTRIBUTED: {unattributed}  <- expected 0; see issue #185");
+        }
     }
 
     // Kernel histogram: what the per-token dispatch budget is actually spent on.
