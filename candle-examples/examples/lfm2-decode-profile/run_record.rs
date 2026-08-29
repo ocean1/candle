@@ -96,8 +96,22 @@ pub fn self_uuid() -> Option<String> {
                 return Some(format!(
                     "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-\
                      {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
-                    b[12], b[13], b[14], b[15]
+                    b[0],
+                    b[1],
+                    b[2],
+                    b[3],
+                    b[4],
+                    b[5],
+                    b[6],
+                    b[7],
+                    b[8],
+                    b[9],
+                    b[10],
+                    b[11],
+                    b[12],
+                    b[13],
+                    b[14],
+                    b[15]
                 ));
             }
             cmd = cmd.add((*lc).cmdsize as usize);
@@ -261,7 +275,12 @@ impl RunRecord {
             if i > 0 {
                 s.push(',');
             }
-            let _ = write!(s, "\"{}\":{{\"kind\":\"Arm\",\"arm\":\"{}\"}}", esc(k), esc(v));
+            let _ = write!(
+                s,
+                "\"{}\":{{\"kind\":\"Arm\",\"arm\":\"{}\"}}",
+                esc(k),
+                esc(v)
+            );
         }
         s.push_str("}}");
 
@@ -331,8 +350,12 @@ impl RunRecord {
                 st.index,
                 st.warmup,
                 st.wall_ms,
-                st.gpu_ms.map(|v| format!("{v:.6}")).unwrap_or("null".into()),
-                st.dispatches.map(|v| v.to_string()).unwrap_or("null".into()),
+                st.gpu_ms
+                    .map(|v| format!("{v:.6}"))
+                    .unwrap_or("null".into()),
+                st.dispatches
+                    .map(|v| v.to_string())
+                    .unwrap_or("null".into()),
                 st.t_end_ns,
                 st.kv_len,
             );

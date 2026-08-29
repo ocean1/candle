@@ -480,6 +480,31 @@ impl KvSlot {
         self.all_data = None;
     }
 
+    /// Discard the last `count` appended positions.
+    ///
+    /// `DESIGN.md` §10.2a's KV half of `resolve`: *"`len += n`; discarded bytes
+    /// **need not be cleared** — unreachable above `len`"*. The read is
+    /// `all_data.narrow(2, 0, self.len)`, so a position above `len` is outside
+    /// every view this slot hands out and no kernel can address it.
+    ///
+    /// **The allocation is deliberately not touched.** Rewinding frees nothing
+    /// and must not: stable buffer identity is the property §6.2b exists to
+    /// preserve (`buf#69` at the same base every token), and dropping the
+    /// buffer on rollback would move it at exactly the moment a speculative
+    /// scheme runs most often. A rewind is a length decrement and nothing else,
+    /// which is what §10.2a's cost column means by *"a length decrement"*.
+    fn rewind(&mut self, count: usize) -> Result<()> {
+        if count > self.len {
+            candle::bail!(
+                "lfm2 KV rewind past the start: {count} > len {}. \
+                 `resolve(n)` may only discard positions this speculation appended.",
+                self.len
+            )
+        }
+        self.len -= count;
+        Ok(())
+    }
+
     /// Append `src` along dim 2 and return the live prefix as a view.
     ///
     /// Returns `Err` rather than reallocating when the capacity is exhausted —
@@ -545,6 +570,37 @@ pub struct Cache {
     /// never ran and the window silently read stale slots from the 17th token
     /// on. Caught by the bitwise parity test, which is what it is for.
     conv_compact: bool,
+    /// The conv arm and window width, copied from `Config` so that
+    /// [`Cache::advance`] and [`Cache::resolve`] can check and move the phase
+    /// without a `Model` in hand.
+    ///
+    /// Duplicated rather than referenced because a `Cache` outlives no `Model`
+    /// and holding a borrow would infect every caller's lifetimes; the pair is
+    /// read once at construction and neither is mutable, so they cannot drift
+    /// from the arm the layers actually take.
+    conv_state: ConvState,
+    l_cache: usize,
+    /// Set between [`Cache::advance`] and [`Cache::resolve`]: this pass is a
+    /// speculative verify, so the conv layers must **ring-write** their
+    /// `seq_len` positions rather than rebuilding the state from them.
+    ///
+    /// # Why this needs a flag rather than being inferred from `seq_len > 1`
+    ///
+    /// `seq_len > 1` has two callers with opposite requirements. A **prefill**
+    /// wants the existing rebuild: it is establishing history from nothing, the
+    /// pre-pass state is meaningless, and `Conv1d` over the whole prompt is the
+    /// efficient way to do it. A **verify pass** wants the opposite: the
+    /// pre-pass state is the sequence's real history, and the positions it
+    /// writes must be individually discardable, which is what the ring's slots
+    /// are for (§10.2a).
+    ///
+    /// Inferring from `seq_len` cannot separate them, and inferring from
+    /// "`conv_states` is already populated" would silently change what a
+    /// **turn-boundary prefill** does — §10.9 measures that as a `seq_len > 1`
+    /// pass onto a warm cache, which is the prefill case and must keep the
+    /// rebuild. So the caller says which it is, and `advance`/`resolve` are the
+    /// only things that set it.
+    speculative: bool,
     cos: Tensor,
     sin: Tensor,
     device: Device,
@@ -658,6 +714,9 @@ impl Cache {
             conv_states: vec![None; num_layers],
             conv_phase: 0,
             conv_compact: false,
+            conv_state: config.conv_state,
+            l_cache: config.conv_l_cache,
+            speculative: false,
             device: device.clone(),
             cos,
             sin,
@@ -803,6 +862,224 @@ impl Cache {
         self.conv_states.iter_mut().for_each(|v| *v = None);
         self.conv_phase = 0;
         self.conv_compact = false;
+    }
+
+    /// The conv ring's current write slot.
+    ///
+    /// Exposed because the speculative rollback contract is a statement *about*
+    /// this index, so a test asserting the contract has to be able to read it.
+    /// Read-only: the phase is advanced by `Model::forward` alone, which is the
+    /// one-owner property §10.2e records as having already been wrong once.
+    pub fn conv_phase(&self) -> usize {
+        self.conv_phase
+    }
+
+    /// One layer's conv state, for tests that assert what a code path left in
+    /// the buffer rather than what it computed.
+    ///
+    /// `pub` rather than `pub(crate)` because the tests that need it are
+    /// integration tests — the limitation being pinned is a property of the
+    /// public forward path, and asserting it from inside the module would not
+    /// exercise the same call.
+    pub fn conv_state_for_test(&self, block_idx: usize) -> Option<Tensor> {
+        self.conv_states.get(block_idx).cloned().flatten()
+    }
+
+    /// Open a speculative window of `k` positions — `DESIGN.md` §10.2a's
+    /// `advance`.
+    ///
+    /// This does **not** write anything. It records the state a `resolve` must
+    /// be able to return to, and the write happens when `Model::forward` runs
+    /// the K-position pass. Splitting it that way is what lets one `SpecToken`
+    /// cover both halves of the state: the KV length and the conv phase are
+    /// both read here, before either is moved.
+    ///
+    /// Between this call and its [`Cache::resolve`], reads see all `len + k`
+    /// positions, and **no second `advance` is permitted** — enforced by
+    /// `SpecToken` not being `Copy`, so the caller cannot hold two.
+    pub fn advance(&mut self, k: usize) -> Result<SpecToken> {
+        if k == 0 {
+            candle::bail!("lfm2 advance(0): a speculative window must have at least one position")
+        }
+        // The rotating ring's history must be wide enough that `k` speculative
+        // writes do not overwrite the live window: the buffer is `l_cache + k_ring`
+        // wide and a window of `k` consumes `k` slots, leaving `l_cache + k_ring - k`
+        // for a window that needs `l_cache`. Checked here rather than at the
+        // write, because a partial pass is not rollback-able and this is the
+        // last point at which refusing is free.
+        if let ConvState::RotatingRing { k: k_ring } = self.conv_state {
+            if k > k_ring {
+                candle::bail!(
+                    "lfm2 advance({k}): `--conv-state rotating:{k_ring}` reserves {k_ring} \
+                     history slots, so a {k}-position speculation would overwrite the live \
+                     window. Use `rotating:{k}` or larger (`DESIGN.md` §16 6b: the ring's K \
+                     and the verifier's K are the same number)."
+                )
+            }
+        } else {
+            // §10.2a's whole premise: the shuffle is destructive, so the column
+            // leaving the window is gone and no rollback can restore it. The
+            // sliding ring is rejected for a second reason -- its compaction
+            // relocates the live window, so a phase decrement does not undo a
+            // speculation that spanned one.
+            candle::bail!(
+                "lfm2 advance: speculation requires `--conv-state rotating:<K>`. \
+                 `Shuffle` is destructive (`DESIGN.md` §10.2a) and `SlidingRing` \
+                 compacts, which relocates the window a rewind would have to restore."
+            )
+        }
+        // The conv layers must ring-write this pass rather than rebuilding from
+        // it, and `Model::forward_all` must advance the phase by `seq_len`
+        // rather than seeding it. Set here and cleared by `resolve`, so the
+        // window's extent is exactly the token's lifetime.
+        self.speculative = true;
+        Ok(SpecToken {
+            k,
+            // The first *allocated* slot, not the first slot: 22 of 30 layers
+            // are conv and never append, so `kv_slots[0]` is empty on a model
+            // whose layer 0 is a conv layer -- which LFM2's is (§5.3).
+            kv_len: self
+                .kv_slots
+                .iter()
+                .find(|(k_slot, _)| k_slot.all_data.is_some())
+                .map(|(k_slot, _)| k_slot.len),
+            conv_phase: self.conv_phase,
+        })
+    }
+
+    /// Accept the first `n` of the token's `k` positions and discard the rest —
+    /// `DESIGN.md` §10.2a's `resolve`.
+    ///
+    /// `n == k` is full acceptance, `n == 0` full rejection. **One call reaching
+    /// both halves of the state** is the contract's second structural property:
+    /// a caller cannot satisfy the KV half and forget the conv half, because
+    /// there is only one entry point and it iterates the layer list itself.
+    ///
+    /// `k − n` is derived rather than supplied, so the inconsistent case a
+    /// `commit(n)` + `discard(k − n)` pair admits is unrepresentable.
+    pub fn resolve(&mut self, tok: SpecToken, n: usize) -> Result<()> {
+        if n > tok.k {
+            candle::bail!(
+                "lfm2 resolve({n}) on a {}-position speculation: cannot accept more than \
+                 were proposed",
+                tok.k
+            )
+        }
+        // The window closes here whatever the outcome, so the conv layers stop
+        // ring-writing and the next ordinary pass behaves as it always did.
+        // Cleared before the checks below so that an error leaves the flag down
+        // rather than stranding the cache in speculative mode.
+        self.speculative = false;
+
+        // The `Cat` arm has no length to rewind: `kvs` holds whatever
+        // `Tensor::cat` produced, and the discarded positions are inside that
+        // allocation. Checked before anything is mutated, and unconditionally
+        // rather than only when `discard > 0` — a full acceptance on the `Cat`
+        // arm is still a configuration whose *next* rejection would be silently
+        // wrong, and reporting that at the first `resolve` is what makes the
+        // constraint discoverable.
+        if self.kv_append == KvAppend::Cat && self.use_kv_cache {
+            candle::bail!(
+                "lfm2 resolve: speculation requires `--kv-append in-place`. \
+                 The `Cat` arm has no length to rewind -- the discarded positions are \
+                 inside the concatenated allocation."
+            )
+        }
+
+        // The phase must be where `k` positions of ring-writing would have left
+        // it. Checked before any mutation, and on every resolve rather than only
+        // on a rejection: a full acceptance that ran the wrong number of passes
+        // is equally wrong and is the case a `discard == 0` early return would
+        // have skipped.
+        let width = self.conv_state.width(self.l_cache);
+        let expected = (tok.conv_phase + tok.k) % width;
+        if self.conv_phase != expected {
+            candle::bail!(
+                "lfm2 resolve: conv phase is {} but a {}-position speculation from phase {} \
+                 should have left it at {expected}. The window ran a different number of \
+                 passes than it was opened for.",
+                self.conv_phase,
+                tok.k,
+                tok.conv_phase
+            )
+        }
+
+        let discard = tok.k - n;
+        if discard == 0 {
+            return Ok(());
+        }
+
+        // KV: a length decrement per layer. The bytes above `len` are
+        // unreachable through the `narrow` and need not be cleared.
+        //
+        // **Only the attention layers' slots.** `kv_slots` carries one entry per
+        // layer so that `block_idx` indexes it directly, but LFM2 is hybrid: 22
+        // of its 30 layers are conv and never append (§5.3). Their slots are
+        // untouched — `all_data: None`, `len: 0` — and rewinding one is not a
+        // no-op but an error, because `count > len`. Skipping unallocated slots
+        // rather than tolerating a short rewind is what keeps `rewind`'s bound
+        // check meaningful for the slots that *are* live.
+        for (k_slot, v_slot) in self.kv_slots.iter_mut() {
+            if k_slot.all_data.is_none() {
+                continue;
+            }
+            k_slot.rewind(discard)?;
+            v_slot.rewind(discard)?;
+        }
+
+        // Conv: a pointer move, and this is the line §10.2a's cost column means
+        // by *"a pointer move"*. The discarded slots keep their bytes and become
+        // unreachable, exactly as the KV positions above `len` do — the ring is
+        // `l_cache + k` wide precisely so that `k` speculative writes cannot
+        // reach the live window a rollback returns to.
+        self.conv_phase = (tok.conv_phase + n) % width;
+
+        // The KV length is checked the same way and for the same reason. It is
+        // recorded per `advance` from layer 0, and every layer moves together.
+        if let (Some(before), Some((k_slot, _))) = (
+            tok.kv_len,
+            self.kv_slots
+                .iter()
+                .find(|(k_slot, _)| k_slot.all_data.is_some()),
+        ) {
+            debug_assert_eq!(
+                k_slot.len,
+                before + n,
+                "resolve must leave exactly the accepted positions live"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The receipt for an open speculative window — `DESIGN.md` §10.2a.
+///
+/// **`#[must_use]` and not `Copy`, and both are load-bearing.** A caller who
+/// advances and forgets to resolve gets a compile warning; one who resolves
+/// twice gets a move error. `Cache` is the only place that can mint one, which
+/// is what makes "no second `advance` before a `resolve`" a property of the
+/// type rather than of anyone's discipline.
+///
+/// It carries the pre-advance state rather than only the width, so `resolve`
+/// checks that the window ran the passes it was opened for instead of trusting
+/// the caller — the same reason `resolve(n)` derives `k − n` rather than taking
+/// it.
+#[must_use = "an open speculative window must be resolved, or the state is left mid-speculation"]
+#[derive(Debug)]
+pub struct SpecToken {
+    /// How many positions were proposed.
+    k: usize,
+    /// Layer 0's KV length before the advance. `None` when no slot has been
+    /// allocated yet, which is the pre-prefill case.
+    kv_len: Option<usize>,
+    /// The conv ring's write slot before the advance.
+    conv_phase: usize,
+}
+
+impl SpecToken {
+    /// How many positions this window proposed.
+    pub fn k(&self) -> usize {
+        self.k
     }
 }
 
@@ -1174,7 +1451,78 @@ impl ShortConv {
         // Prepare conv weight: squeeze to (hidden_size, l_cache) for element-wise, or keep for Conv1d
         let conv_weight = self.conv_weight.squeeze(1)?;
 
-        let conv_out = if seq_len == 1 {
+        let conv_out = if cache.speculative && seq_len > 1 {
+            // **The speculative verify path** — `DESIGN.md` §10.2a's `advance`,
+            // for the conv half, at `seq_len = k`.
+            //
+            // The `seq_len > 1` branch below rebuilds the state from this pass's
+            // own activations and zeroes everything past the live window
+            // (`lfm2_spec_conv_shape.rs` pins both by execution). That is right
+            // for a prefill and **unrollbackable by construction** for a verify:
+            // the pre-pass history is discarded, so `resolve(n < k)` has nothing
+            // to expose.
+            //
+            // This writes the `k` positions into the ring the way `k` decode
+            // steps would, one slot each, so the state after position `i` is
+            // exactly the state a decode of that token would have left — which
+            // is what makes discarding a suffix a pointer move rather than a
+            // recomputation.
+            //
+            // **Why a loop and not `Conv1d`.** `Conv1d` computes all `k` outputs
+            // from one contiguous activation run, which is cheaper and is what
+            // prefill wants. It cannot express *"position i reads the ring's
+            // live window at phase i"*, and the ring is what rollback needs. The
+            // loop is `k` iterations of the decode writer over a pass that reads
+            // the weights **once** — the weight sweep is per pass, not per
+            // position (§9.1c), which is the whole speculative thesis and is
+            // unaffected by how the conv taps are gathered.
+            let ConvState::RotatingRing { .. } = self.conv_state else {
+                candle::bail!(
+                    "lfm2 speculative conv: only `RotatingRing` can rewind \
+                     (`DESIGN.md` §10.2a). `Cache::advance` refuses the other arms."
+                )
+            };
+            let width = self.conv_state.width(self.l_cache);
+            let state = match &cache.conv_states[block_idx] {
+                Some(s) => s.clone(),
+                None => Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?,
+            };
+
+            // `Model::forward_all` has already advanced `conv_phase` by
+            // `seq_len` — it is set once per pass and read by all 22 conv
+            // layers, which is the one-owner property §10.2e records as having
+            // been wrong once already. So the *last* position sits at
+            // `conv_phase` and position `i` sits `seq_len - 1 - i` slots before
+            // it. Deriving each slot from the post-pass value rather than
+            // re-deriving the pre-pass one keeps a single source for the index.
+            let last = cache.conv_phase;
+            let mut outs = Vec::with_capacity(seq_len);
+            for i in 0..seq_len {
+                // Position `i`'s slot: the same one the `i`-th decode step of
+                // this window would have written.
+                let phase = (last + width - (seq_len - 1 - i)) % width;
+                let col = bx.narrow(2, i, 1)?.contiguous()?;
+                state.slice_set(&col, 2, phase)?;
+
+                // The same phase-permuted weight the decode path uses, so the
+                // products are the shuffle's and only the accumulation order
+                // differs (§10.2g). Reusing the table rather than rebuilding it
+                // is what keeps this a per-position index rather than a
+                // per-position permutation (§15.2 #10).
+                let w = self
+                    .rotating_weights
+                    .as_ref()
+                    .expect("rotating weights exist whenever the arm is RotatingRing")
+                    .get(phase)
+                    .expect("phase is taken modulo width, so it indexes the table");
+                outs.push((&state * w.unsqueeze(0)?)?.sum_keepdim(2)?);
+            }
+
+            if cache.use_kv_cache {
+                cache.conv_states[block_idx] = Some(state.clone());
+            }
+            Tensor::cat(&outs, 2)?.contiguous()?
+        } else if seq_len == 1 {
             match self.conv_state {
                 ConvState::RotatingRing { .. } => {
                     // §10.2a as specified: the window IS the buffer, and the
@@ -1499,41 +1847,13 @@ impl Model {
         // earlier draft split it -- this wrapped the index while the layers
         // tested `phase >= width` -- and the wrap made the layers' test
         // unreachable, so the compaction never ran.
-        if let ConvState::RotatingRing { .. } = self.conv_state {
-            // The rotating arm never compacts -- that is the whole difference.
-            // The index wraps modulo the buffer width, which is what makes the
-            // dispatch count constant and the write offsets a fixed finite set.
-            let width = self.conv_state.width(self.l_cache);
-            cache.conv_compact = false;
-            cache.conv_phase = if seq_len == 1 {
-                (cache.conv_phase + 1) % width
-            } else {
-                // Prefill lays the live window down at slots `0..l_cache`, so
-                // the newest token is at `l_cache - 1` -- the same seeding the
-                // sliding arm uses, and for the same reason.
-                self.l_cache - 1
-            };
-        } else if let ConvState::SlidingRing { .. } = self.conv_state {
-            let width = self.conv_state.width(self.l_cache);
-            let live_w = self.l_cache + self.conv_state.history();
-            if seq_len == 1 {
-                let next = cache.conv_phase + 1;
-                cache.conv_compact = next >= width;
-                // After a compaction the live window sits at the front, so the
-                // next write lands immediately after it.
-                cache.conv_phase = if cache.conv_compact { live_w } else { next };
-            } else {
-                // Seeded, not advanced: prefill's own write defines the slot.
-                //
-                // Prefill lays the live window down at slots `0..l_cache` and
-                // zeroes the rest, so the newest token is at `l_cache - 1` --
-                // **not** `live_w - 1`. The two coincide at `K = 0` and diverge
-                // for any `K > 0`, so spelling it `l_cache` is what keeps the
-                // history slots from being read as live.
-                cache.conv_compact = false;
-                cache.conv_phase = self.l_cache - 1;
-            }
-        }
+        // Seeding, wrapping and the compaction decision all live in
+        // `advance_conv_phase`, shared with `forward_all` so the two entry
+        // points cannot disagree about where the window sits. The rotating arm
+        // never compacts; the sliding arm seeds prefill at `l_cache - 1` rather
+        // than `live_w - 1`, which is what keeps history slots from being read
+        // as live at `K > 0`.
+        self.advance_conv_phase(seq_len, cache);
 
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
@@ -1547,8 +1867,183 @@ impl Model {
         logits.to_dtype(DType::F32)
     }
 
+    /// Run the model and project **every** position, not only the last.
+    ///
+    /// # Why this exists, and why it is a separate entry point
+    ///
+    /// `forward` above narrows the residual stream to `seq_len - 1` before the
+    /// `lm_head` — `DESIGN.md` §5.10 records it as *"`forward()` returns logits
+    /// for the last position only, so prefill and decode share one call path"*,
+    /// which reads as a prefill efficiency note. **For a speculative verify pass
+    /// it is the mechanism rather than an efficiency note**: verifying K
+    /// proposed tokens means comparing the target's argmax at each of the K
+    /// positions, and one position's logits cannot answer K questions.
+    ///
+    /// It is a second entry point rather than a flag on the first because
+    /// `forward` is on the per-token path and its shape is what every recorded
+    /// digest belongs to. A branch inside it would put a `seq_len`-dependent
+    /// narrow on the decode path to serve a caller decode does not have —
+    /// §11.3l finding 4's shape, where a window drawn for one purpose silently
+    /// changed another.
+    ///
+    /// # What it costs, stated rather than elided
+    ///
+    /// `lm_head` is `[128000, 2048]` and tied to the embedding (§5.1), so this
+    /// runs a GEMV per position where `forward` runs one. **The weight is read
+    /// once either way** — that is the whole speculative thesis (§9.1c: one
+    /// sweep serves K tokens) — but the *output* is `K × 128000` f32, which is
+    /// 512 KB per position and the one term in a verify pass that grows with K
+    /// without amortising. §4 of `measurements/issue-89-verify-shape.md` costs
+    /// it.
+    ///
+    /// Returns `[b_sz, seq_len, vocab]` in f32, where `forward` returns
+    /// `[b_sz, vocab]`.
+    pub fn forward_all(
+        &self,
+        input_ids: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        let (_, seq_len) = input_ids.dims2()?;
+        self.advance_conv_phase(seq_len, cache);
+
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        for (block_idx, layer) in self.layers.iter().enumerate() {
+            hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
+        }
+        let hidden_states = self.embedding_norm.forward(&hidden_states)?.contiguous()?;
+        let logits = self.lm_head.forward(&hidden_states)?;
+        logits.to_dtype(DType::F32)
+    }
+
+    /// The ring's write slot, advanced once per forward pass and read by all 22
+    /// conv layers.
+    ///
+    /// Factored out of `forward` when `forward_all` was added, so the two entry
+    /// points cannot disagree about where the window sits. That is the same
+    /// argument the body already carries for keeping the wrap decision in one
+    /// place: two owners of one decision is a shape that cannot be right, and it
+    /// has already been wrong here once.
+    fn advance_conv_phase(&self, seq_len: usize, cache: &mut Cache) {
+        if let ConvState::RotatingRing { .. } = self.conv_state {
+            let width = self.conv_state.width(self.l_cache);
+            cache.conv_compact = false;
+            cache.conv_phase = if cache.speculative && seq_len > 1 {
+                // A verify pass writes `seq_len` ring slots, one per position,
+                // so it advances the phase by `seq_len` — exactly what
+                // `seq_len` decode steps would have done. The layers derive
+                // each position's slot from the *pre-pass* phase, so this
+                // lands where the last position wrote.
+                (cache.conv_phase + seq_len) % width
+            } else if seq_len == 1 {
+                (cache.conv_phase + 1) % width
+            } else {
+                self.l_cache - 1
+            };
+        } else if let ConvState::SlidingRing { .. } = self.conv_state {
+            let width = self.conv_state.width(self.l_cache);
+            let live_w = self.l_cache + self.conv_state.history();
+            if seq_len == 1 {
+                let next = cache.conv_phase + 1;
+                cache.conv_compact = next >= width;
+                cache.conv_phase = if cache.conv_compact { live_w } else { next };
+            } else {
+                cache.conv_compact = false;
+                cache.conv_phase = self.l_cache - 1;
+            }
+        }
+    }
+
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// Verify `k` proposed tokens in **one** forward pass, accept the longest
+    /// correct prefix, and roll the state back to it.
+    ///
+    /// This is `DESIGN.md` §17's speculative *verifier* — the half every
+    /// speculative scheme shares. **Where `proposed` comes from is policy and is
+    /// not here** (§7.7: policy is runtime-swappable, kernel structure is not).
+    /// #90 (MTP) and #91 (DSpark) supply proposers; this takes a slice.
+    ///
+    /// # The accept test, and why greedy needs no epsilon
+    ///
+    /// Under greedy decoding a speculative scheme is **output-identical to
+    /// non-speculative decoding by construction**: a draft token is accepted iff
+    /// it equals what the target would have produced, which is
+    /// `argmax(logits[i])`. So the check is exact rather than statistical, and
+    /// **a scheme that changes the output is a bug, not a tradeoff** — which is
+    /// why the canonical digest pair is this mechanism's test rather than a
+    /// divergence bound. Distribution-preserving sampling is a later,
+    /// separately-argued step and is deliberately absent.
+    ///
+    /// # The one-token overhang, which is the mechanism and not an off-by-one
+    ///
+    /// `last` is the token already committed — the one whose logits produced
+    /// `proposed[0]`. The pass runs `[last, proposed[0..k-1]]`, so position `i`
+    /// predicts what follows `proposed[i-1]`, and **a fully-accepted window
+    /// yields `k` tokens from `k` positions**: the `k − 1` verified proposals
+    /// plus the bonus token the last position predicts for free. That free token
+    /// is why a `k`-position verify can advance `k` tokens rather than `k − 1`,
+    /// and it is the reason the cost model in
+    /// `measurements/issue-89-verify-shape.md` §4 compares a `k`-position verify
+    /// against `k` decodes rather than `k − 1`.
+    ///
+    /// # Returns
+    ///
+    /// The accepted tokens — between 1 and `k`, never 0, because the target's
+    /// own prediction at position 0 is always correct by definition.
+    pub fn verify_step(
+        &self,
+        last: u32,
+        proposed: &[u32],
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<Vec<u32>> {
+        let k = proposed.len();
+        if k == 0 {
+            candle::bail!("lfm2 verify_step: no proposed tokens")
+        }
+        // Opened before the pass, so the token records the state to return to
+        // rather than a state the pass has already moved.
+        let tok = cache.advance(k)?;
+
+        // `[last, proposed[0..k-1]]`. The final proposal is not fed: nothing
+        // would verify it, since its verifier is the token after it.
+        let mut window = Vec::with_capacity(k);
+        window.push(last);
+        window.extend_from_slice(&proposed[..k - 1]);
+
+        let device = &cache.device;
+        let input = Tensor::new(window.as_slice(), device)?.reshape((1, k))?;
+
+        // **One pass over the weights for k positions.** §9.1c: the weight sweep
+        // is per step and not per token, so this is where the multiple comes
+        // from -- 5.394 GB read once against k times.
+        let logits = self.forward_all(&input, index_pos, cache)?;
+        let argmax = logits.i(0)?.argmax(candle::D::Minus1)?.to_vec1::<u32>()?;
+
+        // Accept the longest prefix where the target agrees with the proposal.
+        // Position `i`'s argmax is what the target would emit after
+        // `window[i]`, so it is compared against `proposed[i]`.
+        let mut accepted = Vec::with_capacity(k);
+        for i in 0..k {
+            let target = argmax[i];
+            accepted.push(target);
+            if i + 1 < k && target != proposed[i] {
+                // The first disagreement ends the prefix. The target's own token
+                // is kept -- it is what non-speculative decoding would have
+                // emitted here -- which is what makes a rejection cost nothing
+                // rather than costing a token.
+                break;
+            }
+        }
+
+        // `n` positions of state survive. The remaining `k - n` were written by
+        // the pass and are discarded: KV by a length decrement, conv by a phase
+        // move, neither by clearing bytes (§10.2a).
+        cache.resolve(tok, accepted.len())?;
+        Ok(accepted)
     }
 }
 
