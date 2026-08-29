@@ -50,6 +50,7 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::lfm2::{Cache, Config, ConvState, LayerType, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -88,6 +89,219 @@ fn load_average() -> Option<f64> {
     // we pass the true length of a stack array we own.
     let n = unsafe { getloadavg(a.as_mut_ptr(), 3) };
     (n > 0).then_some(a[0])
+}
+
+/// The process's own resident and physical footprint, from `proc_pid_rusage`
+/// (`DESIGN.md` §3.4a-i).
+///
+/// # Why the process figure has to be beside the pool figure
+///
+/// #204 measured the pool at long context and found it **flat** — live
+/// 5.422 → 5.470 GB over 1750 tokens with `pending_bytes` 0.000 at every
+/// sample — and then died of `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
+/// Its own words: *"a flat pool locates the growth and does not name it."*
+/// A pool counter can only report what the pool holds; if the growth is
+/// outside the pool, no pool counter can see it, and adding more pool
+/// counters would keep answering the question that was already answered.
+///
+/// `phys_footprint` is the quantity the OS bills the process for, so it
+/// spans **every** allocation this process holds however it was made — pooled
+/// or not, ours or Metal's own. It is therefore the one number that can show
+/// growth the five classes do not name (§9.5f candidate 3), which is what
+/// §16 P0 #7 has been waiting on.
+///
+/// §3.4a-i measured this call at **0.5 µs**, and it is taken outside the
+/// per-token timing window.
+#[cfg(target_os = "macos")]
+fn proc_footprint() -> Option<(u64, u64)> {
+    const RUSAGE_INFO_V6: i32 = 6;
+
+    // Field offsets in `u64` words, **read from
+    // `<sys/resource.h>`'s `struct rusage_info_v6`** rather than recalled —
+    // `DESIGN.md` §15.3 #17, and the reason is that a wrong offset here returns
+    // a plausible number rather than an error. The struct opens with
+    // `uint8_t ri_uuid[16]` (2 words), then `ri_user_time`, `ri_system_time`,
+    // `ri_pkg_idle_wkups`, `ri_interrupt_wkups`, `ri_pageins`, `ri_wired_size`,
+    // `ri_resident_size`, `ri_phys_footprint`.
+    //
+    // The pair is sanity-checked by the caller rather than trusted: a
+    // `phys_footprint` below the weights this process has provably loaded is a
+    // misread rather than a small process, and §2.4's *"too good is a bug
+    // signal"* applies to a memory figure exactly as to a speedup.
+    const W_RESIDENT: usize = 8;
+    const W_PHYS: usize = 9;
+
+    // 64 words = 512 B against the struct's ~472 B, so the call cannot write
+    // past the buffer even if a later SDK appends a field.
+    const WORDS: usize = 64;
+
+    // Declared here rather than pulled from `libc`, which `candle-examples` does
+    // not depend on: adding a crate to a workspace manifest for two integers is
+    // a wider change than the measurement warrants.
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+    }
+    let mut buf = [0u64; WORDS];
+    // SAFETY: `proc_pid_rusage` writes at most `sizeof(rusage_info_v6)` bytes
+    // (~472) into the buffer, and `WORDS * 8 = 512` is larger, so the write is
+    // in bounds for a buffer this frame owns. A non-zero return means the call
+    // failed and the buffer is not read.
+    let rc = unsafe {
+        proc_pid_rusage(
+            std::process::id() as i32,
+            RUSAGE_INFO_V6,
+            buf.as_mut_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some((buf[W_PHYS], buf[W_RESIDENT]))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn proc_footprint() -> Option<(u64, u64)> {
+    None
+}
+
+/// One reading of every participant in a buffer's lifetime, at one token.
+///
+/// # Why all of these and not just the pool
+///
+/// `DESIGN.md` §6.3c establishes that a buffer's existence has **three**
+/// participants — the CPU handle, the GPU completion epoch, and the residency
+/// set — and §6.7 L4's third corollary is that a liveness question must be
+/// asked of *every* participant rather than the ones in view. #204 asked the
+/// pool and got a flat answer. These are the others:
+///
+/// | field | answers |
+/// |---|---|
+/// | `pool_*` | what the allocator holds — #204's flat quantity, reproduced so the arms are comparable |
+/// | `residency` | §6.3c's third participant, which has membership tracking since #167 and has never been read at long context |
+/// | `device_allocated` | `MTLDevice.currentAllocatedSize` — **the driver's own count**, which is not derived from any of our bookkeeping |
+/// | `phys_footprint` | what the OS bills the process, which spans everything above and anything outside it |
+/// | `allocations` / `evicted` | the create/destroy rate issue #206 predicts degenerates under `Cat` |
+///
+/// **`device_allocated` beside `phys_footprint` is the discriminator issue #206
+/// asks for in its third acceptance item.** `kIOGPUCommandBufferCallbackErrorOutOfMemory`
+/// is a *command buffer* error, so the failure need not be bytes at all. If the
+/// driver's own allocated size tracks the pool while the footprint climbs, the
+/// growth is outside Metal's allocations; if both climb together, it is bytes
+/// and the question is whose. Neither reading is available from a pool counter.
+#[derive(Clone, Copy, Debug, Default)]
+struct MemProbe {
+    token: u64,
+    kv_len: u64,
+    wall_ms: f64,
+    pool_live: u64,
+    pool_free: u64,
+    pool_pending: u64,
+    pool_live_buffers: u64,
+    pool_free_buffers: u64,
+    pool_free_buckets: u64,
+    pool_pending_buffers: u64,
+    /// Cumulative since process start, so a rate is a difference of two samples.
+    allocations: u64,
+    allocated_bytes: u64,
+    evicted: u64,
+    hits: u64,
+    lookups: u64,
+    buckets_probed: u64,
+    residency: u64,
+    device_allocated: u64,
+    phys_footprint: u64,
+    resident: u64,
+}
+
+impl MemProbe {
+    #[cfg(feature = "metal")]
+    fn read(dev: &candle::MetalDevice, token: u64, kv_len: u64, wall: f64) -> Self {
+        let (shared, private) = dev.pool_occupancy();
+        let (cs, cp) = dev.pool_counters();
+        let (phys, resident) = proc_footprint().unwrap_or((0, 0));
+        Self {
+            token,
+            kv_len,
+            wall_ms: wall * 1e3,
+            pool_live: (shared.live_bytes + private.live_bytes) as u64,
+            pool_free: (shared.free_bytes + private.free_bytes) as u64,
+            pool_pending: (shared.pending_bytes + private.pending_bytes) as u64,
+            pool_live_buffers: (shared.live_buffers + private.live_buffers) as u64,
+            pool_free_buffers: (shared.free_buffers + private.free_buffers) as u64,
+            pool_free_buckets: (shared.free_buckets + private.free_buckets) as u64,
+            pool_pending_buffers: (shared.pending_buffers + private.pending_buffers) as u64,
+            allocations: cs.allocations + cp.allocations,
+            allocated_bytes: cs.allocated_bytes + cp.allocated_bytes,
+            evicted: cs.evicted + cp.evicted,
+            hits: cs.hits + cp.hits,
+            lookups: cs.lookups + cp.lookups,
+            buckets_probed: cs.buckets_probed + cp.buckets_probed,
+            residency: dev.residency_set_len() as u64,
+            device_allocated: dev.metal_device().current_allocated_size() as u64,
+            phys_footprint: phys,
+            resident,
+        }
+    }
+
+    /// One line for a human watching a long run, on stderr.
+    fn human(&self) -> String {
+        let gb = |b: u64| b as f64 / 1e9;
+        format!(
+            "progress: token {:>7}  kv_len {:>7}  wall {:7.3} ms  \
+             pool live {:6.3} free {:6.3} pending {:6.3} GB  \
+             dev {:6.3} GB  phys {:6.3} GB  resid {:>6}  alloc {:>9}  evict {:>9}",
+            self.token,
+            self.kv_len,
+            self.wall_ms,
+            gb(self.pool_live),
+            gb(self.pool_free),
+            gb(self.pool_pending),
+            gb(self.device_allocated),
+            gb(self.phys_footprint),
+            self.residency,
+            self.allocations,
+            self.evicted,
+        )
+    }
+
+    /// One JSON object per sample, for the committed series.
+    ///
+    /// Bytes stay **bytes** here and are divided only for the human line: a
+    /// series that has already been rounded to GB cannot be differenced to
+    /// recover a per-token rate, which is the quantity issue #206's second
+    /// acceptance item asks for.
+    fn jsonl(&self) -> String {
+        format!(
+            "{{\"token\":{},\"kv_len\":{},\"wall_ms\":{:.4},\
+             \"pool_live\":{},\"pool_free\":{},\"pool_pending\":{},\
+             \"pool_live_buffers\":{},\"pool_free_buffers\":{},\
+             \"pool_free_buckets\":{},\"pool_pending_buffers\":{},\
+             \"allocations\":{},\"allocated_bytes\":{},\"evicted\":{},\
+             \"hits\":{},\"lookups\":{},\"buckets_probed\":{},\
+             \"residency\":{},\"device_allocated\":{},\
+             \"phys_footprint\":{},\"resident\":{}}}",
+            self.token,
+            self.kv_len,
+            self.wall_ms,
+            self.pool_live,
+            self.pool_free,
+            self.pool_pending,
+            self.pool_live_buffers,
+            self.pool_free_buffers,
+            self.pool_free_buckets,
+            self.pool_pending_buffers,
+            self.allocations,
+            self.allocated_bytes,
+            self.evicted,
+            self.hits,
+            self.lookups,
+            self.buckets_probed,
+            self.residency,
+            self.device_allocated,
+            self.phys_footprint,
+            self.resident,
+        )
+    }
 }
 
 /// Access to the Metal profiling counters, with a no-op stand-in off Metal.
@@ -540,6 +754,69 @@ struct Args {
     /// sized by `kv_len` (§9.1, #68 finding 4).
     #[arg(long, default_value_t = 2)]
     arena_record_steps: usize,
+
+    /// Tokens of KV reserved per sequence under `--kv-append in-place`.
+    ///
+    /// # Why this flag has to exist for issue #61, and why it is not a policy
+    ///
+    /// `Cache::new` hard-wires `DEFAULT_KV_CAPACITY`, which is **4096**, and
+    /// that value is deliberately a placeholder: `Cache::new_with`'s doc
+    /// comment says so in as many words -- *"above the 2720 ceiling with
+    /// headroom ... and small enough that nobody mistakes it for a considered
+    /// long-context answer"*, with **"what would decide it is a context-length
+    /// curve -- issue #61"**. So the `InPlace` arm could not be measured past
+    /// `kv_len` 4096 by any harness, which is a **quarter of the way** to the
+    /// smallest interesting point of that curve and 3 % of the 128k target
+    /// §2.1 names.
+    ///
+    /// **This selects an existing parameter; it does not choose the policy.**
+    /// `Cache::new_with` already takes the capacity and already refuses loudly
+    /// when it is exhausted (§6.2b finding 4); all that was missing was a way
+    /// for a *measurement* to ask for a different one. `DEFAULT_KV_CAPACITY`
+    /// is untouched, so an unflagged run is byte-for-byte what shipped --
+    /// §7.1a's shape, applied to a harness flag rather than to an axis.
+    ///
+    /// **It is `Reserve`, so it is allocated whether or not it is reached**:
+    /// at 16 KiB/token (§5.6's geometry, not §5.6's table) a capacity of
+    /// 131072 is **2.147 GB** allocated up front. That is inside every
+    /// prediction in `measurements/issue-61-raw/sweep_admission.py`, and the
+    /// prediction is what §9.5j item 1 requires *before* the arm runs.
+    ///
+    /// Ignored under `--kv-append cat`, which has no capacity: it reallocates
+    /// the whole cache every token (§6.2), which is the thing being measured.
+    #[arg(long, default_value_t = candle_transformers::models::lfm2::DEFAULT_KV_CAPACITY)]
+    kv_capacity: usize,
+
+    /// Print a progress line to stderr every N decode tokens. 0 disables it.
+    ///
+    /// Issue #61 requires a long-context run to report **where it stopped and
+    /// why** rather than truncating silently, and a run that dies having printed
+    /// nothing cannot. The line carries `kv_len` and the pool's live / free /
+    /// **pending** bytes, the last being §9.5k's *"capped by nothing"* term and
+    /// the one whose unbounded growth §3.4a-iv names as the diagnostic shape.
+    ///
+    /// Default 0 so a normal timed run is byte-for-byte unchanged: the write is
+    /// outside the per-token window but inside the loop, and a measurement
+    /// should not pay for an instrument it did not ask for (§6.4a).
+    #[arg(long, default_value_t = 0)]
+    progress_every: usize,
+
+    /// Write one JSON object per `--progress-every` sample to this path.
+    ///
+    /// The human progress line is for watching a run; this is the artifact.
+    /// `CONTRIBUTING.md` §3.2a #4 requires the raw series be committed beside
+    /// any plot so it can be re-analysed, and §2.6's rule is that a number
+    /// existing only in a PR body is unmeasured.
+    ///
+    /// **Bytes are written as bytes**, not rounded to GB: issue #206's second
+    /// acceptance item asks for a per-token create/destroy *rate*, which is a
+    /// difference of two cumulative counters, and a series pre-rounded for
+    /// display cannot be differenced to recover it.
+    ///
+    /// Ignored without `--progress-every`, since that is what decides when a
+    /// sample is taken.
+    #[arg(long)]
+    mem_jsonl: Option<PathBuf>,
 }
 
 /// Normalize an LFM2.5-VL `config.json` into candle's schema.
@@ -772,7 +1049,11 @@ fn main() -> Result<()> {
     };
 
     let model = Model::new(&config, vb).context("constructing LFM2 model")?;
-    let mut cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    // `new_with` rather than `new`, so #61's context curve can reach past
+    // `DEFAULT_KV_CAPACITY`'s 4096 on the `InPlace` arm. Unflagged this passes
+    // exactly `DEFAULT_KV_CAPACITY`, so it is the same call `new` makes.
+    let mut cache = Cache::new_with(true, dtype, &config, &device, args.kv_capacity)
+        .context("allocating KV cache")?;
 
     // ---- variant axes, validated before the clock starts -----------------
     //
@@ -858,6 +1139,22 @@ fn main() -> Result<()> {
         Device::Metal(d) => Some(d.clone()),
         _ => None,
     };
+
+    // Buffered, and flushed after the loop rather than per sample: at
+    // `--progress-every 1` on a long run this is thousands of writes, and an
+    // unbuffered one inside the loop would be an instrument sitting in the
+    // window it measures (§2.4, §6.4a).
+    //
+    // Opened BEFORE the loop so a path that cannot be created fails now rather
+    // than after a run that may take an hour.
+    let mut mem_jsonl = match args.mem_jsonl.as_ref() {
+        Some(p) => Some(std::io::BufWriter::new(
+            std::fs::File::create(p)
+                .with_context(|| format!("creating memory series at {}", p.display()))?,
+        )),
+        None => None,
+    };
+
     while tokens.len() < args.n {
         let next = logits_processor.sample(&logits).context("sampling")?;
         if eos_ids.contains(&next) {
@@ -995,6 +1292,63 @@ fn main() -> Result<()> {
         // window it describes rather than inside it.
         step_stamps.push((run_record::now_ns(), kv_len));
         kv_len += 1;
+
+        // ---- progress, and it is a MEASUREMENT rather than a courtesy ------
+        //
+        // A long-context run can fail, and issue #61 requires that **where it
+        // stopped is reported rather than silently truncated**. A run that dies
+        // at token N having printed nothing says only that it died; one that has
+        // printed its progress says *at which `kv_len`*, which is the number the
+        // stopping point is expressed in.
+        //
+        // The pool figures are printed with it because they are the mechanism
+        // that would explain such a stop. §9.5k: `free_bytes` is capped by
+        // `set_free_budget` and **`pending_bytes` is capped by nothing** — it is
+        // §6.3b's stranding (11.6 buffers/token), and under `KvAppend=Cat` the
+        // size just freed is never the size next requested, so a freed cache
+        // strands instead of being reused. §3.4a-iv names the diagnostic shape
+        // exactly: *"a curve that climbs without plateauing as `--n` or `kv_len`
+        // rises is a leak or an allocator defect"*, and records that this
+        // document has seen that shape **three times and late every time**.
+        //
+        // On stderr so it cannot land in the middle of the `RESULT` line a
+        // parser keys on, and every `--progress-every` tokens rather than every
+        // token: at one line per token a 32k run prints 32k lines, and the write
+        // itself would sit inside the loop being timed.
+        if args.progress_every > 0 && tokens.len().is_multiple_of(args.progress_every) {
+            #[cfg(feature = "metal")]
+            let sample = metal_device
+                .as_ref()
+                .map(|d| MemProbe::read(d, tokens.len() as u64, kv_len as u64, wall));
+            #[cfg(not(feature = "metal"))]
+            let sample: Option<MemProbe> = None;
+            match sample {
+                Some(s) => {
+                    eprintln!("{}", s.human());
+                    if let Some(w) = mem_jsonl.as_mut() {
+                        let _ = writeln!(w, "{}", s.jsonl());
+                        // Flushed at every sample, deliberately, and this is the
+                        // one place a buffered writer would be wrong. **The run
+                        // being measured is one that dies** — #204's `Cat` arm
+                        // exhausted memory at `kv_len` 2284 — and the samples
+                        // nearest the failure are the whole point. A buffer
+                        // holding them when the process is killed loses exactly
+                        // the tail the artifact exists for.
+                        //
+                        // The cost is bounded by `--progress-every`, which is
+                        // the flag that decides how often this happens at all,
+                        // and the write is outside the per-token timing window.
+                        let _ = w.flush();
+                    }
+                }
+                None => eprintln!(
+                    "progress: token {:>7}  kv_len {:>7}  wall {:7.3} ms",
+                    tokens.len(),
+                    kv_len,
+                    wall * 1e3
+                ),
+            }
+        }
     }
 
     // ---- summarize -------------------------------------------------------
@@ -1152,10 +1506,17 @@ fn main() -> Result<()> {
 
     if args.per_token {
         println!("=== per token ===");
+        // `kv_len` is printed beside the index because #61's whole question is
+        // ms/token **as a function of kv_len**, and the two are not the same
+        // number: the index starts at 0 and `kv_len` starts at the prompt
+        // length. Deriving one from the other downstream means a plot's x-axis
+        // depends on a prompt length recorded somewhere else, which is exactly
+        // the reconstruction §3.4a-iii prices at 15 %. Here it is measured.
         for (i, (w, g, d)) in steps.iter().enumerate() {
             let tag = if i < warmup { " [warmup]" } else { "" };
+            let kv = step_stamps.get(i).map(|s| s.1).unwrap_or(0);
             println!(
-                "{i:4}  wall {:8.3} ms  gpu {:8.3} ms  dispatches {d}{tag}",
+                "{i:4}  kv_len {kv:7}  wall {:8.3} ms  gpu {:8.3} ms  dispatches {d}{tag}",
                 w * 1e3,
                 g * 1e3
             );
