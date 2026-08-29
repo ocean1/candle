@@ -47,7 +47,9 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{Cache, Config, ConvState, LayerType, Lfm2Config, Model};
+use candle_transformers::models::lfm2::{
+    AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Lfm2Config, Model,
+};
 use clap::Parser;
 use serde_json::Value;
 use std::io::Write;
@@ -512,15 +514,99 @@ struct Axes {
     /// #70's GPU bump allocator, rather than #69's CPU plan.
     gpu_offsets: bool,
     /// The attention arm, echoed for the run line.
-    attn: String,
+    ///
+    /// **The resolved enum, not the flag string** (issue #241). It was a
+    /// `String` re-tested by hand, and the test was `attn == "sdpa"` with an
+    /// `else` -- a two-armed conditional over what became a three-armed axis
+    /// when #116 added `FlashDecoding`, so `--attn flash` reported
+    /// `AttnImpl=Generic` on every `RESULT` line. Holding the enum makes the
+    /// rendering an exhaustive `match`, so a fourth arm is a compile error
+    /// where it was previously a silent mislabel.
+    attn: AttnImpl,
     /// The KV-append arm, echoed for the run line (issue #142).
-    kv_append: String,
+    ///
+    /// The enum for the same reason as `attn` above: this axis has two arms
+    /// today and a hand-written binary test is correct only by coincidence of
+    /// that count.
+    kv_append: KvAppend,
     /// The conv-state arm (#141), echoed for the run line.
     conv_state: ConvState,
+    /// KV tokens per page, and pages per chunk (#116).
+    ///
+    /// Only reachable under `AttnImpl=FlashDecoding` and inert otherwise. Held
+    /// so `axis_pairs` can state them: an axis that is inert is still an axis
+    /// the run took a value for, and recording it as `UNRECORDED` would make
+    /// this run unpoolable with any run that did record it (#241).
+    flash_page_size: usize,
+    flash_k: usize,
+}
+
+/// The `AttnImpl` arm, as `.bench/configurations.md` §1 spells it.
+///
+/// # Why this is a `match` on the enum and not a string test
+///
+/// It was `if attn == "sdpa" { "Sdpa" } else { "Generic" }` — a **two-armed
+/// conditional over a three-armed axis** — so `--attn flash` reported
+/// `AttnImpl=Generic` on every `RESULT` line it ever produced (issue #241).
+///
+/// **That is worse than an omission.** An absent field reads as `UNRECORDED`
+/// and a reader knows to go looking; a wrong field is a false statement, and a
+/// flash run was actively mislabelled as the arm it is not. It also means a
+/// completeness check — "does the line name every axis?" — passes on it, which
+/// is why #215's audit of the same function did not catch this: **presence is
+/// not correctness.**
+///
+/// Exhaustive by construction: a fourth arm added to [`AttnImpl`] fails to
+/// compile here rather than silently rendering as one of these three.
+fn attn_impl_arm(attn: AttnImpl) -> &'static str {
+    match attn {
+        AttnImpl::Generic => "Generic",
+        AttnImpl::Sdpa => "Sdpa",
+        AttnImpl::FlashDecoding => "FlashDecoding",
+    }
+}
+
+/// The `KvAppend` arm (#142). Exhaustive for [`attn_impl_arm`]'s reason.
+///
+/// This axis has two arms today, so the `if kv_append == "in-place"` it
+/// replaces was *correct* — and correct by coincidence of the arm count, which
+/// is the property #241 is about. A binary test over a two-armed axis and a
+/// binary test over a three-armed axis are the same code.
+fn kv_append_arm(kv: KvAppend) -> &'static str {
+    match kv {
+        KvAppend::Cat => "Cat",
+        KvAppend::InPlace => "InPlace",
+    }
+}
+
+/// The `ConvState` arm (#141, §10.2g), with its parameters.
+///
+/// Already exhaustive before #241 — recorded here because it is the shape the
+/// other two now have, and because it is the reason the audit found only one
+/// defect: a `match` on an enum was the pattern this file already used in two
+/// of three places.
+fn conv_state_arm(conv: ConvState) -> String {
+    match conv {
+        ConvState::Shuffle => "Shuffle".to_string(),
+        ConvState::SlidingRing { k, slack } => format!("SlidingRing(k={k},slack={slack})"),
+        ConvState::RotatingRing { k } => format!("RotatingRing(k={k})"),
+    }
 }
 
 impl Axes {
-    fn resolve(args: &Args, _device: &Device) -> Result<Self> {
+    /// Resolves the axes for one run.
+    ///
+    /// `config` is the model configuration `main` has *already* built, and the
+    /// attention, KV-append and conv-state arms are read back from it rather
+    /// than re-derived from the flag strings (issue #241). Before, `main`
+    /// parsed `--attn` into `config.attn_impl` with a three-armed `match` and
+    /// this function separately kept the raw string, which `config_line` then
+    /// tested with a two-armed `if`. **Two parses of one flag is what let them
+    /// disagree**, and the disagreement was silent: `--attn flash` selected
+    /// `FlashDecoding` and reported `Generic`. One parse, read back from the
+    /// mechanism that decides it, is the same discipline `math_mode_name` and
+    /// `hazard_key_name` already follow.
+    fn resolve(args: &Args, _device: &Device, config: &Config) -> Result<Self> {
         #[cfg(feature = "metal")]
         let layout = match args.arena_layout.as_str() {
             "packed" => candle::metal_backend::ArenaLayout::Packed,
@@ -585,95 +671,76 @@ impl Axes {
             #[cfg(feature = "metal")]
             layout,
             gpu_offsets,
-            attn: args.attn.clone(),
-            kv_append: args.kv_append.clone(),
-            conv_state: ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?,
+            // Read back from the configuration the model was built from, not
+            // re-parsed from the flag (#241). These three are the axes whose
+            // arm is decided on `Config`, so this is where the arm actually is.
+            attn: config.attn_impl,
+            kv_append: config.kv_append,
+            conv_state: config.conv_state,
+            flash_page_size: config.flash_page_size,
+            flash_k: config.flash_pages_per_chunk,
         })
     }
 
     /// The configuration as one line, in the form the registry keys on.
+    ///
+    /// # One source, rendered twice
+    ///
+    /// This is [`Self::axis_pairs`] joined, and it is derived rather than
+    /// written out for the reason issue #241 exists: it *was* a separate
+    /// `format!` with its own copy of each axis's rendering, and the two copies
+    /// disagreed. Both carried `if attn == "sdpa" { "Sdpa" } else { "Generic" }`
+    /// and both had to be fixed; a third consumer would have needed a third
+    /// fix. §11.3h's recurring lesson is that a second copy of a list is a copy
+    /// that goes stale, and this had two.
+    ///
+    /// The shape is unchanged for the axes that were already here — same
+    /// `Axis=Arm` tokens, same separator — so the committed corpus still
+    /// ingests. `ingest.rs` splits this field on whitespace and then on `=`,
+    /// keyed rather than positional, so **added axes append and change nothing
+    /// about how an older line parses.** What changes is that the six axes
+    /// §7.1a records as absent are now stated: `BarrierScope`, `MathMode`,
+    /// `MemoryBudget`, `ScratchLayout`, `FlashPageSize` and `FlashK`.
     fn config_line(&self) -> String {
-        // ParamStyle is not selectable from here: nothing on the LFM2 path
-        // dispatches the packed variants (§11.3k), so a flag would name an arm
-        // that does not run. Recorded as `split` rather than omitted, so the
-        // line states every axis §7.1 has.
-        //
-        // `Executor` and `ReplayBarriers` are stated for that same reason and
-        // are likewise not selectable here. This harness deliberately carries no
-        // `--icb` (§11.3n): with the flag present, the timing §17 Phase 2 item
-        // 10 forbids would be one argument away and nothing in the output would
-        // say the arm is invalid. `ReplayBarriers` only has an effect under an
-        // installed ICB executor, so on this harness it is `Always` by
-        // construction -- recorded so a row cannot be read as having been taken
-        // under an unstated arm, which is #99's diagnosis and the failure
-        // `MathMode` embodied for the life of the project by being in neither
-        // the registry nor a config line.
-        format!(
-            "ParamStyle=Split ArenaLayout={} ArenaOffsets={} HazardKey={} AttnImpl={} \
-             KvAppend={} ConvState={} ScratchSizing=none Executor=Classical \
-             ReplayBarriers=Always",
-            if self.arena {
-                #[cfg(feature = "metal")]
-                {
-                    match self.layout {
-                        candle::metal_backend::ArenaLayout::Packed => "Packed",
-                        candle::metal_backend::ArenaLayout::NonAliasing => "NonAliasing",
-                    }
-                }
-                #[cfg(not(feature = "metal"))]
-                {
-                    "none"
-                }
-            } else {
-                "none(pool)"
-            },
-            if self.gpu_offsets { "Gpu" } else { "Cpu" },
-            Self::hazard_key_name(),
-            if self.attn == "sdpa" {
-                "Sdpa"
-            } else {
-                "Generic"
-            },
-            if self.kv_append == "in-place" {
-                "InPlace"
-            } else {
-                "Cat"
-            },
-            match self.conv_state {
-                ConvState::Shuffle => "Shuffle".to_string(),
-                ConvState::SlidingRing { k, slack } => {
-                    format!("SlidingRing(k={k},slack={slack})")
-                }
-                ConvState::RotatingRing { k } => format!("RotatingRing(k={k})"),
-            },
-        )
+        self.axis_pairs()
+            .into_iter()
+            .map(|(axis, arm)| format!("{axis}={arm}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Every axis `.bench/configurations.md` §1 declares, as `(axis, arm)`.
     ///
-    /// # Why this is not `config_line()` split on spaces
+    /// **This is now the single source, and `config_line()` is derived from
+    /// it** (issue #241). It used to be the second of two lists, each with its
+    /// own copy of every axis's rendering — and both copies carried the same
+    /// two-armed `AttnImpl` conditional, so both had to be fixed. A third
+    /// consumer would have needed a third fix.
     ///
-    /// `config_line`'s own comment says it "states every axis §7.1 has", and it
-    /// does not: the registry declares **eleven** and that line emits **eight**.
-    /// `Executor`, `BarrierScope` and `MathMode` are missing. That is not a
-    /// cosmetic gap — it is precisely the shape of the failure #122 recorded,
-    /// where `MathMode` was a real, switchable axis absent from both the
-    /// registry and the `config=[…]` line and was therefore invisible for the
-    /// life of the project (`DESIGN.md` §2.3.9).
+    /// # What it reports, and from where
     ///
-    /// `.bench/configurations.md` §1 states the consequence exactly: the
-    /// `config=[…]` line "catches an axis added to the harness and not to this
-    /// file. It does **not** catch an axis added to neither."
+    /// All **sixteen** axes the registry declares, each read from the mechanism
+    /// that actually decides it rather than from a flag — `MathMode` from the
+    /// same environment variable `kernel.rs:203` reads, `Executor` from the
+    /// device, and the three `Config` axes from the `Config` the model was
+    /// built from. A run recorded through this cannot be silently pooled with
+    /// one taken under a different math mode, which is the merge the store must
+    /// refuse.
     ///
-    /// So this function reports all eleven, reading each from the mechanism that
-    /// actually decides it rather than from a flag — `MathMode` from the same
-    /// environment variable `kernel.rs:203` reads, `Executor` from the device.
-    /// A run recorded through this cannot be silently pooled with one taken
-    /// under a different math mode, which is the merge the store must refuse.
+    /// Historical note, because the reasoning is worth keeping: this function
+    /// was written when `config_line()` emitted **eight** of the then-eleven
+    /// axes, and existed to report the other three. `.bench/configurations.md`
+    /// §1 states the consequence exactly — the `config=[…]` line "catches an
+    /// axis added to the harness and not to this file. It does **not** catch an
+    /// axis added to neither", which is the failure #122 recorded for
+    /// `MathMode` (`DESIGN.md` §2.3.9).
     ///
-    /// `config_line` is deliberately left alone: it is what every committed
-    /// artifact's `RESULT` line looks like, and changing its shape would break
-    /// the ingest of the corpus that already exists.
+    /// **The stated reason for not fixing `config_line()` was not true.**
+    /// It read: *"changing its shape would break the ingest of the corpus that
+    /// already exists."* `lloom-runs`' `ingest.rs` splits `config=[…]` on
+    /// whitespace and then on `=` — **keyed, not positional** — so added axes
+    /// append and change nothing about how an older line parses. Checked
+    /// against the parser rather than assumed, which is what #241 did.
     fn axis_pairs(&self) -> Vec<(String, String)> {
         let p = |k: &str, v: &str| (k.to_string(), v.to_string());
         vec![
@@ -704,32 +771,14 @@ impl Axes {
             ),
             p("ArenaOffsets", if self.gpu_offsets { "Gpu" } else { "Cpu" }),
             p("HazardKey", Self::hazard_key_name()),
-            p(
-                "AttnImpl",
-                if self.attn == "sdpa" {
-                    "Sdpa"
-                } else {
-                    "Generic"
-                },
-            ),
-            p(
-                "KvAppend",
-                if self.kv_append == "in-place" {
-                    "InPlace"
-                } else {
-                    "Cat"
-                },
-            ),
-            p(
-                "ConvState",
-                &match self.conv_state {
-                    ConvState::Shuffle => "Shuffle".to_string(),
-                    ConvState::SlidingRing { k, slack } => {
-                        format!("SlidingRing(k={k},slack={slack})")
-                    }
-                    ConvState::RotatingRing { k } => format!("RotatingRing(k={k})"),
-                },
-            ),
+            // These three render from the resolved enum through an exhaustive
+            // `match` (#241). The `AttnImpl` line was `if attn == "sdpa"` with
+            // an `else`, which reported `Generic` for `FlashDecoding` -- a
+            // wrong value rather than a missing one, and therefore invisible to
+            // any check that asks whether the axis is present.
+            p("AttnImpl", attn_impl_arm(self.attn)),
+            p("KvAppend", kv_append_arm(self.kv_append)),
+            p("ConvState", &conv_state_arm(self.conv_state)),
             // Only selects anything under `Executor=Icb`, which this harness
             // does not take. Stated at its default rather than omitted: an
             // unstated axis and an axis at its default are different facts, and
@@ -737,6 +786,26 @@ impl Axes {
             p("BarrierScope", "RunStart"),
             p("ScratchSizing", "none"),
             p("MathMode", Self::math_mode_name()),
+            // The five below were absent entirely, which is the *other* half of
+            // #241's audit and a different defect from the wrong-value one
+            // above. `ReplayBarriers` is on the `RESULT` line and was not here;
+            // the last four postdate this function (#186, #195, #116). An axis
+            // the run took and did not record is `UNRECORDED` in the store --
+            // honest, and it means the run cannot be pooled with one that did
+            // record it, so the corpus fragments silently.
+            p("ReplayBarriers", "Always"),
+            // Off unless a budget is installed, and this harness installs none
+            // (§9.5l: no harness does).
+            p("MemoryBudget", "None"),
+            // Nothing on the decode path allocates from the scratch class, so
+            // neither arm is reachable here; `Planes` is what §9.1a's figures
+            // were computed under.
+            p("ScratchLayout", "Planes"),
+            // Only reachable under `AttnImpl=FlashDecoding` and inert
+            // otherwise -- but *inert* and *unrecorded* are different facts,
+            // and the run did take a value for them.
+            p("FlashPageSize", &self.flash_page_size.to_string()),
+            p("FlashK", &self.flash_k.to_string()),
         ]
     }
 
@@ -890,8 +959,12 @@ struct Args {
     #[arg(long)]
     hazard_key: Option<String>,
 
-    /// LFM2 decode attention: `generic` (the default path) or `sdpa` (#97's
-    /// GQA-native `sdpa_vector`).
+    /// LFM2 decode attention: `generic` (the default path), `sdpa` (#97's
+    /// GQA-native `sdpa_vector`) or `flash` (#116's FlashDecoding).
+    ///
+    /// `flash` was added by #116 and this help text still named two arms until
+    /// #241 — the same omission as the `RESULT` line's, in the place a user
+    /// reads to find out what the flag takes.
     #[arg(long, default_value = "generic")]
     attn: String,
 
@@ -1277,7 +1350,7 @@ fn main() -> Result<()> {
     //
     // Parsed and checked here so an unsatisfiable combination fails before the
     // model runs rather than after a five-minute measurement.
-    let axes = Axes::resolve(&args, &device)?;
+    let axes = Axes::resolve(&args, &device, &config)?;
     axes.announce();
 
     // ---- #171's by-class telemetry, switched on (#205) --------------------
