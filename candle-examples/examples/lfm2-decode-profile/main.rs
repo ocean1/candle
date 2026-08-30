@@ -539,6 +539,21 @@ struct Axes {
     /// this run unpoolable with any run that did record it (#241).
     flash_page_size: usize,
     flash_k: usize,
+    /// The admission fraction, or `None` when no budget is installed (#249).
+    ///
+    /// Read back from the `Config` the `Cache` was built from rather than from
+    /// the flag, which is #241's discipline: the arm is decided on `Config`, so
+    /// that is where the arm actually is. Before this, `axis_pairs` rendered
+    /// `MemoryBudget=None` **unconditionally** with a comment saying no harness
+    /// installs one — true when written, and this is the harness that does, so
+    /// leaving it would have been §7.1a-i's *present-and-wrong* failure rather
+    /// than the safer absent one.
+    memory_budget: Option<f64>,
+    /// Concurrent sequences (#249). Not a variant axis in §7.1a's registry —
+    /// it is a workload parameter like `--n` — but it is stated beside them
+    /// because a run's `B` decides whether its figures may be pooled with
+    /// another's, which is exactly what the axis vector is for.
+    batch: usize,
 }
 
 /// The `AttnImpl` arm, as `.bench/configurations.md` §1 spells it.
@@ -679,6 +694,8 @@ impl Axes {
             conv_state: config.conv_state,
             flash_page_size: config.flash_page_size,
             flash_k: config.flash_pages_per_chunk,
+            memory_budget: config.memory_budget.map(|b| b.fraction),
+            batch: args.batch,
         })
     }
 
@@ -794,9 +811,21 @@ impl Axes {
             // honest, and it means the run cannot be pooled with one that did
             // record it, so the corpus fragments silently.
             p("ReplayBarriers", "Always"),
-            // Off unless a budget is installed, and this harness installs none
-            // (§9.5l: no harness does).
-            p("MemoryBudget", "None"),
+            // **This harness now installs one** (#249, `--memory-budget`), so
+            // this renders the resolved value rather than the constant `None`
+            // it carried while the comment here said *"no harness does"*
+            // (§9.5l). That sentence was true when written and became false
+            // without this line being edited — §11.3h's recurring shape, and
+            // §7.1a-i's *present-and-wrong* case, which is the unsafe direction:
+            // a false `None` compares **equal** to real unbudgeted runs where an
+            // absent axis would only have been `UNRECORDED`.
+            p(
+                "MemoryBudget",
+                &match self.memory_budget {
+                    None => "None".to_string(),
+                    Some(f) => format!("{f}"),
+                },
+            ),
             // Nothing on the decode path allocates from the scratch class, so
             // neither arm is reachable here; `Planes` is what §9.1a's figures
             // were computed under.
@@ -806,6 +835,14 @@ impl Axes {
             // and the run did take a value for them.
             p("FlashPageSize", &self.flash_page_size.to_string()),
             p("FlashK", &self.flash_k.to_string()),
+            // **Not one of §7.1a's sixteen axes**, and stated anyway. `B` is a
+            // workload parameter rather than a variant arm — it selects no
+            // kernel and flips no default — but it decides whether two runs'
+            // figures are comparable, which is what an axis vector is for. A
+            // B=8 row pooled with a B=1 row would be comparing an aggregate
+            // against a per-sequence rate. #171's store keys on this field, so
+            // a batched run and an unbatched one cannot silently merge.
+            p("Batch", &self.batch.to_string()),
         ]
     }
 
@@ -876,6 +913,71 @@ struct Args {
     /// roofline comparison is about.
     #[arg(long, default_value_t = 10)]
     warmup: usize,
+
+    /// Concurrent sequences per decode step — `DESIGN.md` §13.4a's `B`.
+    ///
+    /// **N sequences advancing in LOCKSTEP FROM THE SAME PROMPT.** Every row
+    /// runs the same prompt and, under argmax, produces the same tokens, so
+    /// they step together for the whole run and no scheduler is needed.
+    ///
+    /// # What this measures, and what it deliberately does not
+    ///
+    /// §13.4a's central claim is that **weight traffic is per step, not per
+    /// token**: one 5.394 GB sweep serves all `B` rows, so aggregate throughput
+    /// should rise with `B` while step time barely moves. That claim is
+    /// arithmetic (64.8 tok/s at B=1 against a projected 518.6 at B=8) and had
+    /// never been run, because no harness could set `B` at all. This flag is
+    /// the instrument; measuring with it is #251's.
+    ///
+    /// **Ragged batches are out of scope**, and that is a scope decision rather
+    /// than a limitation discovered late. Different-length sequences need
+    /// either padding or a scheduler, and both are engine questions (§10.3's
+    /// paging, #148). Uniform lockstep is enough to measure the
+    /// weight-amortisation claim, which is the claim that matters — and it is
+    /// the only shape whose correctness gate is exact: at `B > 1` with
+    /// identical prompts, **every row must produce the token stream B=1
+    /// produces**, which `--batch-check` asserts.
+    ///
+    /// `1` is the default, so an unflagged run is byte-for-byte the B=1 path
+    /// every recorded figure belongs to.
+    #[arg(long, default_value_t = 1)]
+    batch: usize,
+
+    /// Assert that every batch row's token stream is identical.
+    ///
+    /// The correctness gate for `--batch`, and it is **stronger than a digest**
+    /// (issue #249): a divergence between rows means the batch dimension is
+    /// leaking — one sequence's output depending on its neighbours, which
+    /// §2.3.3 #7 forbids and which is exactly the defect a batched harness
+    /// would otherwise hide. Checked every step rather than at the end, so the
+    /// failure names the step and the row.
+    ///
+    /// On by default: the check is a slice comparison over `B` `u32`s per
+    /// token, and a gate that has to be remembered is a gate that is not run
+    /// (§11.3j).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    batch_check: bool,
+
+    /// Install `DESIGN.md` §9.5's admission check at the given fraction of
+    /// `recommendedMaxWorkingSetSize`.
+    ///
+    /// **Off by default, and this is the first harness to carry it** — §9.5l
+    /// records that *no* harness installs a budget, so `admission::Budget` has
+    /// never refused anything on a real run. Issue #249 makes that reachable
+    /// for the reason §9.5b gives: **KV × B is the only class that can consume
+    /// the machine on its own**, and `B` is the axis this flag's sibling adds.
+    ///
+    /// The predicted peak is `weights + B × capacity × 16 KiB + conv + act +
+    /// scratch`, so raising `--batch` walks it toward the refusal §9.5b
+    /// computes at `B=16 ctx 128k` — 41.4 GB, which the real denominator
+    /// (55.663 GB × 0.65 = 36.181 GB) **refuses**. A batched harness that OOMs
+    /// where admission should have refused is a defect in admission, and
+    /// finding it is a result.
+    ///
+    /// `0.65` is §9.5k's table value and **not a measurement** (§9.5l), which
+    /// is why it is a flag rather than a constant here too.
+    #[arg(long)]
+    memory_budget: Option<f64>,
 
     #[arg(long, default_value_t = 299792458)]
     seed: u64,
@@ -1340,9 +1442,53 @@ fn main() -> Result<()> {
     };
 
     let model = Model::new(&config, vb).context("constructing LFM2 model")?;
+
+    // §9.5's admission, installed only when asked for (issue #249).
+    //
+    // **The batch is what makes this reachable.** §9.5b's table is flat in
+    // every B=1 configuration — everything under 12.7 % of the machine — so a
+    // B=1 harness installing a budget would never see it refuse, and §9.5l
+    // records that no harness installs one at all. `KV × B` is the only class
+    // that can consume the machine (§9.5b), so `--batch` is the axis that
+    // walks the prediction into the refusal.
+    //
+    // Placed **after** `Model::new` because that is where the weights are
+    // actually allocated, and §9.5m's `reconcile_weights` compares the figure
+    // passed here against what the weight-bearing pool holds — a check that
+    // reads an empty pool reports nothing (#244). §7.1b records the ordering as
+    // a fact of all four harnesses: `Model::new` precedes `Cache::new_with` in
+    // 4 of 4, and this is the fifth.
+    if let Some(fraction) = args.memory_budget {
+        anyhow::ensure!(
+            fraction > 0.0 && fraction <= 1.0,
+            "--memory-budget must be in (0, 1], got {fraction}"
+        );
+        let la: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| {
+                matches!(
+                    t,
+                    candle_transformers::models::lfm2::LayerType::FullAttention
+                )
+            })
+            .collect();
+        let mut budget = candle_transformers::models::lfm2::MemoryBudget::new(
+            language_weight_bytes(&config, &la, dtype.size_in_bytes()),
+        );
+        budget.batch = args.batch;
+        budget.fraction = fraction;
+        config.memory_budget = Some(budget);
+    }
+
     // `new_with` rather than `new`, so #61's context curve can reach past
     // `DEFAULT_KV_CAPACITY`'s 4096 on the `InPlace` arm. Unflagged this passes
     // exactly `DEFAULT_KV_CAPACITY`, so it is the same call `new` makes.
+    //
+    // **This is where admission runs**, so a configuration whose predicted peak
+    // exceeds the budget is refused here — before the first token and before
+    // any KV is allocated — rather than discovered by dying (§9.5a: the machine
+    // has been panicked twice by finding a limit that way).
     let mut cache = Cache::new_with(true, dtype, &config, &device, args.kv_capacity)
         .context("allocating KV cache")?;
 
@@ -1419,11 +1565,25 @@ fn main() -> Result<()> {
     }
 
     let prefill_start = std::time::Instant::now();
-    let input = Tensor::new(prompt_ids.as_slice(), &device)?.unsqueeze(0)?;
+    // `[B, prompt_len]` — the same prompt in every row.
+    //
+    // **Built by repeating rather than by broadcasting.** `Tensor::broadcast_as`
+    // would give a view whose stride along dim 0 is zero, and `Embedding` is a
+    // gather that would then read one row and produce a non-contiguous result
+    // the rest of the stack has to materialise anyway. Repeating the ids costs
+    // `B * prompt_len` u32 once, off the per-token path.
+    //
+    // At `B = 1` this is `prompt_ids` unchanged, so the default path allocates
+    // and computes exactly what it did before.
+    let batch = args.batch;
+    let prefill_ids: Vec<u32> = prompt_ids.repeat(batch);
+    let input = Tensor::new(prefill_ids.as_slice(), &device)?.reshape((batch, prompt_ids.len()))?;
+    // `[B, vocab]` — one row of logits per sequence. `forward` narrows to the
+    // last position and returns `[b_sz, vocab]`, so the `squeeze(0)` the B=1
+    // path used is exactly the `B = 1` case of keeping the batch dimension.
     let mut logits = model
         .forward(&input, 0, &mut cache)
-        .context("prefill forward pass")?
-        .squeeze(0)?;
+        .context("prefill forward pass")?;
     // Force the prefill to complete before the clock stops; candle is
     // asynchronous, so without this the time recorded is submission, not
     // execution.
@@ -1449,7 +1609,17 @@ fn main() -> Result<()> {
     // cannot reallocate mid-window; the stamp itself is one
     // `clock_gettime_nsec_np` against a 24 MHz timebase (`DESIGN.md` §3.4b).
     let mut step_stamps: Vec<(u64, usize)> = Vec::with_capacity(args.n);
+    // Row 0's stream. At `B = 1` it is *the* stream, and at `B > 1` it is the
+    // one every other row is asserted equal to, so the reported text and the
+    // EOS test mean the same thing at every `B`.
     let mut tokens: Vec<u32> = Vec::with_capacity(args.n);
+    // Every row's stream for this step, reused across steps so the per-token
+    // path allocates nothing. `batch_rows[r]` is row `r`'s token.
+    let mut batch_rows: Vec<u32> = vec![0; batch];
+    // The first step at which two rows disagreed, if any. Recorded rather than
+    // returned immediately so the run still reports where it got to — a
+    // divergence is a finding and its `kv_len` is part of it.
+    let mut batch_divergence: Option<(usize, usize, u32, u32)> = None;
     let mut hit_eos = false;
     let mut last_token_kernels: Vec<(String, u64)> = Vec::new();
 
@@ -1479,7 +1649,44 @@ fn main() -> Result<()> {
     };
 
     while tokens.len() < args.n {
-        let next = logits_processor.sample(&logits).context("sampling")?;
+        // **Sampled per row**, because `LogitsProcessor::sample` is rank-0 by
+        // construction: `sample_argmax` is `argmax(D::Minus1)?.to_scalar()`, and
+        // `to_scalar` requires rank 0, so a `[B, vocab]` tensor is not something
+        // it can take. That is the one genuine B=1 assumption on this path
+        // (issue #249), and it is the harness's rather than the model's.
+        //
+        // **`B` GPU argmaxes rather than one batched one**, and it is stated
+        // rather than elided: `fast_argmax_f32` is 1 dispatch of ~517 (§11.2a),
+        // so this makes the dispatch count `517 + (B - 1)` rather than flat.
+        // The alternative — one `argmax` over `[B, vocab]` and one `to_vec1` —
+        // would be flat, and it would also change what the B=1 arm dispatches,
+        // which is the arm every recorded figure belongs to. Keeping B=1
+        // byte-identical is worth more than a flat sampling term, and §2.4's
+        // engagement proof is computed over the FORWARD PASS for exactly this
+        // reason — see the `dispatches_per_token_forward` note below.
+        //
+        // Each row gets its own narrowed view rather than a copy.
+        for (r, slot) in batch_rows.iter_mut().enumerate() {
+            // `[B, vocab] -> [vocab]`. `narrow` + `squeeze` rather than
+            // `IndexOp::i`, which would need a trait import for one call; both
+            // are views and neither copies. At `B = 1` this is `squeeze(0)`,
+            // the exact shape the B=1 path always passed.
+            let row = logits.narrow(0, r, 1)?.squeeze(0)?;
+            *slot = logits_processor.sample(&row).context("sampling")?;
+        }
+        let next = batch_rows[0];
+
+        // **The correctness gate** (issue #249): identical prompts must give
+        // identical streams, so a row differing from row 0 means the batch
+        // dimension is leaking. Checked here — before the token is used — so
+        // the failure names the step it happened at rather than a digest at the
+        // end.
+        if args.batch_check && batch > 1 && batch_divergence.is_none() {
+            if let Some((r, &t)) = batch_rows.iter().enumerate().find(|(_, &t)| t != next) {
+                batch_divergence = Some((tokens.len(), r, next, t));
+            }
+        }
+
         if eos_ids.contains(&next) {
             // The point is a steady-state decode measurement, so generation
             // continues past the model's natural stopping point. Recorded
@@ -1512,11 +1719,14 @@ fn main() -> Result<()> {
         }
 
         let step_start = std::time::Instant::now();
-        let input = Tensor::new(&[next], &device)?.unsqueeze(0)?;
+        // `[B, 1]` — one token per row. At `B = 1` this is `[1, 1]`, which is
+        // what `Tensor::new(&[next])?.unsqueeze(0)?` produced.
+        let input = Tensor::new(batch_rows.as_slice(), &device)?.reshape((batch, 1))?;
+        // `[B, vocab]`, kept batched rather than squeezed: the per-row sampling
+        // above indexes it, and at `B = 1` the squeeze happens there instead.
         logits = model
             .forward(&input, kv_len, &mut cache)
-            .context("decode forward pass")?
-            .squeeze(0)?;
+            .context("decode forward pass")?;
         // One synchronization per token. This is what makes the window a single
         // token rather than a submission queue, and it is also what the decode
         // loop does anyway: sampling reads the logits back to the CPU, so the
@@ -1825,33 +2035,90 @@ fn main() -> Result<()> {
     println!();
 
     println!(
-        "=== decode, steady state ({} tokens, {} warmup excluded) ===",
+        "=== decode, steady state ({} steps, {} warmup excluded, B={batch}) ===",
         steady.len(),
         warmup
     );
+    // **"step" rather than "token", and at `B > 1` they are different
+    // quantities** (`DESIGN.md` §13.4a). A step advances every row by one
+    // token, so it produces `B` tokens; the whole weight-amortisation claim is
+    // that step time barely moves while `B` rises. Calling this "wall / token"
+    // at `B > 1` would report a per-step figure under a per-token name, which
+    // is §2.4's *"check whether the measurement tool measures the thing its
+    // output names"* — the defect that removed `tok_per_s` from the sibling
+    // harness (#102).
     println!(
-        "wall / token          {:.3} ms  (sd {:.3}, min {:.3}, med {:.3}, max {:.3})",
+        "wall / step           {:.3} ms  (sd {:.3}, min {:.3}, med {:.3}, max {:.3})",
         wall_mean * 1e3,
         wall_sd * 1e3,
         wall_min * 1e3,
         wall_med * 1e3,
         wall_max * 1e3
     );
-    println!("throughput            {:.2} tok/s", 1.0 / wall_mean);
+    // The figure §13.4a's table is in: `B / step_time`. At `B = 1` it is the
+    // per-sequence rate this harness has always printed, so the row does not
+    // change meaning for an unflagged run.
+    println!(
+        "aggregate throughput  {:.2} tok/s  ({batch} seq x {:.2} tok/s)",
+        batch as f64 / wall_mean,
+        1.0 / wall_mean
+    );
+    if batch > 1 {
+        println!(
+            "per-sequence          {:.3} ms/token  ({:.2} tok/s)",
+            wall_mean * 1e3,
+            1.0 / wall_mean
+        );
+    }
     if profiling {
         println!(
-            "gpu busy / token      {:.3} ms  (sd {:.3})",
+            "gpu busy / step       {:.3} ms  (sd {:.3})",
             gpu_mean * 1e3,
             gpu_sd * 1e3
         );
         println!(
-            "non-gpu / token       {:.3} ms  ({:.1}% of wall)",
+            "non-gpu / step        {:.3} ms  ({:.1}% of wall)",
             (wall_mean - gpu_mean) * 1e3,
             100.0 * (wall_mean - gpu_mean) / wall_mean
         );
         println!(
-            "dispatches / token    {:.1}  (min {}, max {})",
+            "dispatches / step     {:.1}  (min {}, max {})",
             disp_mean, disp_min, disp_max
+        );
+        // **The engagement proof §2.4 requires, and the reason it is computed
+        // rather than read off the line above** (issue #249).
+        //
+        // The claim under test is that one weight sweep serves `B` rows, so the
+        // *forward pass* must issue the same dispatches at every `B` — if it
+        // does not, the batch is a loop over sequences and the harness is
+        // measuring `B` separate decodes rather than one batched one.
+        //
+        // The counters span sampling (§11.2a: they reset at `:717` and snapshot
+        // at `:716`, where the wall clock does not), and this harness samples
+        // **per row** — `B` `fast_argmax_f32` dispatches, one per row. So the
+        // raw count rises by `B - 1` for a reason that has nothing to do with
+        // the forward pass, and reading it as-is would report a batch that
+        // *is* flat as one that is not. Subtracting the known sampling term is
+        // what makes the quantity discriminate.
+        //
+        // **Whether it discriminates in THIS regime is checked rather than
+        // assumed** — #248 found a dispatch-count proof that expires, because
+        // two `AttnImpl` arms coincide at 547 above `kv_len` 1023. Here the
+        // discriminator is a *difference between B arms of one binary*, not
+        // between two kernels, and the failure it must detect is a per-row loop,
+        // which would scale the forward term by `B` — 517 against 1034 at B=2,
+        // not a coincidence two arms could land on.
+        let sampling_dispatches = batch.saturating_sub(1) as f64;
+        let disp_forward = disp_mean - sampling_dispatches;
+        println!(
+            "  -- of which sampling {:.1}  ({batch} rows x 1 argmax, {:.1} left for the \
+             forward pass)",
+            sampling_dispatches + 1.0,
+            disp_forward
+        );
+        println!(
+            "dispatches / fwd pass {:.1}  <- FLAT IN B iff the weight read is shared",
+            disp_forward
         );
         if disp_mean > 0.0 {
             println!(
@@ -1861,7 +2128,18 @@ fn main() -> Result<()> {
         }
         println!();
         println!("=== roofline ===");
-        println!("weights per token     {:.3} GB", weight_bytes as f64 / 1e9);
+        // **Per STEP, not per token, and that is the whole point.** §13.4a:
+        // *"weight traffic is per step, not per token"* — the same 5.394 GB
+        // serves every row, so this figure does not scale with `B` while the
+        // aggregate throughput above does.
+        println!("weights per step      {:.3} GB", weight_bytes as f64 / 1e9);
+        if batch > 1 {
+            println!(
+                "weights per token     {:.3} GB  (per step / B -- the term batching \
+                 amortises)",
+                weight_bytes as f64 / batch as f64 / 1e9
+            );
+        }
         if gpu_mean > 0.0 {
             println!(
                 "implied bandwidth     {:.1} GB/s  (weights / gpu busy)",
@@ -1872,6 +2150,26 @@ fn main() -> Result<()> {
             "implied bw vs wall    {:.1} GB/s  (weights / wall)",
             weight_bytes as f64 / wall_mean / 1e9
         );
+    }
+
+    // The correctness gate's verdict, printed whether it fired or not — a gate
+    // that reports only on failure is one a reader cannot tell was run (§2.4).
+    if batch > 1 {
+        println!();
+        println!("=== batch correctness (issue #249) ===");
+        match args.batch_check {
+            false => println!("row streams           NOT CHECKED (--batch-check false)"),
+            true => match batch_divergence {
+                None => println!(
+                    "row streams           IDENTICAL across all {batch} rows, {} steps",
+                    tokens.len()
+                ),
+                Some((step, row, want, got)) => println!(
+                    "row streams           **DIVERGED** at step {step}: row 0 emitted {want}, \
+                     row {row} emitted {got}"
+                ),
+            },
+        }
     }
     println!();
 
@@ -1910,18 +2208,57 @@ fn main() -> Result<()> {
     // missing the commit and the variant axes; both are here, so a row can name
     // the configuration it was taken under rather than being read as
     // all-defaults by whoever finds it later.
+    // **The existing field names are kept even though they now say "token"
+    // where the quantity is per STEP.** At `B = 1` — every run this project has
+    // ever recorded, and the default — the two are the same number, so the
+    // corpus keeps parsing and older rows stay comparable (`ingest.rs` splits
+    // `config=[…]` keyed rather than positionally, and these are top-level
+    // fields a rename would break). The batched quantities are **added**
+    // alongside with names that say what they are, which is the same choice
+    // §7.1a records for `config_line()`: append rather than re-spell, so an
+    // older line parses unchanged and a newer one carries more.
+    //
+    // `batch=` is on the line for the reason #171's `UNRECORDED` exists: a run
+    // taken before this field existed is not thereby *at* B=1, it is a run the
+    // question cannot be asked of. Now it can.
     println!(
-        "RESULT label={} n={} warmup={} wall_ms_per_token={:.4} gpu_ms_per_token={:.4} \
-         nongpu_ms_per_token={:.4} dispatches_per_token={:.1} prefill_ms={:.2} \
+        "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
+         gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} dispatches_per_token={:.1} \
+         dispatches_per_forward={:.1} aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
+         batch_streams_identical={} prefill_ms={:.2} \
          prompt_tokens={} weight_bytes={} dtype={:?} hit_eos={} profiling={} \
          config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
         warmup,
+        batch,
         wall_mean * 1e3,
         gpu_mean * 1e3,
         (wall_mean - gpu_mean) * 1e3,
         disp_mean,
+        // Floored at 0 rather than subtracted blindly: with profiling off
+        // `disp_mean` is 0.0, and `0 - (B-1)` printed **-7.0** at B=8 — a count
+        // that cannot be negative, rendered as one. The forward-pass term is
+        // only meaningful when the counters ran, and a nonsense value in a
+        // field a reader keys on is worse than a zero (§2.4). Found by running
+        // the admission arm, which does not profile.
+        if disp_mean > 0.0 {
+            disp_mean - batch.saturating_sub(1) as f64
+        } else {
+            0.0
+        },
+        // §13.4a's own quantity: `B / step_time`.
+        batch as f64 / wall_mean,
+        1.0 / wall_mean,
+        // Tri-state rather than a bool: at `B = 1` there is nothing to compare,
+        // and reporting `true` there would claim a check that did not run —
+        // §15.1a's vacuous-instrument class, in a field.
+        match (batch, args.batch_check, batch_divergence.is_some()) {
+            (1, _, _) => "n/a",
+            (_, false, _) => "unchecked",
+            (_, true, false) => "true",
+            (_, true, true) => "FALSE",
+        },
         prefill_wall.as_secs_f64() * 1e3,
         prompt_ids.len(),
         weight_bytes,

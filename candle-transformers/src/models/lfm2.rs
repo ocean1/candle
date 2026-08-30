@@ -1693,7 +1693,10 @@ impl ShortConv {
                     .expect("rotating weights exist whenever the arm is RotatingRing")
                     .get(phase)
                     .expect("phase is taken modulo width, so it indexes the table");
-                outs.push((&state * w.unsqueeze(0)?)?.sum_keepdim(2)?);
+                // `broadcast_mul` rather than `*`: see the decode arm below for
+                // why, and note it is the same one-line change at all four
+                // conv-weight sites.
+                outs.push(state.broadcast_mul(&w.unsqueeze(0)?)?.sum_keepdim(2)?);
             }
 
             if cache.use_kv_cache {
@@ -1744,7 +1747,10 @@ impl ShortConv {
                         .expect("rotating weights are built whenever the arm is RotatingRing")
                         .get(phase)
                         .expect("phase is taken modulo width, so it indexes the table");
-                    (state * w.unsqueeze(0)?)?.sum_keepdim(2)?.contiguous()?
+                    state
+                        .broadcast_mul(&w.unsqueeze(0)?)?
+                        .sum_keepdim(2)?
+                        .contiguous()?
                 }
                 ConvState::SlidingRing { .. } => {
                     let width = self.conv_state.width(self.l_cache);
@@ -1797,7 +1803,8 @@ impl ShortConv {
                     // unchanged and the output bit-identical. A rotating index
                     // would not: see `ConvState`'s note on §10.2a.
                     let window = state.narrow(2, phase + 1 - self.l_cache, self.l_cache)?;
-                    (window * conv_weight.unsqueeze(0)?)?
+                    window
+                        .broadcast_mul(&conv_weight.unsqueeze(0)?)?
                         .sum_keepdim(2)?
                         .contiguous()?
                 }
@@ -1824,8 +1831,31 @@ impl ShortConv {
                         cache.conv_states[block_idx] = Some(state.clone());
                     }
 
-                    // Apply convolution as element-wise multiply and sum
-                    (state * conv_weight.unsqueeze(0)?)?
+                    // Apply convolution as element-wise multiply and sum.
+                    //
+                    // **`broadcast_mul` rather than `*`, and this is the one
+                    // place LFM2 decode genuinely assumed B=1** (issue #249).
+                    // The state is `[b_sz, hidden, l_cache]` and the weight
+                    // `unsqueeze(0)`s to `[1, hidden, l_cache]`; `Tensor::mul`
+                    // requires the shapes to be *equal*, so the two match only
+                    // when `b_sz == 1` and any `b_sz > 1` fails with
+                    // `shape mismatch in mul`. Every other operator on the
+                    // decode path was already batch-parametric — `b_sz` comes
+                    // from `x.dims3()?` and threads through the projections,
+                    // the KV slots, the attention and the MLP untouched — so
+                    // this was the whole of it, at four sites that are the same
+                    // line.
+                    //
+                    // **The B=1 path does not change.** `broadcast_binary_op`
+                    // computes the broadcast shape and takes the
+                    // `(false, false)` arm — the identical `mul` — when neither
+                    // side needs broadcasting, which is exactly `b_sz == 1`.
+                    // At `b_sz > 1` the weight becomes a stride-0 view rather
+                    // than a copy, so the batch shares one weight read, which
+                    // is §13.4a's claim in miniature: the conv weight is per
+                    // step, not per sequence.
+                    state
+                        .broadcast_mul(&conv_weight.unsqueeze(0)?)?
                         .sum_keepdim(2)?
                         .contiguous()?
                 }
