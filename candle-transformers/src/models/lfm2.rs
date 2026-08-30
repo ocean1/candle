@@ -411,6 +411,33 @@ pub struct MemoryBudget {
     /// it exists to catch is 3.2× larger than the tolerance. A caller that knows
     /// its own load better may tighten it.
     pub weight_tolerance: usize,
+    /// **The longest single forward pass this process will run** — #306.
+    ///
+    /// `1` is decode and is the default. A caller that prefills a `P`-token
+    /// prompt in one pass must set this to `P`; a caller that **chunks** its
+    /// prefill sets it to the chunk size, which is the whole mechanism by
+    /// which chunking makes a long prompt admissible (§13.2b).
+    ///
+    /// # Why this is not inferable, and why the default is 1
+    ///
+    /// **Admission runs once, at the head of `Cache::new_with`, before any
+    /// forward pass** (§9.5d) — so no `seq_len` exists to read, and the prompt
+    /// length is the caller's knowledge arriving later. Defaulting to
+    /// `max_position_embeddings` would refuse essentially every configuration,
+    /// which is §8.1g's failure and the one the admitted arm exists to catch;
+    /// defaulting to 1 leaves every existing verdict **exactly** where it was
+    /// and lets a prefilling caller opt in.
+    ///
+    /// # The limit, stated rather than hidden
+    ///
+    /// A caller that prefills and does not set this gets the pre-#306
+    /// behaviour — which is the behaviour that admitted a configuration
+    /// peaking at **30.5 GB with 77 MB of host memory free** (§13.4c). **What
+    /// #306 buys is that the figure is expressible and checked, not that an
+    /// unwitting caller is safe.** §9.5m's weight term has the same shape and
+    /// the same honest limit: the contract is checkable and the caller still
+    /// has to state it.
+    pub max_seq_len: usize,
 }
 
 impl MemoryBudget {
@@ -441,7 +468,19 @@ impl MemoryBudget {
             batch: 1,
             fraction: Self::DEFAULT_FRACTION,
             weight_tolerance: Self::DEFAULT_WEIGHT_TOLERANCE,
+            // Decode. #306: see the field's own doc comment for why this is 1
+            // and not `max_position_embeddings`.
+            max_seq_len: 1,
         }
+    }
+
+    /// The same budget, told the longest forward pass it will be asked for.
+    ///
+    /// A single-shot prefill of `P` tokens passes `P`; a chunked one passes
+    /// its **chunk size** (§13.2b, §4.1).
+    pub fn with_prefill(mut self, seq_len: usize) -> Self {
+        self.max_seq_len = seq_len;
+        self
     }
 }
 
@@ -907,6 +946,29 @@ impl Cache {
         );
         b.batch = budget.batch;
         b.fraction = budget.fraction;
+        // #306: the activation class is a function of the longest forward pass,
+        // not a constant. Taken from the caller because admission runs before
+        // any pass exists to measure -- see `MemoryBudget::max_seq_len`.
+        b.max_seq_len = budget.max_seq_len;
+        // The geometry that class is computed from, taken from `Config` rather
+        // than from `PrefillGeometry::default()` so a model with different
+        // dimensions is sized correctly and cannot silently inherit LFM2's.
+        b.prefill_geometry = admission::PrefillGeometry {
+            attention_layers: config
+                .layer_types
+                .iter()
+                .filter(|t| **t == LayerType::FullAttention)
+                .count(),
+            conv_layers: config
+                .layer_types
+                .iter()
+                .filter(|t| **t == LayerType::Conv)
+                .count(),
+            query_heads: config.num_attention_heads,
+            head_dim: config.head_dim(),
+            hidden: config.hidden_size,
+            intermediate: config.intermediate_size,
+        };
         // §10.2g: `Shuffle` and `RotatingRing` hold exactly `l_cache` columns
         // (264 KiB); `SlidingRing` holds the slack it slides through as well,
         // which is 1.63 MiB at the default. Taken from `ConvState::width`
