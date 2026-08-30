@@ -35,11 +35,26 @@ use objc2_metal::MTLSize;
 
 /// Storage dtype of the query, key and value tensors.
 ///
-/// `bfloat` is absent, and that is a scope statement rather than an omission:
-/// `flash_decoding.metal` does not instantiate it, because reaching it needs
-/// the ~500-line `_MLX_BFloat16` shim
-/// `scaled_dot_product_attention.metal` carries. **LFM2 ships BF16 on disk and
-/// decode runs F16** (§9.1b), so the arm this issue is measured on is `F16`.
+/// `bfloat` is absent. It is still a scope statement rather than an omission,
+/// and **both of the reasons originally given for it are false** — measured
+/// 2026-08-30 (#307, `DESIGN.md` §3.9).
+///
+/// This comment used to read: *"`flash_decoding.metal` does not instantiate it,
+/// because reaching it needs the ~500-line `_MLX_BFloat16` shim
+/// `scaled_dot_product_attention.metal` carries. LFM2 ships BF16 on disk and
+/// decode runs F16 (§9.1b)."* Measured, `__HAVE_BFLOAT__` **is defined** on this
+/// machine, so that shim is the `#else` branch and is **inert** — the `.metal`
+/// file's own estimate, *"a `#include` of the shim and three lines"*, is an
+/// over-estimate by the `#include`. And bf16 decode is **reachable**: 12 of 12
+/// decode kernel families dispatch a native bf16 sibling at an identical count,
+/// and `lfm2-smoke` PASSes at `--dtype bf16` on all three `--attn` arms.
+///
+/// **What keeps `bfloat` out is now a cost argument rather than a capability
+/// one**: §10.4b measures this arm **+6.3 % slower** than `Sdpa` at `kv_len`
+/// 16 034, so a bf16 instantiation would be built-and-unused (§15.2 #11).
+/// `lfm2.rs`'s `flash_decoding_applies` excludes `BF16` to match, which makes
+/// `--attn flash --dtype bf16` a silent decline to the generic path — see the
+/// note there before reading a flash run's config line.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FlashDType {
     F16,

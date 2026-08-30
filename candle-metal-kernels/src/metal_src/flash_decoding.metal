@@ -610,13 +610,35 @@ instantiate_flash_decoding_heads(float)
 instantiate_flash_decoding_heads(half)
 // clang-format on
 
-// **`bfloat` is deliberately not instantiated, and that is a scope statement
-// rather than an omission.** `scaled_dot_product_attention.metal` reaches it
-// through a ~500-line `_MLX_BFloat16` shim it carries for the pre-`__HAVE_BFLOAT__`
-// case; duplicating that here would be the largest part of this file for a dtype
-// nothing dispatches. **LFM2 ships BF16 on disk and decode runs F16** --
-// `lfm2-determinism/main.rs` converts at load, because *"Metal's bf16 kernel
-// coverage is patchy and unsupported ops fall back to the CPU silently"*
-// (§9.1b). So the arm this issue is measured on is `half`, and `float` is here
-// because CPU-parity fixtures use it. Adding `bfloat` is a `#include` of the
-// shim and three lines, when a caller wants it.
+// **`bfloat` is deliberately not instantiated, and that is still a scope
+// statement rather than an omission -- but every reason this comment used to
+// give for it is FALSE.** Measured 2026-08-30 (#307, `DESIGN.md` §3.9).
+//
+// It read: *"`scaled_dot_product_attention.metal` reaches it through a ~500-line
+// `_MLX_BFloat16` shim it carries for the pre-`__HAVE_BFLOAT__` case;
+// duplicating that here would be the largest part of this file for a dtype
+// nothing dispatches. LFM2 ships BF16 on disk and decode runs F16 --
+// `lfm2-determinism/main.rs` converts at load, because "Metal's bf16 kernel
+// coverage is patchy and unsupported ops fall back to the CPU silently"
+// (§9.1b)."*
+//
+// Three corrections, and the last one is why this is worth keeping rather than
+// deleting:
+//
+//   1. **`__HAVE_BFLOAT__` IS defined on this machine**, so that shim is the
+//      `#else` branch and is inert. Nothing would be duplicated.
+//   2. **"a dtype nothing dispatches" is true and circular.** Nothing
+//      dispatches bfloat here *because this file does not instantiate it*; the
+//      rest of the decode path dispatches bf16 at 12 of 12 families.
+//   3. **The quoted claim is false.** It is a comment in a harness, quoted into
+//      §9.1b as a fact and made load-bearing for three decisions -- including
+//      this one. bf16 decode runs: `lfm2-smoke` PASSes at `--dtype bf16` on all
+//      three `--attn` arms with byte-identical text, and no dispatch falls back
+//      to the CPU.
+//
+// **The disposition is unchanged and its grounds are new.** §10.4b measures this
+// arm **+6.3 % slower** than `Sdpa` at `kv_len` 16 034, so instantiating
+// `bfloat` would be built-and-unused (§15.2 #11). `half` is the measured arm and
+// `float` is here because CPU-parity fixtures use it. Adding `bfloat` is **three
+// lines** -- the `#include` is not needed -- when a caller wants it, and a
+// caller wanting it owes the timing first.

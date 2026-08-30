@@ -395,9 +395,18 @@ fn main() -> Result<()> {
         Device::new_metal(0)?
     };
 
-    // f16 on Metal is what ambrogio loads: LFM2 ships bf16, but Metal's bf16
-    // kernel coverage is patchy and unsupported ops fall back to the CPU
-    // silently. Measuring f32 here would exercise a path nothing runs.
+    // f16 on Metal is what ambrogio loads. Measuring f32 here would exercise a
+    // path nothing runs.
+    //
+    // This comment used to add: "LFM2 ships bf16, but Metal's bf16 kernel
+    // coverage is patchy and unsupported ops fall back to the CPU silently."
+    // **That is false, and it had never been tested** (#307, §3.9) -- it was
+    // quoted into `DESIGN.md` §9.1b as a fact and made load-bearing for three
+    // decisions. THIS harness is what refutes it: it PASSes at `--dtype bf16`
+    // on all three `--attn` arms with text byte-identical to the f16 arm.
+    // The default stays f16 because it is what the consumer loads, which is the
+    // reason this comment led with (§7.1a: a default is its own argued
+    // decision).
     let dtype = match args.dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("f32") => DType::F32,

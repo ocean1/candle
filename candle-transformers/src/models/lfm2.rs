@@ -1391,11 +1391,32 @@ impl Attention {
     ///
     /// The same shape as `sdpa_applies`, and every condition is one
     /// `ops::flash_decoding` would otherwise `bail!` on — so a false here is a
-    /// fallback and never a failure. `BF16` is absent where `sdpa_applies`
-    /// allows it: `flash_decoding.metal` does not instantiate `bfloat`, because
-    /// reaching it needs the ~500-line `_MLX_BFloat16` shim
-    /// `scaled_dot_product_attention.metal` carries, and **LFM2 ships BF16 on
-    /// disk and decode runs F16** (§9.1b).
+    /// fallback and never a failure.
+    ///
+    /// **`BF16` is absent where `sdpa_applies` allows it, and the stated reason
+    /// is false — measured 2026-08-30 (#307, `DESIGN.md` §3.9).** This comment
+    /// used to say `flash_decoding.metal` does not instantiate `bfloat` because
+    /// reaching it needs the ~500-line `_MLX_BFloat16` shim, *"and LFM2 ships
+    /// BF16 on disk and decode runs F16 (§9.1b)"*. Both premises fail:
+    /// `__HAVE_BFLOAT__` **is defined** on this machine, so that shim is the
+    /// `#else` branch and is inert; and bf16 decode is **reachable** — 12 of 12
+    /// decode families dispatch a native bf16 sibling, and `lfm2-smoke` PASSes
+    /// at `--dtype bf16`.
+    ///
+    /// **The condition is kept anyway**, and it is a real fallback rather than
+    /// an oversight: `flash_decoding.metal` genuinely has no `bfloat`
+    /// instantiation, so admitting `BF16` here would `LoadFunctionError` inside
+    /// a forward pass. Instantiating it is **not recommended** — §10.4b measures
+    /// this arm **+6.3 % slower** at `kv_len` 16 034, so a bf16 variant would be
+    /// built-and-unused (§15.2 #11).
+    ///
+    /// **What a caller must know**: at `--attn flash --dtype bf16` this returns
+    /// false and the layer takes the *generic* path — 674 dispatches/token
+    /// against the flash arm's 562 — while `config_line()` still renders
+    /// `AttnImpl=FlashDecoding`. That is a fourth species of §7.1a-i's
+    /// axis-reporting defect: the axis is selected and the mechanism did not
+    /// run, for a **dtype** reason. Attribute a flash run from the kernel
+    /// census, never from the config line (§2.4).
     fn flash_decoding_applies(&self, q: &Tensor, seq_len: usize) -> bool {
         self.attn_impl == AttnImpl::FlashDecoding
             && q.device().is_metal()
