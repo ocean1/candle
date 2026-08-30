@@ -61,11 +61,13 @@ use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::lfm2::{
-    AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model,
+    AttnImpl, Cache, ConvState, KvAppend, Model,
+};
+use candle_examples::lfm2_setup::{
+    default_model_dir, parse_config, tensor_names, weight_files,
 };
 use clap::Parser;
-use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]
@@ -433,64 +435,6 @@ const FOLLOW_UPS: [&str; 8] = [
     "What is the next thing someone should learn about this?",
 ];
 
-/// Normalize an LFM2.5-VL `config.json` into candle's schema.
-///
-/// Mirrors ambrogio's `parse_lfm2_config`, because the harness must measure the
-/// configuration that actually runs, not a nearby one:
-///
-/// * the language config is nested under `text_config`,
-/// * `rope_theta` lives in `rope_parameters` and candle would otherwise default
-///   it to 10000 where this checkpoint uses 1e6,
-/// * candle recomputes `intermediate_size` as 8192 while the FFN weights are
-///   `[10752, 2048]`, so the stated value has to win.
-fn parse_config(raw: &str) -> Result<Config> {
-    let root: Value = serde_json::from_str(raw).context("parsing config.json")?;
-    let text = root.get("text_config").unwrap_or(&root);
-    let mut obj = text
-        .as_object()
-        .context("expected a JSON object for the model config")?
-        .clone();
-
-    if !obj.contains_key("rope_theta") {
-        if let Some(theta) = obj
-            .get("rope_parameters")
-            .and_then(|p| p.get("rope_theta"))
-            .cloned()
-        {
-            obj.insert("rope_theta".into(), theta);
-        }
-    }
-
-    if !obj.contains_key("tie_embedding") {
-        if let Some(v) = obj.get("tie_word_embeddings").cloned() {
-            obj.insert("tie_embedding".into(), v);
-        }
-    }
-
-    for key in ["bos_token_id", "eos_token_id"] {
-        if !obj.contains_key(key) {
-            if let Some(v) = root.get(key).cloned() {
-                obj.insert(key.into(), v);
-            }
-        }
-    }
-
-    let normalized = Value::Object(obj);
-    let base: Lfm2Config = serde_json::from_value(normalized.clone())
-        .context("config.json does not match candle's LFM2 config schema")?;
-    let mut config = base.into_config(false);
-
-    if let Some(stated) = normalized
-        .get("intermediate_size")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
-    {
-        config.intermediate_size = stated;
-    }
-
-    Ok(config)
-}
-
 /// Parse a `--force-tokens` file into the sequence to decode.
 ///
 /// Accepts one id per line and a whitespace- or comma-separated list on one
@@ -546,66 +490,6 @@ fn parse_forced_tokens(raw: &str) -> Result<Vec<u32>> {
     }
     anyhow::ensure!(!out.is_empty(), "the token file parsed to no tokens");
     Ok(out)
-}
-
-/// Tensor names, read from the safetensors header without mapping the weights.
-fn tensor_names(path: &Path) -> Result<Vec<String>> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut len_bytes = [0u8; 8];
-    file.read_exact(&mut len_bytes)?;
-    let header_len = u64::from_le_bytes(len_bytes) as usize;
-    anyhow::ensure!(
-        header_len > 0 && header_len < 100 * 1024 * 1024,
-        "implausible safetensors header length {header_len}"
-    );
-
-    let mut header = vec![0u8; header_len];
-    file.read_exact(&mut header)?;
-    let parsed: Value = serde_json::from_slice(&header)?;
-    Ok(parsed
-        .as_object()
-        .context("safetensors header is not a JSON object")?
-        .keys()
-        .filter(|k| *k != "__metadata__")
-        .cloned()
-        .collect())
-}
-
-fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let index = dir.join("model.safetensors.index.json");
-    if !index.exists() {
-        return Ok(vec![dir.join("model.safetensors")]);
-    }
-    let raw = std::fs::read_to_string(&index)?;
-    let parsed: Value = serde_json::from_str(&raw)?;
-    let map = parsed
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .context("safetensors index has no weight_map")?;
-    let mut names: Vec<String> = map
-        .values()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-    names.sort();
-    names.dedup();
-    Ok(names.into_iter().map(|n| dir.join(n)).collect())
-}
-
-/// Default HF cache location for the checkpoint this project targets.
-fn default_model_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let base =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--LiquidAI--LFM2.5-VL-3B/snapshots");
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&base)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.join("config.json").exists())
-        .collect();
-    entries.sort();
-    entries.pop()
 }
 
 fn main() -> Result<()> {
