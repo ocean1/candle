@@ -289,6 +289,17 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     flash_k: usize,
 
+    /// How `--attn flash` sizes the scratch class: `grow` (the default),
+    /// `reserve` or `bucket` — `DESIGN.md` §9.1a's three policies, issue #234.
+    ///
+    /// Sizing decides **where bytes live and not what they are**, so all three
+    /// arms owe the same text here and the same digests in
+    /// `lfm2-determinism` — which is why this flag exists on the gates rather
+    /// than only on the profiler. `grow` is what #116 allocated, so the default
+    /// is byte-for-byte what shipped.
+    #[arg(long, default_value = "grow")]
+    flash_scratch_sizing: String,
+
     /// KV cache growth: `cat` (the default `Tensor::cat` reallocation) or
     /// `in-place` (pre-allocated, written at a moving offset -- issue #142).
     ///
@@ -650,6 +661,12 @@ fn main() -> Result<()> {
     };
     config.flash_page_size = args.flash_page_size;
     config.flash_pages_per_chunk = args.flash_k;
+    // §9.1a's sizing policy (#234). Refused rather than defaulted, for the same
+    // reason as `--attn`: a silently-ignored flag makes a gate report on an arm
+    // it did not run (§2.4).
+    config.flash_scratch_sizing =
+        candle_nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
+            .map_err(anyhow::Error::msg)?;
     println!("attention implementation: {:?}", config.attn_impl);
     // Refused rather than defaulted, for the same reason as `--attn`: an
     // unrecognized value that silently pinned the default would report the

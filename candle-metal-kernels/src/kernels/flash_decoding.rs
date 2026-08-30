@@ -186,6 +186,16 @@ impl FlashPartialParams {
     /// the **head** stride (the reserved capacity, which `sdpa_vector` also
     /// takes) and index 2 is the **token** stride — the field #200 could not
     /// vary and §9.1d asks for.
+    ///
+    /// `n_chunks` is what this step computes and `chunk_capacity` is what the
+    /// region was sized for — the pair `ScratchSizing` decides (#234). They are
+    /// equal under `Sizing::Grow` and differ under the other two, and passing
+    /// the live count for both is what made every reserving policy
+    /// inexpressible however many were compiled. **A capacity below the live
+    /// count is refused here**: it would make the partial pass write past its
+    /// own region, which §3.5 makes silent corruption rather than an error, and
+    /// a caller computing the two independently is exactly the hand-sync this
+    /// function exists to remove.
     #[allow(clippy::too_many_arguments)]
     pub fn for_step(
         q_shape: &[usize],
@@ -195,9 +205,17 @@ impl FlashPartialParams {
         page_size: usize,
         pages_per_chunk: usize,
         n_chunks: usize,
+        chunk_capacity: usize,
         alpha: f32,
         softcapping: f32,
-    ) -> Self {
+    ) -> Result<Self, MetalKernelError> {
+        if chunk_capacity < n_chunks {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "flash-decoding scratch sized for {chunk_capacity} chunks but the step \
+                 computes {n_chunks}: the partial pass would write past its region, which \
+                 under HazardTrackingModeUntracked is silent corruption (DESIGN.md 3.5)"
+            )));
+        }
         // Folded the way `call_sdpa_vector` folds it, so the two paths scale
         // identically and a comparison between them is a comparison of the
         // split rather than of the scale.
@@ -206,20 +224,22 @@ impl FlashPartialParams {
         } else {
             alpha
         };
-        Self {
+        Ok(Self {
             gqa_factor: (q_shape[1] / k_shape[1]) as i32,
             n_keys: k_shape[2] as i32,
             chunk_size: (page_size * pages_per_chunk) as i32,
             n_chunks: n_chunks as i32,
+            chunk_capacity: chunk_capacity as i32,
             pages_per_chunk: pages_per_chunk as i32,
             page_size: page_size as i32,
+            _pad: 0,
             k_head_stride: k_stride[1] as u64,
             v_head_stride: v_stride[1] as u64,
             k_token_stride: k_stride[2] as u64,
             v_token_stride: v_stride[2] as u64,
             scale,
             softcapping,
-        }
+        })
     }
 }
 

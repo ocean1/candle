@@ -45,6 +45,7 @@ extern crate accelerate_src;
 
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
+use candle_nn::ops::FlashScratchSizing;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::lfm2::{
@@ -539,6 +540,13 @@ struct Axes {
     /// this run unpoolable with any run that did record it (#241).
     flash_page_size: usize,
     flash_k: usize,
+    /// The scratch sizing arm (#234), echoed for the run line.
+    ///
+    /// The enum and not the flag string, for #241's reason: the arm is decided
+    /// on `Config`, so that is where it is read from, and it renders through an
+    /// exhaustive `match` so a fourth arm is a compile error rather than a
+    /// silently wrong value.
+    flash_scratch_sizing: FlashScratchSizing,
     /// The admission fraction, or `None` when no budget is installed (#249).
     ///
     /// Read back from the `Config` the `Cache` was built from rather than from
@@ -694,6 +702,7 @@ impl Axes {
             conv_state: config.conv_state,
             flash_page_size: config.flash_page_size,
             flash_k: config.flash_pages_per_chunk,
+            flash_scratch_sizing: config.flash_scratch_sizing,
             memory_budget: config.memory_budget.map(|b| b.fraction),
             batch: args.batch,
         })
@@ -801,7 +810,21 @@ impl Axes {
             // unstated axis and an axis at its default are different facts, and
             // conflating them is what this whole function exists to stop.
             p("BarrierScope", "RunStart"),
-            p("ScratchSizing", "none"),
+            // **An arm rather than `none`, as of #234.** It read `none` because
+            // nothing on the decode path allocated from the scratch class, and
+            // that was true until #116 gave it a consumer — after which the
+            // line said *"the mechanism is not installed"* about a mechanism
+            // that was installed and running at `Grow`. §7.1a-i's
+            // present-and-wrong case: a false off-state compares **equal** to
+            // real runs of other configurations, where an absent axis would
+            // only have been `UNRECORDED`.
+            //
+            // Rendered from the resolved enum through an exhaustive `match`
+            // (#241, #245), so the arm on the line is the arm the model was
+            // built with and a fourth arm is a compile error. It is stated on
+            // every run including the `Generic` and `Sdpa` ones, where it is
+            // inert: *inert* and *unrecorded* are different facts.
+            p("ScratchSizing", self.flash_scratch_sizing.name()),
             p("MathMode", Self::math_mode_name()),
             // The five below were absent entirely, which is the *other* half of
             // #241's audit and a different defect from the wrong-value one
@@ -1090,6 +1113,24 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     flash_k: usize,
 
+    /// How `--attn flash` sizes the scratch class: `grow` (the default),
+    /// `reserve` or `bucket` — `DESIGN.md` §9.1a's three policies, issue #234.
+    ///
+    /// **Three arms have been compiled since #71 and none reached a model path
+    /// until now.** #116 sized these buffers to the live `kv_len` on every
+    /// call, which is `Grow` in effect and by consequence rather than by
+    /// choice; this flag is what turns three compiled arms into three
+    /// measurable ones. `grow` is what shipped, so the default allocates
+    /// byte-for-byte what it did.
+    ///
+    /// `reserve` reserves for the **cache's** capacity (`--kv-capacity`, 4096
+    /// by default) rather than for `max_position_embeddings`: the first is the
+    /// largest `kv_len` a run can reach and the second is the model's
+    /// positional ceiling, 128000. `bucket` takes the smallest rung of
+    /// `BUCKET_LADDER` (8k/32k/128k in tokens) that covers the step.
+    #[arg(long, default_value = "grow")]
+    flash_scratch_sizing: String,
+
     /// KV cache growth: `cat` (the default `Tensor::cat` reallocation) or
     /// `in-place` (pre-allocated, written at a moving offset -- issue #142).
     #[arg(long, default_value = "cat")]
@@ -1362,6 +1403,64 @@ fn language_weight_bytes(config: &Config, layer_is_attn: &[bool], dtype_bytes: u
     params * dtype_bytes
 }
 
+/// Bytes one attention layer's FlashDecoding partials **ask for** at the
+/// selected sizing arm (`DESIGN.md` §9.1a, issue #234).
+///
+/// # Why this is on the `RESULT` line
+///
+/// §2.4: an instrument that cannot be shown to have engaged has measured
+/// nothing, and the proof must come **from a quantity the flag should have
+/// changed** rather than from the flag being echoed back. #257 found a third
+/// species of that failure — an axis rendering correctly for a mechanism that
+/// **did not run** — and `ScratchSizing` is exposed to exactly it: the arm is
+/// inert on `--attn generic` and `--attn sdpa`, which allocate from this class
+/// not at all.
+///
+/// So this figure is **0 unless FlashDecoding is selected**, and otherwise
+/// differs per arm: the live count under `Grow`, the reservation under
+/// `Reserve`, a rung under `Bucket`. Two runs differing only in this flag whose
+/// `scratch_asks_bytes` agree did not select what they claim to have.
+///
+/// # It is a prediction, and it says so
+///
+/// Computed from the arm and `kv_len` rather than read from the allocator, so
+/// it is *what the policy asks for* and not *what was allocated* — §5.5a's
+/// caution about a harness quoting its own computed figure as evidence. The
+/// observed side is `allocated_bytes` under `--mem-jsonl`, which knows nothing
+/// about this arithmetic. The field is named `asks` for that reason.
+///
+/// `+ 2` per (head, chunk) is the online-softmax `m` and `l`, and the count is
+/// **query** heads because a partial is downstream of GQA's register broadcast
+/// (§9.1a: using the 8 KV heads would under-size the class 4×).
+fn flash_scratch_ask_bytes(
+    axes: &Axes,
+    config: &Config,
+    kv_len: usize,
+    kv_capacity: usize,
+) -> usize {
+    if config.attn_impl != AttnImpl::FlashDecoding {
+        return 0;
+    }
+    let chunk_size = (config.flash_page_size * config.flash_pages_per_chunk).max(1);
+    let live = kv_len.div_ceil(chunk_size);
+    // The same three arms `Sizing::sized_chunks` computes, and the same bounds:
+    // `Reserve` against the cache's capacity, `Bucket` against the ladder in
+    // chunks. A refusal is impossible here — the run completed, so the op
+    // accepted these inputs — and is rendered as the live count rather than
+    // panicking after a successful measurement.
+    let chunks = match axes.flash_scratch_sizing {
+        FlashScratchSizing::Grow => live,
+        FlashScratchSizing::Reserve => kv_capacity.div_ceil(chunk_size).max(live),
+        FlashScratchSizing::Bucket => [8_192usize, 32_768, 131_072]
+            .iter()
+            .map(|&kv| kv.div_ceil(chunk_size))
+            .find(|&rung| live <= rung)
+            .unwrap_or(live),
+    };
+    let head_dim = config.hidden_size / config.num_attention_heads;
+    config.num_attention_heads * chunks * (head_dim + 2) * 4
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -1416,6 +1515,11 @@ fn main() -> Result<()> {
     };
     config.flash_page_size = args.flash_page_size;
     config.flash_pages_per_chunk = args.flash_k;
+    // §9.1a's sizing policy, reaching a model path for the first time (#234).
+    // Refused rather than defaulted, for the same reason as `--attn`: a
+    // silently-ignored flag makes an A/B arm measure the wrong thing (§2.4).
+    config.flash_scratch_sizing =
+        FlashScratchSizing::parse(&args.flash_scratch_sizing).map_err(anyhow::Error::msg)?;
     // Refused rather than defaulted, for the same reason as `--attn`.
     config.kv_append = match args.kv_append.as_str() {
         "cat" => candle_transformers::models::lfm2::KvAppend::Cat,
@@ -2221,13 +2325,28 @@ fn main() -> Result<()> {
     // `batch=` is on the line for the reason #171's `UNRECORDED` exists: a run
     // taken before this field existed is not thereby *at* B=1, it is a run the
     // question cannot be asked of. Now it can.
+    // **The engagement proof for `ScratchSizing`, and it is not the config
+    // line** (#234, and #257's third species: an axis that renders correctly
+    // for a mechanism that did not run). §2.4 requires a flag be shown to have
+    // engaged **from a quantity it should have changed**, and what this arm
+    // changes is *how many bytes one attention layer's partials occupy*.
+    //
+    // Computed from the resolved arm and the final `kv_len` rather than
+    // measured at the allocation, which is a weaker check and an honest one:
+    // it says what the selected policy *asks for*, so it discriminates the
+    // three arms — 0 on `Generic`/`Sdpa`, `live` on `Grow`, the reservation on
+    // `Reserve` and a rung on `Bucket` — and a reader comparing it against
+    // `allocated_bytes` in `--mem-jsonl` has the observed side. **A figure the
+    // harness computes is a prediction that agrees, not an observation**
+    // (§5.5a's own caution), and it is labelled `asks` for that reason.
+    let scratch_asks_bytes = flash_scratch_ask_bytes(&axes, &config, kv_len, args.kv_capacity);
     println!(
         "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
          gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} dispatches_per_token={:.1} \
          dispatches_per_forward={:.1} aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
          batch_streams_identical={} prefill_ms={:.2} \
-         prompt_tokens={} weight_bytes={} dtype={:?} hit_eos={} profiling={} \
-         config=[{}] candle_commit={} seed={} temp={} top_p={}",
+         prompt_tokens={} weight_bytes={} scratch_asks_bytes={} dtype={:?} hit_eos={} \
+         profiling={} config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
         warmup,
@@ -2262,6 +2381,7 @@ fn main() -> Result<()> {
         prefill_wall.as_secs_f64() * 1e3,
         prompt_ids.len(),
         weight_bytes,
+        scratch_asks_bytes,
         dtype,
         hit_eos,
         profiling,

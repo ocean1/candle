@@ -8,6 +8,7 @@
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 use crate::utils::repeat_kv;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
+use candle_nn::ops::FlashScratchSizing;
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
 use std::collections::HashMap;
 
@@ -112,6 +113,9 @@ impl Lfm2Config {
             attn_impl: AttnImpl::default(),
             flash_page_size: 256,
             flash_pages_per_chunk: 1,
+            // `Grow`, which is what #116's per-call allocation did before the
+            // axis reached it (#234). Not a choice — see the field's note.
+            flash_scratch_sizing: FlashScratchSizing::default(),
             kv_append: KvAppend::default(),
             conv_state: ConvState::default(),
             // §9.5's admission is off unless a caller asks for it, per §7.1a.
@@ -499,6 +503,27 @@ pub struct Config {
     /// 1, which is what §10.4 specifies. What is new is that it is a *stated*
     /// value on a selectable axis rather than an equality welded into a kernel.
     pub flash_pages_per_chunk: usize,
+    /// How `AttnImpl::FlashDecoding` sizes the scratch class (`DESIGN.md`
+    /// §9.1a, issue #234).
+    ///
+    /// **This is the wiring §7.1b names as the cheapest missing
+    /// prerequisite.** #71 compiled three sizing policies and chose none,
+    /// because the axis that separates them is `kv_len` and it was unreachable;
+    /// #61 has since taken `kv_len` to 32 801, and in the interval #116 gave
+    /// the class its first consumer on the LFM2 path — one that sized its
+    /// buffers to the live `kv_len` on every call and read no policy at all. So
+    /// the arm in force was `Grow`, selected by an allocation site rather than
+    /// by anyone.
+    ///
+    /// Defaults to [`FlashScratchSizing::Grow`], which is a **statement of what
+    /// shipped rather than a choice**: an unconfigured caller allocates exactly
+    /// what #116 allocated. §7.1a's rule is that a default is flipped by its
+    /// own argued decision, and wiring an axis is not that argument.
+    ///
+    /// **Inert unless `attn_impl` is `FlashDecoding`**, which is the only path
+    /// that allocates from this class — *inert* and *unrecorded* being different
+    /// facts, so it is still stated on a `RESULT` line (#241).
+    pub flash_scratch_sizing: FlashScratchSizing,
     /// Defaults to `Cat`, for the same reason `attn_impl` defaults to `Generic`.
     pub kv_append: KvAppend,
     /// Defaults to `Shuffle`, so every existing caller keeps §6.1's path.
@@ -629,6 +654,24 @@ pub struct Cache {
     // compiled and the unselected one allocates nothing.
     kv_slots: Vec<(KvSlot, KvSlot)>,
     kv_append: KvAppend,
+    /// The largest `kv_len` this cache admits, in tokens.
+    ///
+    /// **What `FlashScratchSizing::Reserve` reserves against** (#234), and the
+    /// reason it lives here rather than on `Config`: the reachable ceiling is
+    /// `kv_capacity`, which is a `Cache::new_with` argument and defaults to
+    /// `DEFAULT_KV_CAPACITY` (4096) — where `Config::max_position_embeddings`
+    /// is **128000**, the model's positional ceiling and not this run's. A
+    /// `Reserve` bounded by the second would reserve 31× what any step of this
+    /// cache can reach, which is not the policy's cost but a mis-stated bound
+    /// on it, and §9.1a's own table is what a reader would then compare it
+    /// against.
+    ///
+    /// Held for **both** `KvAppend` arms, though only `InPlace` has a
+    /// per-slot capacity: `Cat` reallocates and has no ceiling of its own, so
+    /// its reserve bound is this same configured number rather than something
+    /// derived from a slot that does not exist. That keeps the two arms
+    /// comparable on this axis, which is what an A/B across them needs.
+    kv_capacity: usize,
     // Conv state cache for convolution layers
     conv_states: Vec<Option<Tensor>>,
     /// The ring's rotating write index, in slots.
@@ -793,6 +836,7 @@ impl Cache {
                 .map(|_| (KvSlot::new(kv_capacity), KvSlot::new(kv_capacity)))
                 .collect(),
             kv_append: config.kv_append,
+            kv_capacity,
             conv_states: vec![None; num_layers],
             conv_phase: 0,
             conv_compact: false,
@@ -1276,6 +1320,8 @@ struct Attention {
     attn_impl: AttnImpl,
     flash_page_size: usize,
     flash_pages_per_chunk: usize,
+    /// §9.1a's sizing policy, wired to FlashDecoding's allocation by #234.
+    flash_scratch_sizing: FlashScratchSizing,
     span: tracing::Span,
     span_rot: tracing::Span,
 }
@@ -1313,6 +1359,7 @@ impl Attention {
             attn_impl: cfg.attn_impl,
             flash_page_size: cfg.flash_page_size,
             flash_pages_per_chunk: cfg.flash_pages_per_chunk,
+            flash_scratch_sizing: cfg.flash_scratch_sizing,
             span: tracing::span!(tracing::Level::TRACE, "attn"),
             span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
         })
@@ -1450,6 +1497,18 @@ impl Attention {
             // still unverified: this issue makes it a field one flag apart
             // rather than measuring it, because the axis that would decide it
             // is `kv_len` and that is #61's.
+            //
+            // `flash_scratch_sizing` is §9.1a's policy, reaching this
+            // allocation for the first time (#234). `Reserve` is bounded by
+            // the **cache's** capacity rather than by
+            // `max_position_embeddings`: the first is the largest `kv_len` this
+            // run can reach and the second is the model's positional ceiling,
+            // 4096 against 128000 at the shipped default. The conversion to
+            // chunks happens here because the chunk size is this caller's pair
+            // of fields and a context length is the cache's number.
+            let reserve_chunks = cache
+                .kv_capacity
+                .div_ceil((self.flash_page_size * self.flash_pages_per_chunk).max(1));
             candle_nn::ops::flash_decoding(
                 &q,
                 &k,
@@ -1458,6 +1517,8 @@ impl Attention {
                 1.0,
                 self.flash_page_size,
                 self.flash_pages_per_chunk,
+                self.flash_scratch_sizing,
+                reserve_chunks,
             )?
         } else if self.sdpa_applies(&q, seq_len) {
             // Scale is applied to `q` inside the kernel before the dot product,

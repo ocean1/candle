@@ -83,9 +83,15 @@ using namespace metal;
 /// `softcapping` is tested inside it.
 ///
 /// Field order is chosen so the two 8-byte strides sit together and the struct
-/// needs no interior padding beyond the tail: 6 x int32 then 2 x size_t then
+/// needs no interior padding beyond the tail: 8 x int32 then 4 x size_t then
 /// 2 x float. `flash_params_layout` ships the real offsets across the boundary
 /// rather than either side asserting its own (§11.3d).
+///
+/// **The int32 count was 6 and is 8 as of #234**, which is why the sentence
+/// above is a statement about the current field list rather than a constant: an
+/// even count is what keeps the `size_t` block naturally aligned, and adding
+/// `chunk_capacity` alone would have made it 7 and inserted 4 bytes of padding
+/// the layout check would then have had to explain.
 struct FlashPartialParams {
   /// Query heads per KV head. 4 for LFM2 (32 q heads, 8 kv heads, §5.2).
   int gqa_factor;
@@ -95,11 +101,42 @@ struct FlashPartialParams {
   /// KV tokens per chunk. `k * page_size`; see the header note.
   int chunk_size;
   /// Chunks this step splits `n_keys` into: `ceil(n_keys / chunk_size)`.
+  ///
+  /// **The DISPATCH DEPTH, and not the stride** -- see `chunk_capacity`. Under
+  /// `Sizing::Reserve` the region holds more chunks than this step computes,
+  /// and the partial pass computes only the live ones: a chunk the pass never
+  /// dispatches is a chunk it never writes, so the combine must not read it
+  /// (which it does not -- its own loop bound is this same live count).
   int n_chunks;
+  /// Chunks the region is SIZED for. The partial write stride.
+  ///
+  /// # Why sizing needs a second number rather than a bigger first one
+  ///
+  /// `ScratchSizing` (§9.1a) chooses how many chunks a region reserves, and
+  /// `Reserve` and `Bucket` both reserve more than the step needs. The stride
+  /// between two heads' partials is a property of **how the region was laid
+  /// out**, so it is the reserved count; the number of chunks written and
+  /// merged is a property of **this step**, so it is `n_chunks`. Conflating
+  /// them under a reserving policy makes head `h`'s partials land where head
+  /// `h-1`'s were expected and the answer moves — a plausible wrong answer,
+  /// which §3.5 says nothing reports.
+  ///
+  /// `FlashCombineParams` has carried exactly this separation since #116 and
+  /// every caller passed `n_chunks` for both, because nothing selected a
+  /// reserving policy. **This is the same field on the pass that lays the
+  /// region out**, which is the half that was missing.
+  ///
+  /// Equal to `n_chunks` under `Sizing::Grow`, which is what shipped.
+  int chunk_capacity;
   /// Pages per chunk -- the `k` of `chunk_size = k * page_size`. **1 today.**
   int pages_per_chunk;
   /// KV tokens per page. Equals `chunk_size` at `k = 1`.
   int page_size;
+  /// Padding to keep the `size_t` block naturally aligned and the struct's
+  /// layout stated rather than inferred. Written by the Rust side as 0 and read
+  /// by nothing; `flash_params_layout` asserts the offsets either way, so this
+  /// is a declaration of intent rather than a load-bearing field.
+  int _pad;
   /// Distance between two KV heads, in elements. `k_stride[1]` -- the same
   /// quantity `sdpa_vector` takes, and it is the RESERVED capacity where
   /// `n_keys` is the LIVE length. Those being different numbers is what lets a
@@ -303,15 +340,22 @@ template <typename T, int D>
   // reserved-but-unused chunk safe rather than a source of NaN.
   const bool empty = (chunk_start >= chunk_end);
 
-  // The number of chunks a region is SIZED for, which is the partial stride,
-  // is `n_chunks` here: the partial pass writes only the chunks it computes.
-  const int n_chunks = p.n_chunks;
+  // The stride between two heads' partials is what the region was SIZED for,
+  // which under `Sizing::Reserve` and `Sizing::Bucket` exceeds what this step
+  // computes (§9.1a, #234). Using the live count here would make head `h`'s
+  // partials land where head `h-1`'s were expected under any reserving policy
+  // -- a plausible wrong answer, and §3.5 says nothing reports it.
+  //
+  // Equal to `p.n_chunks` under `Grow`, which is the arm that shipped and the
+  // reason a single field served both until a policy could select otherwise.
+  const int stride_chunks = p.chunk_capacity;
   device float* acc_out =
-      partials + (size_t)head_idx * n_chunks * D + (size_t)chunk_idx * D;
+      partials + (size_t)head_idx * stride_chunks * D + (size_t)chunk_idx * D;
 
   if (simd_gid == 0) {
-    sums[(size_t)head_idx * n_chunks + chunk_idx] = empty ? 0.0f : sum_exp_score;
-    maxs[(size_t)head_idx * n_chunks + chunk_idx] =
+    sums[(size_t)head_idx * stride_chunks + chunk_idx] =
+        empty ? 0.0f : sum_exp_score;
+    maxs[(size_t)head_idx * stride_chunks + chunk_idx] =
         empty ? -INFINITY : new_max;
   }
 
@@ -467,16 +511,19 @@ template <typename T, int D>
 // Layout, shipped across the boundary
 // ============================================================================
 
-// 64, not the 56 the fields sum to: six `int` fill 0..24, the four `size_t`
-// land 8-aligned at 24..56, and the two `float` at 56..64 need no trailing pad
-// only because 64 is already a multiple of the struct's 8-byte alignment.
+// 72 as of #234, and it was 64 before: **eight** `int` fill 0..32, the four
+// `size_t` land 8-aligned at 32..64, and the two `float` at 64..72 need no
+// trailing pad only because 72 is already a multiple of the struct's 8-byte
+// alignment. `_pad` is what makes the `int` count even and keeps that true —
+// with seven ints the `size_t` block would have started at 28 and the compiler
+// would have inserted four bytes here rather than the field stating them.
 //
 // **This literal was wrong on the first attempt and the compiler said so**,
 // which is the argument for the cross-boundary check rather than against it: a
 // `static_assert` catches the author's arithmetic, and
 // `every_family_params_layout_matches_metal` catches the two *sides*
 // disagreeing — a different failure, and the one #38 found live (§11.3d).
-static_assert(sizeof(FlashPartialParams) == 64, "FlashPartialParams layout");
+static_assert(sizeof(FlashPartialParams) == 72, "FlashPartialParams layout");
 static_assert(alignof(FlashPartialParams) == 8, "FlashPartialParams alignment");
 static_assert(sizeof(FlashCombineParams) == 8, "FlashCombineParams layout");
 
@@ -500,18 +547,19 @@ static_assert(sizeof(FlashCombineParams) == 8, "FlashCombineParams layout");
   out[2] = flash_offsetof_rt(FlashPartialParams, n_keys);
   out[3] = flash_offsetof_rt(FlashPartialParams, chunk_size);
   out[4] = flash_offsetof_rt(FlashPartialParams, n_chunks);
-  out[5] = flash_offsetof_rt(FlashPartialParams, pages_per_chunk);
-  out[6] = flash_offsetof_rt(FlashPartialParams, page_size);
-  out[7] = flash_offsetof_rt(FlashPartialParams, k_head_stride);
-  out[8] = flash_offsetof_rt(FlashPartialParams, v_head_stride);
-  out[9] = flash_offsetof_rt(FlashPartialParams, k_token_stride);
-  out[10] = flash_offsetof_rt(FlashPartialParams, v_token_stride);
-  out[11] = flash_offsetof_rt(FlashPartialParams, scale);
-  out[12] = flash_offsetof_rt(FlashPartialParams, softcapping);
+  out[5] = flash_offsetof_rt(FlashPartialParams, chunk_capacity);
+  out[6] = flash_offsetof_rt(FlashPartialParams, pages_per_chunk);
+  out[7] = flash_offsetof_rt(FlashPartialParams, page_size);
+  out[8] = flash_offsetof_rt(FlashPartialParams, k_head_stride);
+  out[9] = flash_offsetof_rt(FlashPartialParams, v_head_stride);
+  out[10] = flash_offsetof_rt(FlashPartialParams, k_token_stride);
+  out[11] = flash_offsetof_rt(FlashPartialParams, v_token_stride);
+  out[12] = flash_offsetof_rt(FlashPartialParams, scale);
+  out[13] = flash_offsetof_rt(FlashPartialParams, softcapping);
 
-  out[13] = sizeof(FlashCombineParams);
-  out[14] = flash_offsetof_rt(FlashCombineParams, n_chunks);
-  out[15] = flash_offsetof_rt(FlashCombineParams, chunk_capacity);
+  out[14] = sizeof(FlashCombineParams);
+  out[15] = flash_offsetof_rt(FlashCombineParams, n_chunks);
+  out[16] = flash_offsetof_rt(FlashCombineParams, chunk_capacity);
 }
 
 // ============================================================================

@@ -1326,6 +1326,99 @@ pub fn sdpa(
     )
 }
 
+/// How FlashDecoding sizes the scratch class it allocates (`DESIGN.md` §9.1a,
+/// issue #234).
+///
+/// # Why this enum exists beside `candle_metal_kernels::Sizing` rather than
+/// being it
+///
+/// The policy is `Sizing`, it has been compiled in three arms since #71, and it
+/// lives in `candle-metal-kernels` — a **metal-only** crate. `FlashDecoding`'s
+/// fields are compiled on every backend, so naming `Sizing` here would put a
+/// metal type in a struct CPU and CUDA builds construct, and §14.1's "must not
+/// break other backends" is a hard constraint rather than a preference. This is
+/// the same shape as the depthwise-conv PR's optional trait method: a
+/// backend-neutral declaration, converted at the metal boundary.
+///
+/// **The conversion is one exhaustive `match`** (`to_metal`, below), so an arm
+/// added to `Sizing` and not to this enum is a compile error rather than a
+/// silently unreachable policy — which is the failure mode #241 found in
+/// `config_line`'s two-armed conditional over a three-armed axis, and #58's
+/// mechanism for preventing it.
+///
+/// The default is `Grow`, and that is a **statement of what shipped rather than
+/// a choice**: #116 sized these buffers to the live `kv_len` on every call,
+/// which its own comment calls *"`Sizing::Grow` in effect … a consequence of
+/// allocating per call and stated rather than chosen"*. Defaulting to anything
+/// else here would flip a default by wiring an axis, which §7.1a forbids.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlashScratchSizing {
+    /// Size to the current `kv_len`, every step. **What #116 does today**, and
+    /// therefore the default — see the type-level note.
+    #[default]
+    Grow,
+    /// Reserve for the configured maximum context, once. The region is then a
+    /// constant size, which is the only arm whose allocation does not vary with
+    /// `kv_len`.
+    Reserve,
+    /// Reserve the smallest rung of `BUCKET_LADDER` that covers `kv_len`.
+    Bucket,
+}
+
+impl FlashScratchSizing {
+    /// Every arm, for a harness and for exhaustive tests.
+    ///
+    /// An array rather than a derive so that adding an arm without extending a
+    /// consumer is visible, which is `Sizing::ALL`'s own argument (#58,
+    /// §11.3i).
+    pub const ALL: [FlashScratchSizing; 3] = [
+        FlashScratchSizing::Grow,
+        FlashScratchSizing::Reserve,
+        FlashScratchSizing::Bucket,
+    ];
+
+    /// The arm's name, as a `RESULT` line and an error message spell it.
+    ///
+    /// Rendered from the resolved enum through an exhaustive `match`, which is
+    /// #241's rule: a conditional narrower than its axis renders a **wrong**
+    /// arm, and a wrong arm compares *equal* to real runs of another
+    /// configuration where an absent one would only have been `UNRECORDED`.
+    pub fn name(self) -> &'static str {
+        match self {
+            FlashScratchSizing::Grow => "Grow",
+            FlashScratchSizing::Reserve => "Reserve",
+            FlashScratchSizing::Bucket => "Bucket",
+        }
+    }
+
+    /// Parse an arm from a flag value.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "grow" => Ok(FlashScratchSizing::Grow),
+            "reserve" => Ok(FlashScratchSizing::Reserve),
+            "bucket" => Ok(FlashScratchSizing::Bucket),
+            other => {
+                candle::bail!("unknown scratch sizing {other:?}; expected grow, reserve or bucket")
+            }
+        }
+    }
+
+    /// The `candle-metal-kernels` policy this names.
+    ///
+    /// Exhaustive by construction, which is what makes this a translation
+    /// rather than a second copy of the policy: the arithmetic stays in
+    /// [`candle_metal_kernels::Sizing::sized_chunks`] and both consumers reach
+    /// it through here.
+    #[cfg(feature = "metal")]
+    fn to_metal(self) -> candle_metal_kernels::Sizing {
+        match self {
+            FlashScratchSizing::Grow => candle_metal_kernels::Sizing::Grow,
+            FlashScratchSizing::Reserve => candle_metal_kernels::Sizing::Reserve,
+            FlashScratchSizing::Bucket => candle_metal_kernels::Sizing::Bucket,
+        }
+    }
+}
+
 /// FlashDecoding: attention split over independent contiguous KV chunks, with
 /// an index-ordered combine (`DESIGN.md` §10.4, issue #116).
 ///
@@ -1355,6 +1448,23 @@ struct FlashDecoding {
     /// page-size effect from a tile-size one, which a sweep holding `k = 1`
     /// cannot.
     pages_per_chunk: usize,
+    /// How the scratch class is sized (`DESIGN.md` §9.1a, issue #234).
+    ///
+    /// Three arms have been compiled since #71 and none reached this
+    /// allocation, which sized to the live `kv_len` on every call — `Grow` in
+    /// effect, by consequence rather than by choice. This field is the wiring
+    /// §7.1b names as the cheapest missing prerequisite, and `Grow` is what it
+    /// defaults to, so an unconfigured caller allocates byte-for-byte what
+    /// shipped.
+    scratch_sizing: FlashScratchSizing,
+    /// Chunks [`FlashScratchSizing::Reserve`] reserves for.
+    ///
+    /// Derived by the caller from its configured max context, because the max
+    /// context is the *model's* number and the chunk size is this op's:
+    /// `ceil(max_context / (page_size * pages_per_chunk))`. Ignored by the
+    /// other two arms, and carried rather than recomputed so the op does not
+    /// need to know what a context length is.
+    reserve_chunks: usize,
 }
 
 impl candle::CustomOp3 for FlashDecoding {
@@ -1436,29 +1546,59 @@ impl candle::CustomOp3 for FlashDecoding {
             .with_label("flash_decoding_o")
             .build()?;
 
-        // The scratch class, §9.1a. Sized here rather than through
-        // `ScratchPlan` because that plan owns *the whole step's* regions and
-        // this op sees one layer — wiring the planned arena is what a
-        // `ScratchSizing` decision would need, and §9.1a records that decision
-        // as deliberately unmade because the axis that separates the policies
-        // is `kv_len` (#61's).
+        // The scratch class, §9.1a — **and it now reads the policy** (#234).
         //
-        // So this is `Sizing::Grow` in effect: sized to the current `kv_len`,
-        // every step. That is a *consequence* of allocating per call and is
-        // stated rather than chosen — see the PR body.
+        // # What the mismatch was, and what resolving it needed
+        //
+        // The comment that stood here said the class was sized *"here rather
+        // than through `ScratchPlan` because that plan owns the whole step's
+        // regions and this op sees one layer"*, and named wiring the planned
+        // arena as what a `ScratchSizing` decision would need. **The premise is
+        // right and the conclusion does not follow.** A plan carries two things
+        // — how many chunks a region reserves, and where each layer's region
+        // sits in one arena — and only the first is a *policy*. The second is
+        // placement, which an op allocating one region per call does not have
+        // and does not need. `Sizing::sized_chunks` is the first alone, so it
+        // is reachable from here; `plan_scratch` calls the same function, so
+        // the two cannot disagree about what an arm means.
+        //
+        // So this is no longer `Grow` **in effect**: it is whichever arm the
+        // caller selected, and `Grow` when nobody selects — which is what
+        // shipped, byte for byte.
+        let sizing = self.scratch_sizing.to_metal();
+        let rungs: Vec<usize> = candle_metal_kernels::BUCKET_LADDER
+            .iter()
+            .map(|&kv| flash_chunk_count(kv, chunk_size))
+            .collect();
+        let chunk_capacity = sizing
+            .sized_chunks(n_chunks, self.reserve_chunks, &rungs)
+            .map_err(candle::Error::msg)?;
+
+        // Sized for the **capacity** and written for the **live** count. Both
+        // numbers reach the kernel: `chunk_capacity` is the stride the partial
+        // pass lays the region out at, and `n_chunks` is the dispatch depth and
+        // the combine's loop bound. Merging over the reservation would fold in
+        // uninitialised memory, which §10.4 and §10.3d both name as a silent
+        // wrong answer no size check catches.
+        //
+        // `walk_order` is sized for the live count and not the capacity,
+        // deliberately: it records the chunks the combine **walked**, and the
+        // combine walks `n_chunks` of them. Sizing it larger would leave the
+        // tail unwritten and give the merge-order assertion a region it cannot
+        // interpret.
         let partials = device
             .new_buffer_builder()
-            .with_size_for(n_q_heads * n_chunks * head_dim, DType::F32)
+            .with_size_for(n_q_heads * chunk_capacity * head_dim, DType::F32)
             .with_label("flash_decoding_partials")
             .build()?;
         let sums = device
             .new_buffer_builder()
-            .with_size_for(n_q_heads * n_chunks, DType::F32)
+            .with_size_for(n_q_heads * chunk_capacity, DType::F32)
             .with_label("flash_decoding_sums")
             .build()?;
         let maxs = device
             .new_buffer_builder()
-            .with_size_for(n_q_heads * n_chunks, DType::F32)
+            .with_size_for(n_q_heads * chunk_capacity, DType::F32)
             .with_label("flash_decoding_maxs")
             .build()?;
         let walk_order = device
@@ -1486,12 +1626,18 @@ impl candle::CustomOp3 for FlashDecoding {
                 self.page_size,
                 self.pages_per_chunk,
                 n_chunks,
+                chunk_capacity,
                 self.scale,
                 self.softcapping,
-            ),
+            )
+            .map_err(candle::Error::wrap)?,
         ))?;
         let combine_params = device.new_buffer_with_data(std::slice::from_ref(
-            &candle_metal_kernels::FlashCombineParams::for_step(n_chunks, n_chunks),
+            // The pair this call has taken since #116, and the reason the
+            // partial pass needed the same one: the combine reads at the
+            // capacity stride and merges to the live count. Both sides of the
+            // region now agree about its shape.
+            &candle_metal_kernels::FlashCombineParams::for_step(n_chunks, chunk_capacity),
         ))?;
 
         let encoder = q.device().command_encoder()?;
@@ -1540,9 +1686,17 @@ impl candle::CustomOp3 for FlashDecoding {
 /// disjoint cost functions; both are parameters here so a sweep can separate
 /// them.
 ///
+/// `scratch_sizing` is `DESIGN.md` §9.1a's policy, wired to this allocation by
+/// #234 — three arms compiled since #71 and, until now, none of them reachable
+/// from a model path. `reserve_chunks` is what
+/// [`FlashScratchSizing::Reserve`] reserves for, in **chunks**: the caller
+/// converts its max context because a context length is the model's number and
+/// a chunk size is this op's. It is ignored by the other two arms.
+///
 /// Metal only, `seq == 1` only. Every other case is an error rather than a
 /// fallback: the caller decides, because a silent fallback is what makes an
 /// A/B arm measure the wrong thing (§2.4).
+#[allow(clippy::too_many_arguments)]
 pub fn flash_decoding(
     q: &Tensor,
     k: &Tensor,
@@ -1551,6 +1705,8 @@ pub fn flash_decoding(
     softcapping: f32,
     page_size: usize,
     pages_per_chunk: usize,
+    scratch_sizing: FlashScratchSizing,
+    reserve_chunks: usize,
 ) -> Result<Tensor> {
     q.apply_op3_no_bwd(
         k,
@@ -1560,6 +1716,8 @@ pub fn flash_decoding(
             softcapping,
             page_size,
             pages_per_chunk,
+            scratch_sizing,
+            reserve_chunks,
         },
     )
 }
