@@ -225,3 +225,68 @@ fn admission_is_off_by_default() {
     assert_eq!(with.memory_budget.unwrap().batch, 1, "B=1 default (§13.2)");
     assert_eq!(with.memory_budget.unwrap().weight_bytes, WEIGHTS_FULL);
 }
+
+// -------------------------------------------------------------------- #306
+// The prefill activation term reaches admission through `MemoryBudget`.
+
+/// **`max_seq_len` defaults to decode and is opt-in**, which is what keeps
+/// every recorded verdict where it was (§7.1a).
+///
+/// A budget that defaulted to `max_position_embeddings` would refuse
+/// essentially every configuration — §8.1g's failure, and the reason the
+/// admitted arm is the load-bearing half of every bound in this file.
+#[test]
+fn the_prefill_length_is_opt_in_and_defaults_to_decode() {
+    let b = MemoryBudget::new(WEIGHTS_FULL);
+    assert_eq!(b.max_seq_len, 1, "decode by default (#306)");
+    assert_eq!(
+        b.with_prefill(2048).max_seq_len,
+        2048,
+        "a prefilling caller says so"
+    );
+    // And a chunked caller passes its CHUNK size, not its prompt length --
+    // which is the whole mechanism by which chunking makes a long prompt
+    // admissible (§13.2b).
+    assert_eq!(b.with_prefill(512).max_seq_len, 512);
+}
+
+/// **The term reaches the `admission::Budget`, and it changes the verdict.**
+///
+/// The engagement check §2.4 requires: proved from a quantity the flag should
+/// have changed — here the predicted footprint — rather than from the field
+/// being set. #9.5l's finding 5 is why: admission compiled to its non-Metal
+/// stub in every harness and *"no amount of arithmetic testing could have seen
+/// it"*.
+#[cfg(feature = "metal")]
+#[test]
+fn the_prefill_length_moves_the_predicted_footprint() {
+    use candle::metal_backend::admission::Budget;
+
+    let decode = Budget::new(WEIGHTS_FULL, 4096, 4096);
+    let prefill = decode.with_prefill(2048);
+
+    let d = decode.footprint();
+    let p = prefill.footprint();
+
+    // Only the activation class moves. Every other class is a property of the
+    // session state and is unchanged by a forward pass's length (§4.1's `seq`
+    // against `kv_len`) -- asserted, because a change that moved KV here would
+    // mean the two axes had been conflated.
+    assert_eq!(d.weights, p.weights);
+    assert_eq!(d.kv, p.kv, "KV is `kv_len`'s, not `seq`'s (§4.1)");
+    assert_eq!(d.conv, p.conv);
+    assert_eq!(d.scratch, p.scratch);
+    assert!(
+        p.activations > d.activations * 100_000,
+        "at P=2048 the activation class is five orders of magnitude above its \
+         decode figure: {} B against {} B",
+        p.activations,
+        d.activations
+    );
+    // 18.66 GB, reconciled against §13.4c in `admission.rs`'s own tests.
+    assert!(
+        (p.activations as f64 / GB - 18.66).abs() < 0.1,
+        "predicted {:.2} GB",
+        p.activations as f64 / GB
+    );
+}
