@@ -983,6 +983,68 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     batch_check: bool,
 
+    /// Speculative window width `K` — `DESIGN.md` §10.2a's `advance`/`resolve`.
+    ///
+    /// **This is #284: the port of `lfm2-determinism`'s verify loop (#89) onto
+    /// the harness that has GPU-busy timing, `--batch` and the run store.** The
+    /// direction is §14.5 step 1's, and the reason is that
+    /// **GPU-busy per accepted token has never been produced for any
+    /// speculative run**: #89's cost curve (K=2 at 1.245x, K=8 at 0.587x) is
+    /// wall-clock `elapsed_ms` from `lfm2-determinism`, a harness whose own
+    /// documentation says that field *"is not comparable between arms"*. So the
+    /// most-cited speculative figures in this project rest on a quantity their
+    /// own harness disclaims, and this flag is what makes the honest one
+    /// takeable.
+    ///
+    /// # The denominator, which is why this is not just a flag
+    ///
+    /// §10.2i states the obstacle exactly: the profiler's loop *"emits one token
+    /// per step and times it, where a verify pass consumes K and emits between 1
+    /// and K, so `wall_ms_per_token` needs a denominator that does not exist
+    /// there."* It exists now — `spec_accepted` — and the per-token fields are
+    /// computed over **accepted tokens** rather than over steps whenever a
+    /// window ran. `wall_ms_per_token` keeps its name and its meaning at `K = 0`
+    /// (where a step *is* a token), so every recorded row stays comparable.
+    ///
+    /// `0` is the default and disables the mechanism entirely — no `advance`,
+    /// no `forward_all`, the ordinary decode loop — so an unflagged run is the
+    /// path every recorded figure belongs to.
+    ///
+    /// Requires `--conv-state rotating:<K'>` with `K' >= K` and
+    /// `--kv-append in-place`; `Cache::advance` refuses everything else before
+    /// any state is written (§10.2h).
+    #[arg(long, default_value_t = 0)]
+    speculate: usize,
+
+    /// Which proposer drives `--speculate`: `oracle` or `wrong:<N>`.
+    ///
+    /// Both are sequences rather than models, and that is the point (#89):
+    /// **greedy speculation is output-identical by construction**, so the
+    /// mechanism can be measured without a draft model at all. The proposer
+    /// decides only *how many* proposals are accepted, never *what* is emitted.
+    ///
+    /// * `oracle` proposes the token the target would have emitted, so every
+    ///   position is accepted and the window is the best case.
+    /// * `wrong:<N>` corrupts every `N`-th proposal, so a rejection happens on a
+    ///   schedule and the rollback is exercised on most windows. This is the
+    ///   **engagement proof** §2.4 requires: an arm that cannot be shown to have
+    ///   rejected anything has not exercised `resolve`, and #89 held the output
+    ///   invariant under 40 and 80 rejections with the stream unmoved.
+    #[arg(long, default_value = "oracle")]
+    spec_proposer: String,
+
+    /// Assert every row accepts the same prefix length at `--batch N`.
+    ///
+    /// **The per-row accept test, and the gate that catches a leak** (#284,
+    /// #252). See the acceptance loop for why uniformity is a *theorem* here
+    /// rather than an assumption, and therefore why a violation is a defect
+    /// rather than a tuning artifact.
+    ///
+    /// On by default, for `--batch-check`'s reason: a gate that has to be
+    /// remembered is a gate that is not run (§11.3j).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    spec_accept_check: bool,
+
     /// Install `DESIGN.md` §9.5's admission check at the given fraction of
     /// `recommendedMaxWorkingSetSize`.
     ///
