@@ -50,6 +50,9 @@ fn config(max_position_embeddings: usize) -> Config {
         // module doc.
         flash_page_size: 256,
         flash_pages_per_chunk: 1,
+        // `Grow`, which is what #116's per-call allocation did before
+        // the axis reached it (#234). Not a choice — see the field.
+        flash_scratch_sizing: Default::default(),
         kv_append: Default::default(),
         conv_state: Default::default(),
         memory_budget: None,

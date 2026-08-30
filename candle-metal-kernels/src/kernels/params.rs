@@ -868,7 +868,7 @@ pub fn expected_sdpa_layout() -> Vec<(&'static str, u32)> {
 
 /// `flash_decoding_partial`'s scalars (`DESIGN.md` §10.4, issue #116).
 ///
-/// # Two fields carry decisions rather than values
+/// # Three fields carry decisions rather than values
 ///
 /// **`k_token_stride`/`v_token_stride` are the parameter #200 could not vary.**
 /// `sdpa_vector` steps keys with `constexpr int stride = BN * D` — compile
@@ -885,19 +885,42 @@ pub fn expected_sdpa_layout() -> Vec<(&'static str, u32)> {
 /// 1, carried as a field so a sweep can separate a page-size effect from a
 /// tile-size one — which a sweep holding `k = 1` cannot.
 ///
-/// Field order mirrors the Metal struct exactly: six `int` then four `size_t`
-/// then two `float`, so the `size_t`s land 8-aligned with no interior padding.
-/// `flash_params_layout` ships the real offsets across the boundary rather than
-/// either side asserting its own (§11.3d).
+/// **`chunk_capacity` is the third, and it is the field `ScratchSizing`
+/// selects** (#234). `n_chunks` is the live count — the dispatch depth and the
+/// combine's loop bound — and `chunk_capacity` is what the region was *sized*
+/// for, which is the stride between two heads' partials.
+/// [`FlashCombineParams`] has carried exactly this separation since #116; the
+/// pass that **lays the region out** did not, so every caller passed the live
+/// count for both and no reserving policy was expressible however many were
+/// compiled. They are equal under `Sizing::Grow`, which is the arm that
+/// shipped, and that is why one field served both for as long as nothing could
+/// select another.
+///
+/// Field order mirrors the Metal struct exactly: **eight** `int` then four
+/// `size_t` then two `float`, so the `size_t`s land 8-aligned with no interior
+/// padding. The count was six before #234, and `_pad` is what keeps it even —
+/// adding `chunk_capacity` alone would have made it seven and inserted four
+/// bytes of padding the layout check would then have had to explain rather than
+/// state. `flash_params_layout` ships the real offsets across the boundary
+/// rather than either side asserting its own (§11.3d).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlashPartialParams {
     pub gqa_factor: i32,
     pub n_keys: i32,
     pub chunk_size: i32,
+    /// Chunks this step computes: the **dispatch depth**, and the count the
+    /// combine merges over.
     pub n_chunks: i32,
+    /// Chunks the region is **sized** for: the partial write stride. Exceeds
+    /// `n_chunks` under `Sizing::Reserve` and `Sizing::Bucket`.
+    pub chunk_capacity: i32,
     pub pages_per_chunk: i32,
     pub page_size: i32,
+    /// Keeps the `int` block even so the `size_t`s stay naturally aligned.
+    /// Written as 0 and read by nothing; the layout kernel asserts the offsets
+    /// either way, so this states an intent rather than carrying a value.
+    pub _pad: i32,
     pub k_head_stride: u64,
     pub v_head_stride: u64,
     pub k_token_stride: u64,
@@ -954,6 +977,10 @@ pub fn expected_flash_layout() -> Vec<(&'static str, u32)> {
         (
             "FlashPartialParams.n_chunks",
             offset_of!(FlashPartialParams, n_chunks) as u32,
+        ),
+        (
+            "FlashPartialParams.chunk_capacity",
+            offset_of!(FlashPartialParams, chunk_capacity) as u32,
         ),
         (
             "FlashPartialParams.pages_per_chunk",

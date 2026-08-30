@@ -45,6 +45,9 @@ fn tiny_config(conv_state: ConvState) -> Config {
         // file was written, which is why it stopped compiling.
         flash_page_size: 256,
         flash_pages_per_chunk: 1,
+        // `Grow`, which is what #116's per-call allocation did before
+        // the axis reached it (#234). Not a choice — see the field.
+        flash_scratch_sizing: Default::default(),
         kv_append: KvAppend::InPlace,
         conv_state,
         memory_budget: None,

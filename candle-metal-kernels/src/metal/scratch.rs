@@ -175,6 +175,74 @@ impl Sizing {
     pub fn rebinds_on_growth(self) -> bool {
         matches!(self, Sizing::Grow)
     }
+
+    /// Chunks a region reserves under this policy, given what the step needs.
+    ///
+    /// # Why this is a function and not four lines inside `plan_scratch`
+    ///
+    /// It **was** four lines inside [`plan_scratch`] until #234, and that is a
+    /// large part of why the axis had three compiled arms and no consumer.
+    /// `plan_scratch` owns *the whole step's* regions and lays them out at
+    /// offsets; a caller that allocates one region per call needs none of that
+    /// and needs exactly this one number. §9.1a records the wiring as deferred
+    /// and §7.1b as the cheapest missing prerequisite, and the mismatch both
+    /// name is between a **plan** and an **op** — the part of the plan an op
+    /// actually needs is the sizing arithmetic alone.
+    ///
+    /// So this is the seam. [`plan_scratch`] calls it and so does
+    /// FlashDecoding's allocation, which is what stops the two disagreeing
+    /// about what a policy means — §8.1b's hand-sync argument, applied to a
+    /// policy rather than to a kernel name.
+    ///
+    /// `live_chunks` is `ceil(kv_len / chunk_size)`. `max_chunks` bounds
+    /// [`Reserve`](Sizing::Reserve) and is ignored by the others;
+    /// `bucket_rungs` is [`BUCKET_LADDER`] converted to chunks by the caller,
+    /// because a rung is a `kv_len` and a chunk count depends on the chunk size
+    /// the caller chose.
+    ///
+    /// # Errors
+    ///
+    /// [`Reserve`](Sizing::Reserve) refuses a `live_chunks` past `max_chunks`
+    /// and [`Bucket`](Sizing::Bucket) refuses one past its last rung, rather
+    /// than rounding down. A region sized for fewer chunks than the step writes
+    /// is an overrun, and §3.5 says nothing catches it.
+    pub fn sized_chunks(
+        self,
+        live_chunks: usize,
+        max_chunks: usize,
+        bucket_rungs: &[usize],
+    ) -> Result<usize, String> {
+        match self {
+            Sizing::Reserve => {
+                if live_chunks > max_chunks {
+                    // Phrased in chunks *and* named for what bounds it. The
+                    // caller here holds only chunk counts — that is the whole
+                    // reason this function takes them — but the number it
+                    // converted is a **max context**, and an error a reader
+                    // cannot trace back to the knob that set it is an error
+                    // that costs a debugging session.
+                    return Err(format!(
+                        "live chunks {live_chunks} exceed the {max_chunks} the configured \
+                         max context reserves"
+                    ));
+                }
+                Ok(max_chunks)
+            }
+            Sizing::Grow => Ok(live_chunks),
+            Sizing::Bucket => bucket_rungs
+                .iter()
+                .copied()
+                .find(|&rung| live_chunks <= rung)
+                .ok_or_else(|| {
+                    format!(
+                        "live chunks {live_chunks} exceed the largest bucket {:?}; refused \
+                         rather than rounded down, which would size a region for fewer chunks \
+                         than the step writes",
+                        bucket_rungs.last()
+                    )
+                }),
+        }
+    }
 }
 
 /// The geometry one attention layer's partials occupy.
@@ -590,37 +658,15 @@ pub fn plan_scratch(
 ) -> Result<ScratchPlan, String> {
     let live_chunks = geometry.chunks(kv_len);
 
-    let sized_chunks = match sizing {
-        // One reservation for the configured maximum, so the offsets never move
-        // and the buffer identity is fixed for the process (§9.2c's criterion).
-        Sizing::Reserve => {
-            if kv_len > max_context {
-                return Err(format!(
-                    "kv_len {kv_len} exceeds the configured max context {max_context}"
-                ));
-            }
-            geometry.chunks(max_context)
-        }
-        // Exactly what this step needs. Minimal footprint, and the policy whose
-        // realloc changes buffer identity -- see `Sizing::rebinds_on_growth`.
-        Sizing::Grow => live_chunks,
-        // The smallest rung that covers `kv_len`.
-        Sizing::Bucket => {
-            let rung = BUCKET_LADDER
-                .iter()
-                .copied()
-                .find(|&b| kv_len <= b)
-                .ok_or_else(|| {
-                    format!(
-                        "kv_len {kv_len} exceeds the largest bucket {}; refused rather than \
-                     rounded down, which would size a region for fewer chunks than the \
-                     step writes",
-                        BUCKET_LADDER[BUCKET_LADDER.len() - 1]
-                    )
-                })?;
-            geometry.chunks(rung)
-        }
-    };
+    // Routed through [`Sizing::sized_chunks`] rather than inlined here as of
+    // #234. It was inlined, and a second consumer -- FlashDecoding's per-call
+    // allocation -- could then only have re-implemented it, which is the
+    // hand-sync §8.1b exists to remove. The refusals move with it: `Reserve`
+    // compared `kv_len > max_context` and now compares the chunk counts those
+    // map to, which is the same verdict because `chunks()` is monotone, and it
+    // is the comparison a caller holding only chunk counts can make.
+    let rungs: Vec<usize> = BUCKET_LADDER.iter().map(|&b| geometry.chunks(b)).collect();
+    let sized_chunks = sizing.sized_chunks(live_chunks, geometry.chunks(max_context), &rungs)?;
 
     let size = region_bytes(geometry, sized_chunks, layout);
     let mut regions = Vec::with_capacity(layers);

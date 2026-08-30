@@ -5290,7 +5290,16 @@ fn every_family_params_layout_matches_metal() {
         // a `sizeof` and twelve fields) and `FlashCombineParams` (3), and one
         // layout kernel reports both because a layout kernel can only see the
         // structs its own file defines.
-        ("flash_decoding.metal", 16),
+        //
+        // **17 as of #234**, which gave `FlashPartialParams` the
+        // `chunk_capacity` its sibling has carried since #116 — the field
+        // `ScratchSizing` selects, and the half that was missing on the pass
+        // that lays the region out. 14 slots there and 3 here, and the guard
+        // fired on the addition, which is what it is for. **`_pad` is
+        // deliberately not a slot**: it carries no value, and asserting the
+        // offset of a field the GPU never reads is the shape #103's finding 3
+        // and #219 both name — half an assertion over a dead field.
+        ("flash_decoding.metal", 17),
     ];
 
     let mut failures = Vec::new();

@@ -152,7 +152,12 @@ fn fill(n: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-/// One end-to-end run, returning the kernel's output.
+/// One end-to-end run at `Sizing::Grow` — the region sized for exactly the
+/// chunks the step computes.
+///
+/// **What every arm did before #234**, and now said rather than implied: the
+/// live count and the capacity are the same number here because that is what
+/// `Grow` means, not because a caller had no second one to pass.
 #[allow(clippy::too_many_arguments)]
 fn run_flash(
     device: &Device,
@@ -170,20 +175,80 @@ fn run_flash(
     scale: f32,
     table: &ChunkTable,
 ) -> Vec<f32> {
+    let n_chunks = flash_chunk_count(n_keys, page_size * pages_per_chunk);
+    run_flash_sized(
+        device,
+        kernels,
+        queries,
+        keys,
+        values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        pages_per_chunk,
+        scale,
+        table,
+        n_chunks,
+    )
+}
+
+/// One end-to-end run, returning the kernel's output.
+///
+/// `chunk_capacity` is what the scratch region is **sized** for and `n_chunks`
+/// is what this step computes — the pair `ScratchSizing` decides (#234). They
+/// are equal under `Grow` and differ under `Reserve` and `Bucket`, and the
+/// difference is what `flash_reserving_capacity_agrees_with_grow` exercises:
+/// without a capacity above the live count, every fixture runs at a stride the
+/// two readings of that field agree on, and a stride bug is invisible.
+#[allow(clippy::too_many_arguments)]
+fn run_flash_sized(
+    device: &Device,
+    kernels: &Kernels,
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    capacity: usize,
+    n_keys: usize,
+    page_size: usize,
+    pages_per_chunk: usize,
+    scale: f32,
+    table: &ChunkTable,
+    chunk_capacity: usize,
+) -> Vec<f32> {
     let cmds = commands(device);
     let chunk_size = page_size * pages_per_chunk;
     let n_chunks = flash_chunk_count(n_keys, chunk_size);
+    assert!(
+        chunk_capacity >= n_chunks,
+        "a region sized for {chunk_capacity} chunks cannot hold the {n_chunks} this step \
+         computes; the partial pass would write past it"
+    );
 
     let q_buf = new_f32(device, queries);
     let k_buf = new_f32(device, keys);
     let v_buf = new_f32(device, values);
     let out = device.new_buffer(n_q_heads * head_dim * 4, SHARED).unwrap();
+    // Sized for the CAPACITY, exactly as `FlashDecoding::metal_fwd` sizes it,
+    // so a reserving arm here allocates the region the kernel then strides by.
     let partials = device
-        .new_buffer(n_q_heads * n_chunks * head_dim * 4, SHARED)
+        .new_buffer(n_q_heads * chunk_capacity * head_dim * 4, SHARED)
         .unwrap();
-    let sums = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
-    let maxs = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
+    let sums = device
+        .new_buffer(n_q_heads * chunk_capacity * 4, SHARED)
+        .unwrap();
+    let maxs = device
+        .new_buffer(n_q_heads * chunk_capacity * 4, SHARED)
+        .unwrap();
     let table_buf = new_u32(device, &table.entries(n_chunks, pages_per_chunk));
+    // The LIVE count and not the capacity: the combine walks `n_chunks` and
+    // writes one entry per walked chunk, so a larger buffer would leave a tail
+    // the merge-order assertion cannot interpret.
     let walk = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
 
     let q_shape = [1usize, n_q_heads, 1, head_dim];
@@ -208,11 +273,16 @@ fn run_flash(
             page_size,
             pages_per_chunk,
             n_chunks,
+            chunk_capacity,
             scale,
             1.0,
-        ),
+        )
+        .unwrap(),
     );
-    let cp = write_struct(device, FlashCombineParams::for_step(n_chunks, n_chunks));
+    let cp = write_struct(
+        device,
+        FlashCombineParams::for_step(n_chunks, chunk_capacity),
+    );
 
     {
         let guard = cmds.command_encoder().unwrap();
@@ -411,6 +481,99 @@ fn flash_is_invariant_to_the_chunk_count() {
             worst < 2e-5,
             "splitting into {} chunks moved the answer by {worst:e}",
             flash_chunk_count(n_keys, page_size)
+        );
+    }
+}
+
+/// **A region sized for more chunks than the step computes gives the same
+/// bits.**
+///
+/// This is the arm `ScratchSizing`'s reserving policies produce (#234), and
+/// **the only fixture in this file where `chunk_capacity != n_chunks`.** Every
+/// other one runs at `Grow`, where the two readings of that field coincide —
+/// so a partial pass striding by the live count instead of the capacity is
+/// invisible to all of them. That is #116's own `k_token_stride` finding in a
+/// second field: *a parameter nothing exercises is a parameter that can be
+/// silently ignored*, and then the policies the axis exists to compare are not
+/// buildable after all.
+///
+/// **Bit-identical and not merely close**, which is the required result rather
+/// than a pleasant one: sizing decides *where bytes live* and not *what they
+/// are* (§2.3.5a), so a moved answer here is a defect. The chunks between the
+/// live count and the capacity are never dispatched, so they are never
+/// written; the combine's loop bound is the live count, so it never reads
+/// them. Both halves have to hold — writing at the wrong stride scatters the
+/// partials, and merging to the capacity folds in uninitialised memory, which
+/// §10.4 and §10.3d both record as a silent wrong answer no size check
+/// catches.
+#[test]
+fn flash_reserving_capacity_is_bit_identical_to_grow() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    // More than one head: the capacity is the stride BETWEEN heads, so at
+    // `n_q_heads == 1` there is no second head to land in the wrong place and
+    // the fixture would be blind to exactly the defect it is written for.
+    let n_q_heads = 4;
+    let n_kv_heads = 1;
+    let capacity = 512;
+    let n_keys = 200;
+    let page_size = 32;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let queries = fill(n_q_heads * head_dim, 41);
+    let keys = fill(n_kv_heads * capacity * head_dim, 42);
+    let values = fill(n_kv_heads * capacity * head_dim, 43);
+
+    let live = flash_chunk_count(n_keys, page_size);
+    assert_eq!(live, 7, "the fixture's live chunk count");
+
+    let grow = run_flash(
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        1,
+        scale,
+        &ChunkTable::Contiguous,
+    );
+
+    // 16 is `Reserve`'s shape at this fixture's own capacity —
+    // `ceil(512 / 32)` — and 9 is a rung that is neither the live count nor the
+    // maximum, so the test does not accidentally depend on the reservation
+    // being the largest number in sight.
+    for &chunk_capacity in &[9usize, 16] {
+        assert!(chunk_capacity > live, "the reserving arm must reserve more");
+        let reserved = run_flash_sized(
+            &device,
+            &kernels,
+            &queries,
+            &keys,
+            &values,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            capacity,
+            n_keys,
+            page_size,
+            1,
+            scale,
+            &ChunkTable::Contiguous,
+            chunk_capacity,
+        );
+        assert_eq!(
+            grow, reserved,
+            "a region sized for {chunk_capacity} chunks against the {live} this step computes \
+             moved the answer. Sizing decides where bytes live, not what they are, so this is \
+             a defect and not a variant (DESIGN.md 2.3.5a, 9.1a)"
         );
     }
 }
@@ -629,9 +792,12 @@ fn run_partials(
 
     let pp = write_struct(
         device,
+        // `n_chunks` twice: the live count and the capacity, which is
+        // `Sizing::Grow` and is what this fixture takes (#234).
         FlashPartialParams::for_step(
-            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, scale, 1.0,
-        ),
+            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, scale, 1.0,
+        )
+        .unwrap(),
     );
     let cp = write_struct(device, FlashCombineParams::for_step(n_chunks, n_chunks));
 
@@ -818,9 +984,12 @@ fn token_stride_is_read_from_the_parameter() {
 
     let pp = write_struct(
         &device,
+        // `n_chunks` twice: the live count and the capacity, which is
+        // `Sizing::Grow` and is what this fixture takes (#234).
         FlashPartialParams::for_step(
-            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, scale, 1.0,
-        ),
+            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, scale, 1.0,
+        )
+        .unwrap(),
     );
     let cp = write_struct(&device, FlashCombineParams::for_step(n_chunks, n_chunks));
 
@@ -974,9 +1143,12 @@ fn walk_order_of(
 
     let pp = write_struct(
         device,
+        // `n_chunks` twice: the live count and the capacity, which is
+        // `Sizing::Grow` and is what this fixture takes (#234).
         FlashPartialParams::for_step(
-            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, scale, 1.0,
-        ),
+            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, scale, 1.0,
+        )
+        .unwrap(),
     );
     let cp = write_struct(device, FlashCombineParams::for_step(n_chunks, n_chunks));
 

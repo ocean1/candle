@@ -422,6 +422,88 @@ fn only_grow_rebinds_on_growth() {
     assert!(!Sizing::Bucket.rebinds_on_growth());
 }
 
+/// **`sized_chunks` is the policy, and it is reachable without a plan** (#234).
+///
+/// The arithmetic was four lines inside `plan_scratch` until #234, which is why
+/// the axis had three compiled arms and no consumer: a caller allocating **one
+/// region per call** — FlashDecoding's, §9.1a's first real consumer — needs the
+/// chunk count and none of the offsets a plan carries. Splitting the two is
+/// what makes the policy reachable from an op; `plan_scratch` routes through
+/// the same function, so the two cannot disagree about what an arm means.
+///
+/// Asserted per arm rather than by a total, so a policy that stopped
+/// discriminating is named rather than absorbed.
+#[test]
+fn sized_chunks_is_the_policy_each_arm_names() {
+    // Rungs in CHUNKS, which is what a caller holding a chunk size converts
+    // `BUCKET_LADDER` to. 8k/32k/128k at page size 256.
+    let rungs = [32usize, 128, 512];
+
+    // `Grow` is exactly the step, at every input: the arm with no reservation
+    // and therefore the one whose region moves.
+    for live in [0usize, 1, 7, 11, 512] {
+        assert_eq!(Sizing::Grow.sized_chunks(live, 512, &rungs), Ok(live));
+    }
+
+    // `Reserve` is the maximum whatever the step needs, which is the property
+    // it trades bytes for: the region is one size for the process.
+    for live in [0usize, 1, 11, 512] {
+        assert_eq!(Sizing::Reserve.sized_chunks(live, 512, &rungs), Ok(512));
+    }
+
+    // `Bucket` is the smallest rung that covers the step. The boundary cases
+    // are the ones a ladder gets wrong: exactly a rung takes that rung, one
+    // past it takes the next.
+    assert_eq!(Sizing::Bucket.sized_chunks(1, 512, &rungs), Ok(32));
+    assert_eq!(Sizing::Bucket.sized_chunks(32, 512, &rungs), Ok(32));
+    assert_eq!(Sizing::Bucket.sized_chunks(33, 512, &rungs), Ok(128));
+    assert_eq!(Sizing::Bucket.sized_chunks(512, 512, &rungs), Ok(512));
+
+    // No arm may reserve LESS than the step computes, at any input. That is the
+    // invariant the partial pass rests on: a region sized for fewer chunks than
+    // are dispatched is an overrun, and §3.5 says nothing reports it.
+    for arm in Sizing::ALL {
+        for live in [0usize, 1, 7, 32, 33, 128, 512] {
+            if let Ok(sized) = arm.sized_chunks(live, 512, &rungs) {
+                assert!(
+                    sized >= live,
+                    "{arm:?} sized {sized} for a step computing {live}"
+                );
+            }
+        }
+    }
+}
+
+/// **Both reserving arms refuse rather than rounding down** (#234).
+///
+/// A region sized for fewer chunks than the step writes is an overrun, which
+/// §3.5 makes silent corruption rather than an error — so the failure is a
+/// returned `Err` at a known site. `Grow` has nothing to refuse, and asserting
+/// that is what makes this a discrimination rather than a check that everything
+/// fails (§8.1g's own lesson: a suite testing only the refusal passes under a
+/// mutation that refuses everything).
+#[test]
+fn a_step_past_the_reservation_is_refused_and_grow_has_nothing_to_refuse() {
+    let rungs = [32usize, 128, 512];
+
+    assert!(
+        Sizing::Reserve.sized_chunks(513, 512, &rungs).is_err(),
+        "Reserve must refuse a step past its configured maximum"
+    );
+    assert!(
+        Sizing::Bucket.sized_chunks(513, 512, &rungs).is_err(),
+        "Bucket must refuse a step past its last rung"
+    );
+
+    // The other bound, and it is the load-bearing half: an arm that refused
+    // everything would pass the two assertions above.
+    assert!(Sizing::Reserve.sized_chunks(512, 512, &rungs).is_ok());
+    assert!(Sizing::Bucket.sized_chunks(512, 512, &rungs).is_ok());
+    // `Grow` reserves what the step needs, so no input is past its reservation
+    // — including one that both others refuse.
+    assert_eq!(Sizing::Grow.sized_chunks(513, 512, &rungs), Ok(513));
+}
+
 /// Under `Reserve` the offsets do not move as `kv_len` grows. That is the
 /// property it trades bytes for.
 #[test]
