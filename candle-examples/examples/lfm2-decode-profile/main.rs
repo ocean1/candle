@@ -2203,6 +2203,41 @@ fn main() -> Result<()> {
         println!();
     }
 
+    // The same census for the PREFILL pass (lloom issue #250).
+    //
+    // **The snapshot already carried this and nothing printed it** -- §6.7 L2's
+    // "unused state is a missing optimization wearing a disguise", in a
+    // reporting field. `profile::snapshot()` fills `by_label` unconditionally
+    // (`metal/profile.rs:174`) and the prefill snapshot is taken right after
+    // the prefill pass; only its scalar counts ever reached stdout.
+    //
+    // **Here the census is not a convenience, it is the only engagement proof
+    // available** (§2.4). #248 found the `AttnImpl` dispatch-count proof
+    // EXPIRES above `kv_len` 1023 because two arms coincide at 547. At
+    // `seq_len > 1` it is worse than a coincidence: `sdpa_applies` and
+    // `flash_decoding_applies` BOTH require `seq_len == 1` (`lfm2.rs:1339`,
+    // `:1355`), so every `--attn` arm takes the generic path and the counts are
+    // identical BY CONSTRUCTION. A dispatch count cannot discriminate the arms
+    // here at all, and reading one as engagement would be exactly the vacuous
+    // instrument §2.4 warns about. The kernel NAMES can discriminate: they say
+    // which matmul kernel ran (GEMV against a tiled GEMM, and which tile) and
+    // which attention path did.
+    if profiling {
+        if let Some(p) = &prefill_profile {
+            if !p.by_label.is_empty() {
+                let total: u64 = p.by_label.iter().map(|(_, c)| c).sum();
+                println!(
+                    "=== kernels in the prefill pass ({} tokens, {total} dispatches) ===",
+                    prompt_ids.len()
+                );
+                for (name, count) in &p.by_label {
+                    println!("{count:6}  {name}");
+                }
+                println!();
+            }
+        }
+    }
+
     // The configuration is part of the RESULT line, not a separate note.
     // #99's diagnosis was that the harness emits a near-complete cache key
     // missing the commit and the variant axes; both are here, so a row can name
