@@ -198,6 +198,23 @@ struct Args {
     #[arg(long, default_value = "oracle")]
     spec_proposer: String,
 
+    /// Print the kernel census for the Nth verify window and nothing else
+    /// (issue #258). Needs `CANDLE_METAL_PROFILE=1`.
+    ///
+    /// **A census, not a timing.** The question is whether a `seq_len > 1`
+    /// verify pass dispatches `gemm_nt_*` where a `seq_len == 1` decode step
+    /// dispatches `gemv_*` — the step function #255 isolated on the B axis at
+    /// fixed B=1, asked of the K axis. Every figure it produces is an exact
+    /// count, so it is load-independent (`DESIGN.md` §6.6a) and needs no quiet
+    /// machine.
+    ///
+    /// Window 0 is deliberately available but window 1 is the one to take: the
+    /// first window follows the prefill, whose pipelines are still being
+    /// created, and a first-touch cost has no place in a count anyone reads as
+    /// steady state (§2.4).
+    #[arg(long)]
+    spec_census_at: Option<usize>,
+
     /// Label printed with the result, to tag a run inside a batch.
     #[arg(long, default_value = "")]
     label: String,
@@ -1060,10 +1077,41 @@ fn main() -> Result<()> {
 
                 let tok = cache.advance(width)?;
                 let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
+
+                // **The kernel census for ONE verify pass (issue #258).** Reset
+                // immediately before and snapshot immediately after, with a
+                // device synchronize on each side so no other window's
+                // dispatches land in the interval -- `profile::reset`'s own doc
+                // comment requires the sync, because an in-flight command
+                // buffer's completion handler fires later and would otherwise
+                // be attributed here.
+                //
+                // The question is whether a `seq_len > 1` verify pass dispatches
+                // `gemm_nt_*` where a `seq_len == 1` decode dispatches `gemv_*`
+                // -- the GEMV->GEMM switch #255 isolated at fixed B=1, reached
+                // from the K axis instead. It is a COUNT, exact and
+                // load-independent (§6.6a), so it needs no quiet machine.
+                let census = args.spec_census_at == Some(spec_windows);
+                if census {
+                    device.synchronize()?;
+                    candle_metal_kernels::metal::profile::reset();
+                }
                 let all = model
                     .forward_all(&input, kv_len, &mut cache)
                     .context("speculative verify pass")?
                     .squeeze(0)?;
+                if census {
+                    device.synchronize()?;
+                    let snap = candle_metal_kernels::metal::profile::snapshot();
+                    let total: u64 = snap.by_label.iter().map(|(_, c)| c).sum();
+                    println!(
+                        "=== kernels in ONE k={width} verify pass ({total} dispatches) ==="
+                    );
+                    for (name, count) in &snap.by_label {
+                        println!("{count:6}  {name}");
+                    }
+                    println!();
+                }
                 kv_len += width;
 
                 // Find the accepted prefix first, *then* emit it.
