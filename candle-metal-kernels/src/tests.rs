@@ -6669,8 +6669,24 @@ fn reference_rmsnorm_gemv(
 fn gemv_fused_rmsnorm_matches_a_reference() {
     let eps = 1e-5f32;
     // K is LFM2's hidden size; the two N values select the two decode tiles.
-    for &(n_out, label) in &[(512usize, "bm4 (k/v_proj)"), (6144usize, "bm8 (in_proj)")] {
-        let k = 2048usize;
+    //
+    // **K = 2050 is in the list and it is not decoration.** The GEMV walks the
+    // input vector in `blockN = BN*SN*TN = 128` chunks and handles the
+    // remainder in a separate `leftover` path, so at LFM2's own K = 2048 the
+    // tail NEVER EXECUTES -- 2048 = 16 x 128 exactly. Measured: a mutation
+    // deleting the prologue from the leftover path entirely passes every test
+    // when the fixtures are all 2048-shaped.
+    //
+    // That is §9.2c's finding in this kernel's own geometry -- "a parity test
+    // built only from the model's own shapes is blind to a whole defect
+    // class" -- and #70's `align_up` case, and §10.4a's `k_token_stride` case.
+    // The fixture must be UNALIGNED AT THE LEVEL WHERE THE BRANCH IS TAKEN.
+    for &(k, n_out, label) in &[
+        (2048usize, 512usize, "bm4 (k/v_proj), K divides blockN"),
+        (2048usize, 6144usize, "bm8 (in_proj), K divides blockN"),
+        (2050usize, 512usize, "bm4, K leaves a 2-element tail"),
+        (2050usize, 6144usize, "bm8, K leaves a 2-element tail"),
+    ] {
         let (b, m, n) = (1usize, n_out, 1usize);
 
         let mat: Vec<f32> = (0..n_out * k)
