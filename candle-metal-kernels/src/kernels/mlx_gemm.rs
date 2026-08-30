@@ -703,7 +703,46 @@ pub fn call_mlx_gemm(
         .bt())?;
     };
 
-    if m == 1 || n == 1 {
+    // ---- issue #290 step 2: the align_M discriminator ----------------------
+    //
+    // MEASUREMENT PROBE ONLY. Both gates below are off unless their environment
+    // variable is set, so an unconfigured process is byte-for-byte what shipped
+    // (DESIGN.md 7.1a's discipline for a non-default arm).
+    //
+    // #255 (13.5a) measured the GEMV->GEMM switch at 4.549x the GEMV's time at
+    // 0.996x its bytes, B held at 1, and named three candidates it could not
+    // separate. #290 step 1 eliminated candidate 2 (threadgroup staging) on
+    // size: the tile stages 3072 B of a 32768 B budget -- 9.4 % -- in a region
+    // where #266 mutation-tested 24576 B and 32768 B as costing nothing.
+    //
+    // This isolates candidate 3. `align_M` is a function constant already
+    // (mlx_gemm.metal:1005, set at :746 from `m % bm == 0`), gating four paths
+    // at :1187, :1232, :1272 and :1335. At B=1 with bm=32, `m % bm == 0` is
+    // FALSE always, so decode never takes the :1232 aligned-loop fast branch
+    // and every tile load goes through `load_safe` -- a per-element predicated
+    // scalar path (`tmp_idx[]`/`tmp_val[]`, :144-175) -- where `load_unsafe` is
+    // one vector copy (:135-141). That is 3.4's scalar-against-half4 gap inside
+    // the loader.
+    //
+    // `LLOOM_290_FORCE_GEMM=1`  routes m == 1 to the GEMM, as #253's own
+    //                           LLOOM_253_FORCE_GEMM did, holding B = 1 fixed
+    //                           so the batch is not a variable. This is the
+    //                           reference arm and reproduces #255's 4.55x.
+    //
+    // `LLOOM_290_PAD_M=1`       additionally rounds M up to the tile's BM, so
+    //                           align_M is TRUE and the aligned path is taken.
+    //
+    // *** PADDING CHANGES THE WORK DONE. *** The kernel is told M = 32 where
+    // one row exists, so `load_unsafe` reads 31 rows past the operand and the
+    // output rows above 0 are garbage. This measures THE PATH, not a shippable
+    // configuration, and no arm of it may be reported as a speedup. Row 0 is
+    // still computed from real data, which is what makes the comparison a
+    // comparison; nothing downstream may consume rows 1..32.
+    //
+    // `n == 1` still takes the GEMV under both: that arm is the mat-vec shape,
+    // not decode's vec-mat, and #253 excluded it for the same reason.
+    let force_gemm = m == 1 && n != 1 && crate::utils::get_env_bool("LLOOM_290_FORCE_GEMM", false);
+    if (m == 1 || n == 1) && !force_gemm {
         return call_mlx_gemv(
             device,
             ep,
@@ -734,6 +773,21 @@ pub fn call_mlx_gemm(
     let device_type = device.device_type();
     let tile = select_tile_config(dtype, m, n, k, b, a_trans, b_trans, device_type);
     let (bm, bn, bk, wm, wn) = (tile.bm, tile.bn, tile.bk, tile.wm, tile.wn);
+
+    // issue #290 step 2, second gate. Round M up to the tile's BM so that
+    // `align_M` below is true and the kernel takes the aligned loop at
+    // mlx_gemm.metal:1232 with `load_unsafe`, instead of the bound-checked
+    // per-element `load_safe` every B < BM otherwise forces.
+    //
+    // Deliberately AFTER `select_tile_config`, so the padding cannot change
+    // which tile is selected: the arms must differ in `align_M` alone, and a
+    // pad that moved the tile would confound candidate 3 with the tile choice
+    // #253 already excluded. Asserted by the census, which must show the same
+    // kernel name on both arms.
+    //
+    // This is what makes the arm unshippable -- see the note at the force gate.
+    let pad_m = force_gemm && crate::utils::get_env_bool("LLOOM_290_PAD_M", false);
+    let m = if pad_m { m.div_ceil(bm) * bm } else { m };
 
     // https://github.com/ml-explore/mlx/blob/02efb310cac667bc547d1b96f21596c221f84fe7/mlx/backend/metal/matmul.cpp#L422
     // has_batch should be true when b > 1, matching the original candle behavior
@@ -773,6 +827,15 @@ pub fn call_mlx_gemm(
         };
         (a_stride, b_stride)
     };
+
+    // issue #290 step 2: on the padded arm the operand still has ONE row, and
+    // the aligned path's `load_unsafe` reads BM of them unconditionally. An
+    // `lda` of 0 makes every padded row re-read row 0 -- in bounds, and the
+    // per-row arithmetic identical to the real row's, so the aligned loader
+    // moves the same bytes per row that the unaligned one would have. It is
+    // still not a shippable configuration: rows 1..BM of the output are
+    // duplicates nothing may consume.
+    let lda = if pad_m { 0 } else { lda };
 
     let gemm_params = GemmParams {
         m: m as i32,

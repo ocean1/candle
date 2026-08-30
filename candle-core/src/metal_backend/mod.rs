@@ -1820,10 +1820,28 @@ impl BackendStorage for MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        // issue #290 step 2: the padded arm writes a full BM-row tile, so the
+        // destination must have room for it. `store_result` on the aligned path
+        // (mlx_gemm.metal:1231-1268) is the UNSAFE store -- it writes BM x BN
+        // unconditionally -- where the unaligned path calls `store_result_safe`
+        // and clips to `tgp_bm`. Without this the padded arm writes 32 rows into
+        // a 1-row allocation and the GPU hangs, which is what the first attempt
+        // did (recorded in measurements/issue-290-align-m.md).
+        //
+        // Off unless BOTH step-2 gates are set, so an unconfigured process
+        // allocates exactly `b * m * n` as it did before. MEASUREMENT PROBE
+        // ONLY: rows 1..32 are written and never read, and the returned
+        // storage still declares `b * m * n`, so nothing downstream can consume
+        // them. This is why the arm measures the PATH and is not shippable.
+        let pad_rows = m == 1
+            && n != 1
+            && std::env::var("LLOOM_290_FORCE_GEMM").is_ok()
+            && std::env::var("LLOOM_290_PAD_M").is_ok();
+        let alloc_elems = if pad_rows { b * 32 * n } else { b * m * n };
         let buffer = self
             .device
             .new_buffer_builder()
-            .with_size_for(b * m * n, self.dtype)
+            .with_size_for(alloc_elems, self.dtype)
             .with_label("matmul")
             .build()?;
         let encoder = self.device.command_encoder()?;
