@@ -1104,9 +1104,7 @@ fn main() -> Result<()> {
                     device.synchronize()?;
                     let snap = candle_metal_kernels::metal::profile::snapshot();
                     let total: u64 = snap.by_label.iter().map(|(_, c)| c).sum();
-                    println!(
-                        "=== kernels in ONE k={width} verify pass ({total} dispatches) ==="
-                    );
+                    println!("=== kernels in ONE k={width} verify pass ({total} dispatches) ===");
                     for (name, count) in &snap.by_label {
                         println!("{count:6}  {name}");
                     }
