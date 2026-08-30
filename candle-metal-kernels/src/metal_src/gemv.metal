@@ -41,6 +41,67 @@ struct GemvDefaultAccT {
 };
 
 ///////////////////////////////////////////////////////////////////////////////
+/// Prologue functors (issue #266, `DESIGN.md` §12.2 #2)
+///////////////////////////////////////////////////////////////////////////////
+
+// The mirror of `mlx_gemm.metal`'s `TransformNone`/`TransformAdd`/
+// `TransformAxpby` at the *input* end. §7.5 states the mechanism for epilogues
+// and §11.3v (#221) records that it is built and inherited from MLX for the
+// matmul; two of §12.2's four fusion entries are **prologues**, which that item
+// does not name, and this is the seam they need.
+//
+// A prologue transforms `in_vec` as it is loaded into registers, so the
+// transformed vector is never written to memory. That is what removes the
+// round-trip §12.2 #2 is about, and §12.1 is explicit that the round-trip is
+// the win rather than the dispatch count.
+//
+// WHAT A PROLOGUE CANNOT DO, and it decides this entry's shape. A functor here
+// sees one thread's `TN` elements at offset `bn`. It cannot see the whole
+// vector, because a GEMV partitions the OUTPUT across `n_tgp` threadgroups
+// (336 of them for w1 at LFM2's geometry) and Metal has no cross-threadgroup
+// barrier inside a dispatch. So a reduction over all of `K` -- which is what
+// RMSNorm's `rsqrt(mean(x^2))` is -- cannot be computed here; it can only be
+// *recomputed*, once per threadgroup. `measurements/issue-266-raw/prediction.py`
+// prices that at 432x the reduction work and 106.2 MB/token of re-reads
+// against a 0.492 MB/token saving.
+//
+// Hence the split: the reduction stays its own dispatch and produces a scale,
+// and the prologue applies the scale and the norm weight. What disappears is
+// the normalized vector's write and the consumer's read of it.
+
+// The identity. Selected when no fusion is asked for, and byte-for-byte what
+// shipped: it holds no state and its `operator()` returns its argument, so it
+// inlines away entirely.
+template <typename T, typename AccT>
+struct PrologueNone {
+  METAL_FUNC PrologueNone(const device T*, const device float*) {}
+  METAL_FUNC AccT operator()(AccT x, int) const { return x; }
+};
+
+// RMSNorm's elementwise tail: `x * inv_rms * weight[i]`.
+//
+// `inv_rms` is a single f32 the reduction dispatch wrote, read once at
+// construction rather than per element -- §11.3e's hoist rule, which is why
+// this costs one dependent load per dispatch and not one per element.
+//
+// The weight is indexed by the element's position in the INPUT vector, which
+// is `bn + tn`, and the caller passes it. Getting that index wrong is the
+// failure mode a fixture whose `norm_w` is all-ones cannot see, so the parity
+// test uses a non-constant weight.
+template <typename T, typename AccT>
+struct PrologueRmsNorm {
+  const device T* w;
+  AccT inv_rms;
+
+  METAL_FUNC PrologueRmsNorm(const device T* w_, const device float* scale)
+      : w(w_), inv_rms(static_cast<AccT>(scale[0])) {}
+
+  METAL_FUNC AccT operator()(AccT x, int i) const {
+    return x * inv_rms * static_cast<AccT>(w[i]);
+  }
+};
+
+///////////////////////////////////////////////////////////////////////////////
 /// Matrix-vector: mat [M_out, K] × vec [K] → out [M_out]
 /// (mat rows = output dimension, mat cols = K)
 ///////////////////////////////////////////////////////////////////////////////
@@ -54,9 +115,11 @@ template <
     const int TM,       // Thread rows (in elements)
     const int TN,       // Thread cols (in elements)
     const bool kDoAxpby,
-    typename AccT = typename GemvDefaultAccT<T>::type>
+    typename AccT = typename GemvDefaultAccT<T>::type,
+    typename Prologue = PrologueNone<T, AccT>>
 struct GEMVKernel {
   using acc_type = AccT;
+  using prologue_type = Prologue;
 
   MLX_MTL_CONST int threadsM = BM * SM;
   MLX_MTL_CONST int threadsN = BN * SN;
@@ -113,6 +176,7 @@ struct GEMVKernel {
       const float beta,
       const int bias_stride,
       threadgroup AccT* tgp_memory,
+      thread const Prologue& prologue,
       uint3 tid,
       uint3 lid,
       uint simd_gid,
@@ -151,6 +215,15 @@ struct GEMVKernel {
     for (int i = 0; i < n_iter; ++i) {
       load_unsafe<AccT>(in_vec, v_coeff, bn);
 
+      // The prologue transforms the input vector in registers, so a fused
+      // producer's output is never written to memory (issue #266). Under
+      // `PrologueNone` this is the identity and inlines away, which is what
+      // makes the unfused arm byte-for-byte what shipped.
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        v_coeff[tn] = prologue(v_coeff[tn], bn + tn);
+      }
+
       int mat_offset = 0;
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
@@ -166,6 +239,16 @@ struct GEMVKernel {
 
     if (leftover > 0) {
       load_safe<AccT>(in_vec, v_coeff, bn, in_size);
+      // Guarded by `bn + tn < in_size`: `load_safe` zero-fills past the end,
+      // and the prologue must not index its weight out of bounds there. A
+      // zero times anything is zero, so skipping the transform on the padding
+      // lanes is also arithmetically the same.
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        if (bn + tn < in_size) {
+          v_coeff[tn] = prologue(v_coeff[tn], bn + tn);
+        }
+      }
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
         load_safe(&mat[tm * matrix_ld], inter, bn, in_size);
@@ -440,6 +523,7 @@ template <
     const int TM, const int TN,
     const bool kDoNCBatch,
     const bool kDoAxpby,
+    typename Prologue,
     typename ShapeP, typename StrideP>
 METAL_FUNC void gemv_body(
     const device T* mat,
@@ -458,11 +542,13 @@ METAL_FUNC void gemv_body(
     StrideP bias_batch_stride,
     const int bias_stride,
     threadgroup typename GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>::acc_type* tgp_memory,
+    thread const Prologue& prologue,
     uint3 tid,
     uint3 lid,
     uint simd_gid,
     uint simd_lid) {
-  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby,
+                              typename GemvDefaultAccT<T>::type, Prologue>;
 
   if (kDoNCBatch) {
     in_vec += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, vector_batch_stride, batch_ndim);
@@ -480,7 +566,7 @@ METAL_FUNC void gemv_body(
   kernel_t::run(mat, in_vec, bias, out_vec,
                 in_vec_size, out_vec_size, matrix_ld,
                 alpha, beta, bias_stride,
-                tgp_memory,
+                tgp_memory, prologue,
                 tid, lid, simd_gid, simd_lid);
 }
 
@@ -521,13 +607,86 @@ void gemv(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   gemv_tgp_memory(kernel_t);
-  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby>(
+  const prologue_t prologue(nullptr, nullptr);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t>(
       mat, in_vec, bias, out_vec,
       in_vec_size, out_vec_size, matrix_ld, alpha, beta,
       batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
       bias_batch_stride, bias_stride,
       kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue,
+      tid, lid, simd_gid, simd_lid);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+/// gemv with a fused RMSNorm prologue (issue #266, §12.2 #2)
+///////////////////////////////////////////////////////////////////////////////
+
+// The fused arm. Two extra bindings on the END -- the norm weight and a
+// one-element f32 buffer holding `1/rms` -- so the *classical* signature above
+// is untouched and the two arms stay independently dispatchable, which is
+// §12.3's requirement that fused and unfused variants coexist and be
+// swappable.
+//
+// The scale buffer is produced by a separate reduction dispatch
+// (`reduce.metal`'s `rmsnorm_scale`). That is not a concession: it is forced.
+// A GEMV partitions the output across `n_tgp` threadgroups and Metal has no
+// cross-threadgroup barrier inside a dispatch, so no prologue can compute a
+// reduction over the whole input vector -- it can only recompute it per
+// threadgroup, which `measurements/issue-266-raw/prediction.py` prices at 432x
+// the reduction work.
+//
+// So this removes the normalized vector's ROUND-TRIP and not the norm's
+// dispatch. §12.1 is explicit that the round-trip is the win and the dispatch
+// count is the visible number; here the two come apart, and this arm collects
+// only the first.
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_rmsnorm(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    const device T* bias [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& matrix_ld [[buffer(6)]],
+    const constant float& alpha [[buffer(7)]],
+    const constant float& beta [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const constant int64_t* bias_batch_stride [[buffer(13)]],
+    const constant int& bias_stride [[buffer(14)]],
+    const device T* norm_weight [[buffer(15)]],
+    const device float* norm_scale [[buffer(16)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueRmsNorm<T, typename kernel_t::acc_type>;
+  gemv_tgp_memory(kernel_t);
+  // The scale is read ONCE here, at kernel entry, rather than per element --
+  // §11.3e's hoist rule, which is what keeps this one dependent load per
+  // dispatch instead of one per element. `tid.z` is the batch index, matching
+  // the one scale per row the reduction writes.
+  const prologue_t prologue(norm_weight, norm_scale + tid.z);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t>(
+      mat, in_vec, bias, out_vec,
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      bias_batch_stride, bias_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue,
       tid, lid, simd_gid, simd_lid);
 }
 
@@ -582,14 +741,17 @@ void gemv_packed(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   gemv_tgp_memory(kernel_t);
   GemvParams p = *pp;
-  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby>(
+  const prologue_t prologue(nullptr, nullptr);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t>(
       mat, in_vec, bias, out_vec,
       p.in_vec_size, p.out_vec_size, p.matrix_ld, p.alpha, p.beta,
       p.batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
       bias_batch_stride, p.bias_stride,
       kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue,
       tid, lid, simd_gid, simd_lid);
 }
 
@@ -792,6 +954,29 @@ void gemv_t_packed(
   [[kernel]] decltype(func##_packed<itype, bm, bn, sm, sn, tm, tn, (bool)nc, (bool)axpby>)  \
              func##_packed<itype, bm, bn, sm, sn, tm, tn, (bool)nc, (bool)axpby>;
 
+// The fused-prologue sibling (issue #266, §12.2 #2), named by appending
+// `_rmsnorm`.
+//
+// DELIBERATELY NOT part of `instantiate_gemv_nc_axpby`'s cross. That macro
+// emits 4 nc/axpby combinations per tile across 7 tiles and 3 dtypes; adding a
+// fused arm to it would emit 84 more names per dtype, of which LFM2 dispatches
+// **two**. §11.3g measured the doubling of this family at +730 ms of cold
+// compile and +4.01 MiB, which is the strongest recorded case for not
+// instantiating what nothing asks for, and §11.3k decided a scope on exactly
+// that arithmetic.
+//
+// So the fused arm is instantiated only at `nc=0, axpby=0` and only at the two
+// tiles the decode path selects -- read from `call_mlx_gemv`'s own tile rule
+// and confirmed against the committed census
+// (`measurements/issue-249-raw/kernel-census.txt`, which records `bm4` and
+// `bm8` and no others).
+#define instantiate_gemv_rmsnorm_helper(nm, itype, bm, bn, sm, sn, tm, tn)     \
+  template [[host_name(                                                        \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                      \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_rmsnorm")]]                             \
+  [[kernel]] decltype(gemv_rmsnorm<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_rmsnorm<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
 #define instantiate_gemv_nc_axpby(func, nm, itype, bm, bn, sm, sn, tm, tn)    \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 0)      \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 1)      \
@@ -825,6 +1010,18 @@ void gemv_t_packed(
 instantiate_gemv_blocks(float32, float)
 instantiate_gemv_blocks(float16, half)
 instantiate_gemv_blocks(bfloat16, bfloat)
+
+// The two decode-path tiles, per dtype. `bm8` serves w1/w3 (N=10752) and
+// conv.in_proj (N=6144); `bm4` serves q_proj (N=2048) and k/v_proj (N=512).
+// f32 is instantiated alongside f16 so the parity fixture can run at f32,
+// which is the precision §2.3.5a's discriminator wants.
+#define instantiate_gemv_rmsnorm_blocks(nm, itype)              \
+  instantiate_gemv_rmsnorm_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
+  instantiate_gemv_rmsnorm_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+
+instantiate_gemv_rmsnorm_blocks(float32, float)
+instantiate_gemv_rmsnorm_blocks(float16, half)
+instantiate_gemv_rmsnorm_blocks(bfloat16, bfloat)
 
 instantiate_gemv_t_blocks(float32, float)
 instantiate_gemv_t_blocks(float16, half)

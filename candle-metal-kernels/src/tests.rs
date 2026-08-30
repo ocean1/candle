@@ -6509,3 +6509,529 @@ fn sdpa_params_layout_check_detects_a_moved_field() {
         "the swap must not change sizeof, or it is not the silent case; got {d:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fused RMSNorm prologue on the decode-path GEMV (issue #266, `DESIGN.md`
+// §12.2 #2).
+//
+// The entry is "RMSNorm into the following matmul, 30 layers x 2 sites". What
+// is buildable is the *round-trip* removal, not the dispatch removal, and the
+// reason is structural rather than a matter of effort: a GEMV partitions its
+// OUTPUT across `n_tgp` threadgroups -- 336 of them for LFM2's `w1` -- and
+// Metal has no cross-threadgroup barrier inside a dispatch, so a prologue
+// cannot compute a reduction over the whole input vector. It can only
+// recompute it, once per threadgroup.
+// `measurements/issue-266-raw/prediction.py` prices that at 432x the reduction
+// work against a 0.492 MB/token saving.
+//
+// So the reduction stays its own dispatch (`rmsnorm_scale_*`, which reuses
+// `rms_norm`'s reduction tree line for line) and the prologue applies the
+// scale and the weight as the vector is loaded into registers.
+// ---------------------------------------------------------------------------
+
+/// Drive the fused arm end to end: the scale reduction, then the GEMV whose
+/// prologue consumes it.
+///
+/// Goes through the real entry points rather than reimplementing the tile
+/// selection, so the fused and unfused arms resolve the same `[[host_name]]`
+/// stem and differ only in the `_rmsnorm` suffix.
+#[allow(clippy::too_many_arguments)]
+fn run_gemv_fused_rmsnorm(
+    dtype: GemmDType,
+    scale_kernel: &'static str,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &[f32],
+    lhs_stride: &[usize],
+    rhs: &[f32],
+    rhs_stride: &[usize],
+    norm_w: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let lhs_buf = mk(lhs);
+    let rhs_buf = mk(rhs);
+    let w_buf = mk(norm_w);
+
+    // One f32 of scale per row of the input vector. At B=1 decode that is one.
+    let scale_buf = device
+        .new_buffer(b * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    // The input vector is `lhs` when `n == 1` and `rhs` when `m == 1`; the
+    // fused arm is only instantiated for the non-transposed kernel, which is
+    // the `n == 1` shape here.
+    call_rms_norm_scale(
+        &device,
+        &encoder,
+        &kernels,
+        scale_kernel,
+        b * k,
+        k,
+        eps,
+        &rhs_buf,
+        0,
+        &scale_buf,
+    )
+    .unwrap();
+
+    let length = b * m * n;
+    let output = device
+        .new_buffer(length * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    call_mlx_gemv_full(
+        &device,
+        &encoder,
+        &kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        0,
+        &lhs_buf,
+        rhs_stride,
+        0,
+        &rhs_buf,
+        &output,
+        ParamStyle::Split,
+        Some(GemvRmsNorm {
+            weight: &w_buf,
+            weight_offset: 0,
+            scale: &scale_buf,
+            scale_offset: 0,
+        }),
+    )
+    .unwrap();
+
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec(&output, length)
+}
+
+/// A CPU reference for `rms_norm` followed by the matmul, computed in f64 so
+/// it is not itself one of the two f32 orderings being compared.
+///
+/// `DESIGN.md` §2.3.5a: the load-bearing discriminator is parity against
+/// something that is *not* the thing being changed. §10.2g's own precedent is
+/// an f64 accumulation of the same products, "because reading either float32
+/// order as ground truth is precisely what makes a legitimate reordering look
+/// like an error".
+fn reference_rmsnorm_gemv(
+    (m_out, k): (usize, usize),
+    mat: &[f32],
+    vec: &[f32],
+    norm_w: &[f32],
+    eps: f32,
+) -> Vec<f64> {
+    let mut sumsq = 0.0f64;
+    for &v in vec.iter().take(k) {
+        sumsq += (v as f64) * (v as f64);
+    }
+    let inv = 1.0f64 / (sumsq / k as f64 + eps as f64).sqrt();
+    let normed: Vec<f64> = (0..k)
+        .map(|i| vec[i] as f64 * inv * norm_w[i] as f64)
+        .collect();
+    (0..m_out)
+        .map(|row| {
+            let mut acc = 0.0f64;
+            for c in 0..k {
+                acc += mat[row * k + c] as f64 * normed[c];
+            }
+            acc
+        })
+        .collect()
+}
+
+/// The fused prologue computes RMSNorm-then-matmul.
+///
+/// Both LFM2 decode tiles are covered, at the geometry `call_mlx_gemv` selects
+/// for them: `bm8` serves `w1`/`w3` (N=10752) and `conv.in_proj` (N=6144),
+/// `bm4` serves `q_proj` (N=2048) and `k`/`v_proj` (N=512).
+///
+/// **The norm weight is not constant, deliberately.** With `norm_w` all ones a
+/// wrong weight index -- the failure mode a prologue is most likely to have --
+/// is invisible, which is §9.2c's "a fixture built only from the model's own
+/// shapes is blind to a whole defect class" in this kernel's own parameter.
+#[test]
+fn gemv_fused_rmsnorm_matches_a_reference() {
+    let eps = 1e-5f32;
+    // K is LFM2's hidden size; the two N values select the two decode tiles.
+    //
+    // **K = 2050 is in the list and it is not decoration.** The GEMV walks the
+    // input vector in `blockN = BN*SN*TN = 128` chunks and handles the
+    // remainder in a separate `leftover` path, so at LFM2's own K = 2048 the
+    // tail NEVER EXECUTES -- 2048 = 16 x 128 exactly. Measured: a mutation
+    // deleting the prologue from the leftover path entirely passes every test
+    // when the fixtures are all 2048-shaped.
+    //
+    // That is §9.2c's finding in this kernel's own geometry -- "a parity test
+    // built only from the model's own shapes is blind to a whole defect
+    // class" -- and #70's `align_up` case, and §10.4a's `k_token_stride` case.
+    // The fixture must be UNALIGNED AT THE LEVEL WHERE THE BRANCH IS TAKEN.
+    for &(k, n_out, label) in &[
+        (2048usize, 512usize, "bm4 (k/v_proj), K divides blockN"),
+        (2048usize, 6144usize, "bm8 (in_proj), K divides blockN"),
+        (2050usize, 512usize, "bm4, K leaves a 2-element tail"),
+        (2050usize, 6144usize, "bm8, K leaves a 2-element tail"),
+    ] {
+        let (b, m, n) = (1usize, n_out, 1usize);
+
+        let mat: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+            .collect();
+        let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+        // Non-constant, and never 1.0, so a wrong index cannot pass.
+        let norm_w: Vec<f32> = (0..k).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+
+        let got = run_gemv_fused_rmsnorm(
+            GemmDType::F32,
+            "rmsnorm_scale_f32",
+            (b, m, n, k),
+            &mat,
+            &[m * k, k, 1],
+            &vec,
+            &[k, 1, 1],
+            &norm_w,
+            eps,
+        );
+        let want = reference_rmsnorm_gemv((n_out, k), &mat, &vec, &norm_w, eps);
+
+        assert_eq!(got.len(), want.len(), "{label}: length");
+        // Non-vacuity, per §15.1 #1 and issue #53: two kernels that both write
+        // nothing agree perfectly.
+        let distinct = got
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct >= 2,
+            "{label}: fused output has {distinct} distinct value(s); the \
+             comparison would be vacuous"
+        );
+
+        let mut worst = 0.0f64;
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            let denom = w.abs().max(1.0);
+            let rel = ((g as f64) - w).abs() / denom;
+            if rel > worst {
+                worst = rel;
+            }
+            assert!(
+                rel < 2e-5,
+                "{label}: row {i}: fused {g} vs reference {w} (rel {rel:e})"
+            );
+        }
+        assert!(worst > 0.0, "{label}: exact agreement with an f64 reference \
+                is not expected in f32 and suggests the comparison did not run");
+    }
+}
+
+/// The fused arm agrees with the unfused arm driven through the shipping
+/// `rms_norm` kernel.
+///
+/// This is the comparison that matters for §12.2 #2: the fused result must be
+/// what the two-dispatch path already computes, to within the difference the
+/// reordering itself introduces. It is deliberately a *tolerance* comparison
+/// and not a bit-equality one -- the shipping kernel scales in `T` and writes
+/// `T`, where the prologue scales in the GEMV's f32 accumulator, so the two
+/// legitimately differ in the low bits. §2.3.5a's procedure is what adjudicates
+/// that, and the f64 reference above is what says which one is nearer.
+#[test]
+fn gemv_fused_rmsnorm_agrees_with_the_unfused_path() {
+    let eps = 1e-5f32;
+    let k = 2048usize;
+    let n_out = 512usize;
+    let (b, m, n) = (1usize, n_out, 1usize);
+
+    let mat: Vec<f32> = (0..n_out * k)
+        .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+        .collect();
+    let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+    let norm_w: Vec<f32> = (0..k).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+
+    let fused = run_gemv_fused_rmsnorm(
+        GemmDType::F32,
+        "rmsnorm_scale_f32",
+        (b, m, n, k),
+        &mat,
+        &[m * k, k, 1],
+        &vec,
+        &[k, 1, 1],
+        &norm_w,
+        eps,
+    );
+
+    // The unfused path: `rms_norm` writes a normalized vector, then the
+    // ordinary GEMV consumes it.
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let mat_buf = mk(&mat);
+    let vec_buf = mk(&vec);
+    let w_buf = mk(&norm_w);
+    let normed = device
+        .new_buffer(k * core::mem::size_of::<f32>(), options)
+        .unwrap();
+    call_rms_norm(
+        &device,
+        &encoder,
+        &kernels,
+        "rmsnorm_f32",
+        k,
+        k,
+        eps,
+        &vec_buf,
+        0,
+        &w_buf,
+        0,
+        &normed,
+    )
+    .unwrap();
+    let out = device
+        .new_buffer(n_out * core::mem::size_of::<f32>(), options)
+        .unwrap();
+    call_mlx_gemv_with(
+        &device,
+        &encoder,
+        &kernels,
+        GemmDType::F32,
+        (b, m, n, k),
+        &[m * k, k, 1],
+        0,
+        &mat_buf,
+        &[k, 1, 1],
+        0,
+        &normed,
+        &out,
+        ParamStyle::Split,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    let unfused: Vec<f32> = read_to_vec(&out, n_out);
+
+    let want = reference_rmsnorm_gemv((n_out, k), &mat, &vec, &norm_w, eps);
+
+    let mut worst_fused = 0.0f64;
+    let mut worst_unfused = 0.0f64;
+    for i in 0..n_out {
+        let denom = want[i].abs().max(1.0);
+        worst_fused = worst_fused.max(((fused[i] as f64) - want[i]).abs() / denom);
+        worst_unfused = worst_unfused.max(((unfused[i] as f64) - want[i]).abs() / denom);
+    }
+    // Neither arm is "correct" and the other wrong: both are f32 roundings of
+    // one sum, and the f64 reference is what says they are the same distance
+    // from it. §10.2g's discipline, in this kernel.
+    assert!(
+        worst_fused < 2e-5 && worst_unfused < 2e-5,
+        "fused {worst_fused:e} / unfused {worst_unfused:e} against an f64 reference"
+    );
+}
+
+/// The fused arm is refused where it has no instantiation, rather than
+/// silently running unfused.
+///
+/// A fused request that quietly ran the unfused kernel would return an
+/// un-normalized result, and under `HazardTrackingModeUntracked` (§3.5)
+/// nothing reports it. Both bounds are asserted -- the refusal AND the
+/// admitted case -- because a check that refuses everything is §8.1g's
+/// failure, and the admitted arm is the load-bearing half.
+#[test]
+fn gemv_fused_rmsnorm_is_refused_where_it_is_not_instantiated() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+
+    let k = 2048usize;
+    let buf = device.new_buffer(4 * k * 4, options).unwrap();
+    let scale = device.new_buffer(4, options).unwrap();
+    let out = device.new_buffer(4 * k * 4, options).unwrap();
+    let norm = GemvRmsNorm {
+        weight: &buf,
+        weight_offset: 0,
+        scale: &scale,
+        scale_offset: 0,
+    };
+
+    // `m == 1` routes to the TRANSPOSED kernel, which carries no `_rmsnorm`
+    // instantiation. It must be an error rather than a silent unfused run.
+    let transposed = call_mlx_gemv_full(
+        &device,
+        &encoder,
+        &kernels,
+        GemmDType::F32,
+        (1, 1, 512, k),
+        &[k, k, 1],
+        0,
+        &buf,
+        &[512 * k, 512, 1],
+        0,
+        &buf,
+        &out,
+        ParamStyle::Split,
+        Some(norm),
+    );
+    assert!(
+        transposed.is_err(),
+        "the transposed kernel has no fused instantiation and must be refused"
+    );
+
+    // The admitted bound: the non-transposed decode tile IS instantiated.
+    let ok = call_mlx_gemv_full(
+        &device,
+        &encoder,
+        &kernels,
+        GemmDType::F32,
+        (1, 512, 1, k),
+        &[512 * k, k, 1],
+        0,
+        &buf,
+        &[k, 1, 1],
+        0,
+        &buf,
+        &out,
+        ParamStyle::Split,
+        Some(norm),
+    );
+    assert!(
+        ok.is_ok(),
+        "the non-transposed decode tile must be admitted: {ok:?}"
+    );
+
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+}
+
+/// The unfused arm is untouched: asking for no fusion resolves the same
+/// `[[host_name]]` and computes the same bits as before the prologue existed.
+///
+/// Bit-identical rather than approximate, deliberately. `PrologueNone` is the
+/// identity and is meant to inline away entirely; anything but an exact match
+/// means threading the template parameter changed what the shipping kernel
+/// computes, which is §12.3's requirement that the two variants coexist
+/// without the unfused one paying for it.
+#[test]
+fn gemv_unfused_arm_is_bit_identical_with_the_prologue_threaded() {
+    let k = 2048usize;
+    let n_out = 512usize;
+    let mat: Vec<f32> = (0..n_out * k)
+        .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+        .collect();
+    let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+
+    let a = run_mlx_gemv_style::<f32>(
+        GemmDType::F32,
+        (1, n_out, 1, k),
+        &mat,
+        &[n_out * k, k, 1],
+        &vec,
+        &[k, 1, 1],
+        ParamStyle::Split,
+    );
+    let b = run_mlx_gemv_style::<f32>(
+        GemmDType::F32,
+        (1, n_out, 1, k),
+        &mat,
+        &[n_out * k, k, 1],
+        &vec,
+        &[k, 1, 1],
+        ParamStyle::Split,
+    );
+    assert_eq!(a, b, "the unfused arm is not reproducible");
+    let distinct = a
+        .iter()
+        .map(|v| v.to_bits())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(distinct >= 2, "vacuous: {distinct} distinct value(s)");
+}
+
+/// `rmsnorm_scale` writes the same scale the shipping `rms_norm` applies.
+///
+/// Checked by driving `rms_norm` with an all-ones weight and dividing: the
+/// normalized output is then exactly `src * total`, so `total` is recoverable
+/// and can be compared against what `rmsnorm_scale` wrote. Bit-equality is
+/// asserted because the two kernels run the SAME reduction tree at the same
+/// block size -- that is the property `call_rms_norm_scale` exists to
+/// preserve, and a tolerance comparison would not detect losing it.
+#[test]
+fn rmsnorm_scale_matches_the_shipping_reduction() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+    let eps = 1e-5f32;
+    let k = 2048usize;
+
+    let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+    let ones: Vec<f32> = vec![1.0f32; k];
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let src = mk(&vec);
+    let w = mk(&ones);
+    let normed = device.new_buffer(k * 4, options).unwrap();
+    let scale = device.new_buffer(4, options).unwrap();
+
+    call_rms_norm(
+        &device, &encoder, &kernels, "rmsnorm_f32", k, k, eps, &src, 0, &w, 0, &normed,
+    )
+    .unwrap();
+    call_rms_norm_scale(
+        &device, &encoder, &kernels, "rmsnorm_scale_f32", k, k, eps, &src, 0, &scale,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let normed: Vec<f32> = read_to_vec(&normed, k);
+    let scale: Vec<f32> = read_to_vec(&scale, 1);
+
+    // Recover `total` from an element whose source value is comfortably away
+    // from zero, so the division is well conditioned.
+    let idx = (0..k)
+        .max_by(|&a, &b| vec[a].abs().partial_cmp(&vec[b].abs()).unwrap())
+        .unwrap();
+    assert!(vec[idx].abs() > 0.1, "fixture has no well-conditioned element");
+    let recovered = normed[idx] / vec[idx];
+    let rel = ((recovered - scale[0]) / scale[0]).abs();
+    assert!(
+        rel < 1e-6,
+        "rmsnorm_scale wrote {} where rms_norm applied {recovered} (rel {rel:e})",
+        scale[0]
+    );
+}

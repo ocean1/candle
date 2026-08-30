@@ -411,6 +411,78 @@ pub fn call_rms_norm_with(
     Ok(())
 }
 
+/// RMSNorm's reduction half only: writes `rsqrt(mean(x^2) + eps)`, one `f32`
+/// per row, and no normalized vector (issue #266, `DESIGN.md` §12.2 #2).
+///
+/// The scaling half is applied by the consuming matmul's prologue
+/// ([`crate::GemvRmsNorm`]), so the normalized activation is never written to
+/// memory. That round-trip is what §12.2 #2 removes and what §12.1 names as
+/// the real win.
+///
+/// **The dispatch geometry is `call_rms_norm`'s, deliberately.** Same
+/// `work_per_threadgroup`, same `out_length`, same
+/// `min(max_total_threads_per_threadgroup, (work/2).next_power_of_two())`
+/// width — so the kernel selects the same `BLOCKSIZE` case and reduces over
+/// the same tree in the same index order. The scale it writes is therefore
+/// bit-identical to the `total` the shipping kernel computes internally, which
+/// keeps §2.3.3 #1 out of the reduction entirely and confines the numerical
+/// question to where the scaling multiply happens.
+///
+/// `alpha` is not taken: the weight is the consumer's to apply.
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_scale(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    length: usize,
+    elements_to_sum: usize,
+    eps: f32,
+    input: &Buffer,
+    input_offset: usize,
+    output_scale: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "rms_norm_scale {kernel_name} length={length} elements_to_sum={elements_to_sum}"
+    );
+
+    set_params!(
+        encoder,
+        (
+            length as u32,
+            elements_to_sum as u32,
+            (input, input_offset),
+            Output::new(output_scale),
+            eps
+        )
+    );
+
+    let work_per_threadgroup = elements_to_sum;
+    let out_length = length / work_per_threadgroup;
+
+    let thread_group_count = MTLSize {
+        width: out_length,
+        height: 1,
+        depth: 1,
+    };
+    let width = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        (work_per_threadgroup / 2).next_power_of_two(),
+    );
+    let thread_group_size = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_layer_norm(
     device: &Device,

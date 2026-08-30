@@ -41,7 +41,9 @@ pub use flash_decoding::{
 };
 pub use indexing::*;
 pub use indexing_names::IndexingKernel;
-pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_with, GemmDType};
+pub use mlx_gemm::{
+    call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_full, call_mlx_gemv_with, GemmDType, GemvRmsNorm,
+};
 pub use scratch::{
     call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,
 };
