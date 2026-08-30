@@ -227,7 +227,20 @@ METAL_FUNC int64_t simd_shuffle_down(int64_t data, uint16_t delta) {
 
 
 #if defined(__HAVE_BFLOAT__)
-// Metal does not have simd_shuffle_down for bfloat16
+// Metal does not have simd_shuffle_down for bfloat16 -- and it does not have
+// ANY simdgroup operation for it. Enumerated 2026-08-30 (#307, `DESIGN.md`
+// §3.9): simd_sum, simd_product, simd_min, simd_max, both simd_prefix_*,
+// simd_broadcast_first and all five simd_shuffle* are absent at `bfloat` and
+// present at `half` and `float` -- 12 of 12. So this shim is one member of a
+// family-wide gap rather than a one-off, which is why `is_simd_op<Sum<bfloat>>`
+// stays false below (it is gated on the compiler's own
+// __is_valid_simdgroup_type) while `is_valid_simd_type<bfloat>` is specialized
+// true: bfloat may use the SHUFFLE TREE and never the hardware reduction.
+//
+// The cost is 5 shuffle+op pairs per simdgroup reduction where f16 gets one
+// `simd_sum`. It is a fixed-order tree, so DESIGN.md §2.3.3 #1 and #3 are
+// satisfied either way -- this is not a determinism risk -- and it is unpriced
+// in time.
 METAL_FUNC bfloat simd_shuffle_down(bfloat value, ushort delta) {
     return as_type<bfloat>(simd_shuffle_down(as_type<ushort>(value), delta));
 }

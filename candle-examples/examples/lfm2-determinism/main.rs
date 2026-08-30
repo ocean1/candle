@@ -627,9 +627,28 @@ fn main() -> Result<()> {
         Device::new_metal(0)?
     };
 
-    // f16 on Metal is what ambrogio loads: LFM2 ships bf16, but Metal's bf16
-    // kernel coverage is patchy and unsupported ops fall back to the CPU
-    // silently. Measuring f32 here would measure a path nothing runs.
+    // f16 on Metal is what ambrogio loads. Measuring f32 here would measure a
+    // path nothing runs.
+    //
+    // This comment used to add: "LFM2 ships bf16, but Metal's bf16 kernel
+    // coverage is patchy and unsupported ops fall back to the CPU silently."
+    // **That is false, and it had never been tested** -- it was quoted into
+    // `DESIGN.md` §9.1b as a fact and made load-bearing for three decisions.
+    // Measured (#307, §3.9): 12 of 12 decode kernel families dispatch a native
+    // bf16 sibling at an IDENTICAL count (1135 against 1135), `lfm2-smoke`
+    // PASSes at bf16 on all three `--attn` arms with byte-identical text, and
+    // **no dispatch falls back to the CPU on any arm**. `--dtype bf16` works.
+    //
+    // The default stays f16 on the honest reason, which is the one this comment
+    // led with: it is what the consumer loads, so it is the path worth gating.
+    // Not on a claim about coverage -- and a default is flipped by its own
+    // argued decision (§7.1a), which this survey is not.
+    //
+    // One real gap, and it is hardware rather than a missing instantiation:
+    // `bfloat` has NO simdgroup operations at all -- 12 of 12 absent where
+    // `half` has them -- so every bf16 reduction takes a 5-instruction shuffle
+    // tree where f16 takes one `simd_sum`. Emulated, fixed-order, correct, and
+    // unpriced in time (§3.9).
     let dtype = match args.dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("f32") => DType::F32,
