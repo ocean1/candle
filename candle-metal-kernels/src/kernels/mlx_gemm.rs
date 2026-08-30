@@ -262,6 +262,32 @@ fn should_use_split_k(b: usize, m: usize, n: usize, k: usize) -> bool {
     (tm * tn) <= 32 && tk >= 8
 }
 
+/// The fused RMSNorm prologue's two extra bindings (issue #266, `DESIGN.md`
+/// §12.2 #2).
+///
+/// `scale` is a one-element `f32` per batch item holding `1/rms`, written by a
+/// separate reduction dispatch. It is a binding rather than a packed-params
+/// field because it is a *device* value the previous dispatch produced:
+/// putting it in the block would mean reading it back to the host between the
+/// two, which is the round trip the fusion exists to remove.
+///
+/// **The reduction cannot move into the prologue**, and that is arithmetic
+/// rather than a preference. A GEMV partitions the output across `n_tgp`
+/// threadgroups — 336 of them for LFM2's `w1` — and Metal has no
+/// cross-threadgroup barrier inside a dispatch, so a prologue can only
+/// *recompute* the whole `sum(x^2)`, once per threadgroup.
+/// `measurements/issue-266-raw/prediction.py` prices that at 432x the
+/// reduction work against a 0.492 MB/token saving.
+#[derive(Debug, Clone, Copy)]
+pub struct GemvRmsNorm<'a> {
+    /// The norm's learned weight, `[K]`, indexed by position in the input vector.
+    pub weight: &'a Buffer,
+    pub weight_offset: usize,
+    /// One `f32` per batch item: `1 / sqrt(mean(x^2) + eps)`.
+    pub scale: &'a Buffer,
+    pub scale_offset: usize,
+}
+
 /// M=1 -> gemv_t (vec[K] x mat[K,N] -> vec[N])
 /// N=1 -> gemv   (mat[M,K] x vec[K] -> vec[M])
 #[allow(clippy::too_many_arguments)]
@@ -317,6 +343,49 @@ pub fn call_mlx_gemv_with(
     rhs_buffer: &Buffer,
     output: &Buffer,
     style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    call_mlx_gemv_full(
+        device, ep, kernels, dtype, (b, m, n, k),
+        lhs_stride, lhs_offset, lhs_buffer,
+        rhs_stride, rhs_offset, rhs_buffer,
+        output, style, None,
+    )
+}
+
+/// As [`call_mlx_gemv_with`], optionally fusing an RMSNorm prologue onto the
+/// input vector (issue #266, `DESIGN.md` §12.2 #2).
+///
+/// `Some(..)` selects the `_rmsnorm` sibling, which scales each input element
+/// by `1/rms` and the norm weight **as it is loaded into registers**, so the
+/// normalized vector is never written to memory. `None` is byte-for-byte the
+/// path that shipped: the `_rmsnorm` suffix is absent from the name, so the
+/// same `[[host_name]]` resolves and the same pipeline runs.
+///
+/// One body serves both, per issue #38's discipline: the arms cannot disagree
+/// about which values are bound or in what order, because only one argument
+/// list exists.
+///
+/// **Refused rather than silently ignored** when the fused arm is asked for on
+/// a path that has no `_rmsnorm` instantiation — the transposed kernel, or a
+/// tile outside the two the decode path selects. A fused request that quietly
+/// ran unfused would produce an un-normalized result, which §3.5 says nothing
+/// reports.
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_gemv_full(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    output: &Buffer,
+    style: ParamStyle,
+    fused_norm: Option<GemvRmsNorm<'_>>,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m == 1 || n == 1, "call_mlx_gemv requires M=1 or N=1");
 
@@ -439,8 +508,39 @@ pub fn call_mlx_gemv_with(
         GemmDType::BF16 => "bfloat16",
     };
     let kernel_prefix = if transpose_mat { "gemv_t" } else { "gemv" };
+
+    // The fused arm is instantiated only for the non-transposed kernel at the
+    // two tiles the decode path selects (`gemv.metal`'s
+    // `instantiate_gemv_rmsnorm_blocks`), and only at `nc0_axpby0`. Anything
+    // else is REFUSED rather than silently falling back to the unfused name:
+    // a fused request that ran unfused would compute an un-normalized result,
+    // and under `HazardTrackingModeUntracked` (§3.5) nothing would report it.
+    let norm_suffix = if fused_norm.is_some() {
+        let tile_is_instantiated =
+            !transpose_mat && bn == 1 && sm == 1 && sn == 32 && tn == 4 && tm == 4 && (bm == 4 || bm == 8);
+        if !tile_is_instantiated {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "gemv fused rmsnorm prologue is not instantiated for \
+                 {kernel_prefix} bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn} \
+                 (mnk={m}x{n}x{k}); only the non-transposed bm4/bm8 decode \
+                 tiles carry it -- see DESIGN.md 12.2 #2, issue #266"
+            )));
+        }
+        if style != ParamStyle::Split {
+            return Err(MetalKernelError::LoadFunctionError(
+                "gemv fused rmsnorm prologue has no packed sibling; the two \
+                 extra bindings are device buffers rather than scalars, so \
+                 there is nothing for a params block to carry (issue #266)"
+                    .to_string(),
+            ));
+        }
+        "_rmsnorm"
+    } else {
+        ""
+    };
+
     let name = format!(
-        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}",
+        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}",
         kernel_prefix,
         dtype_str,
         bm,
@@ -449,7 +549,8 @@ pub fn call_mlx_gemv_with(
         sn,
         tm,
         tn,
-        style.name_suffix()
+        style.name_suffix(),
+        norm_suffix
     );
 
     let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
@@ -492,6 +593,27 @@ pub fn call_mlx_gemv_with(
     // Held until after the dispatch is encoded: the params block and any array
     // promoted out of `setBytes` must outlive it.
     let _staged = finish_packed_params(device, encoder, style, GEMV_PARAMS_ALIGN)?;
+
+    // The fused prologue's two bindings, at 15 and 16 -- after every argument
+    // the classical signature declares, so the classical slot numbering is
+    // untouched and the unfused arm binds exactly what it bound before.
+    //
+    // They go in AFTER `finish_packed_params` deliberately: under
+    // `ParamStyle::Packed` the capture renumbers the slots it diverted, and
+    // these are not part of that argument list. The fused arm is refused for
+    // `Packed` above, so the two mechanisms never meet -- stated here because
+    // the ordering looks incidental and is not (issue #41's `()` hazard, in
+    // the other direction).
+    // `set_input_buffer` rather than a raw bind: both are READS, and that
+    // function is what records the binding for hazard tracking and consults
+    // `prev_ce_outputs` for a pending writer (§6.4). The scale buffer is
+    // written by the reduction dispatch immediately before this one, so the
+    // RAW edge between them is exactly what must not be dropped -- and under
+    // `HazardTrackingModeUntracked` a missed one is silent corruption (§3.5).
+    if let Some(norm) = fused_norm {
+        encoder.set_input_buffer(15, Some(norm.weight), norm.weight_offset);
+        encoder.set_input_buffer(16, Some(norm.scale), norm.scale_offset);
+    }
 
     let n_out_per_tgp = if transpose_mat {
         bn * sn * tn

@@ -1389,6 +1389,116 @@ template<typename T>
     init_kernel("rmsnorm_" #tname, rms_norm_kernel, t)      \
     init_kernel("rmsnorm_" #tname "_packed", rms_norm_kernel_packed, t)
 
+///////////////////////////////////////////////////////////////////////////////
+/// RMSNorm, reduction half only (issue #266, `DESIGN.md` §12.2 #2)
+///////////////////////////////////////////////////////////////////////////////
+
+// Writes `rsqrt(mean(x^2) + eps)` as ONE f32 per row, and nothing else.
+//
+// The scaling half moves into the consuming matmul's prologue
+// (`gemv.metal`'s `PrologueRmsNorm`), so the normalized vector is never
+// materialised. What is left behind is the reduction, and it has to stay its
+// own dispatch: a GEMV partitions its OUTPUT across `n_tgp` threadgroups and
+// Metal has no cross-threadgroup barrier inside a dispatch, so a prologue
+// could only recompute this per threadgroup -- 336 times over for LFM2's `w1`.
+// `measurements/issue-266-raw/prediction.py` has the arithmetic.
+//
+// THE REDUCTION IS `rms_norm`'s OWN, LINE FOR LINE, AND THAT IS THE POINT.
+// Same `loader`/`block_reducer` over `RMS<float>`, same `RMSLoadOp`/
+// `RMSReduceOp`, same `BLOCKSIZE`, same `rsqrt(fast_divide(...) + eps)`. So
+// the value written here is bit-identical to the `total` the shipping kernel
+// computes, and §2.3.3 #1 is not engaged by the reduction at all. Writing a
+// second reduction that merely agreed to tolerance is exactly what §2.3.5a
+// would then have to adjudicate; reusing the tree removes the question.
+//
+// What DOES move is where the scaling multiply happens and in what precision:
+// the shipping kernel computes `T(src * total) * alpha` in `T`, and the fused
+// prologue computes `float(src) * total * float(alpha)` in the GEMV's `AccT`,
+// which is f32. That is a real numerical difference, it is a REORDERING
+// rather than a defect, and it is what the parity test and §2.3.5a's ladder
+// are for.
+//
+// `alpha` is deliberately absent: the weight is applied in the consumer's
+// prologue, indexed by position in the input vector.
+template<
+    typename T,
+    ushort BLOCKSIZE
+>
+METAL_FUNC void rmsnorm_scale(
+    const uint src_numel,
+    const uint el_per_block,
+    device const T *src,
+    device float *dst_scale,
+    const float eps,
+    threadgroup RMS<float> shared[BLOCKSIZE],
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]]
+) {
+    using Indexer = indexer_t<uint, false>;
+    Indexer indexer;
+    Divide fast_divide;
+    loader<T, RMS<float>, RMSLoadOp<float>, BLOCKSIZE,  Indexer, uint> load;
+    block_reducer<RMS<float>, RMSReduceOp<float>, BLOCKSIZE> reduce(shared);
+
+    const uint offset = dst_id * el_per_block;
+
+    RMS<float> value = load(
+        RMSLoadOp<float>::init(),
+        indexer,
+        src_numel,
+        el_per_block,
+        src,
+        offset,
+        tid
+    );
+    RMS<float> result = RMS<float> { value.count, static_cast<float>(value.sum_sq) };
+
+    result = reduce(result, tid);
+    if (tid == 0) {
+        dst_scale[dst_id] = rsqrt(fast_divide(result.sum_sq, float(el_per_block)) + eps);
+    }
+}
+
+#define rmsnorm_scale_case(N)                           \
+case N: {                                               \
+    threadgroup RMS<float> shared[N];                   \
+    rmsnorm_scale<T, N>(                                \
+        src_numel,                                      \
+        el_per_block,                                   \
+        src,                                            \
+        dst_scale,                                      \
+        eps,                                            \
+        shared,                                         \
+        tid,                                            \
+        dst_id);                                        \
+    break;                                              \
+}
+
+template<typename T>
+[[kernel]] void rmsnorm_scale_kernel(
+    constant uint &in_src_numel,
+    constant uint &in_el_per_block,
+    device const T *src,
+    device float *dst_scale,
+    constant float &in_eps,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormParams p { in_src_numel, in_el_per_block, in_eps };
+    norm_entry(rmsnorm_scale_case)
+}
+
+// No `_packed` sibling, and that is a decision rather than an omission. This
+// kernel exists only to feed `gemv`'s fused prologue, which is itself refused
+// under `ParamStyle::Packed` (its two extra bindings are device buffers, not
+// scalars, so there is nothing for a params block to carry). Instantiating a
+// packed sibling would add names nothing can ask for -- §11.3l's
+// "declared-and-unaskable" class, recorded there as dead instantiations paid
+// for at every cold compile.
+#define init_rmsnorm_scale(tname, t)                        \
+    init_kernel("rmsnorm_scale_" #tname, rmsnorm_scale_kernel, t)
+
 template<typename T>
 struct LayerNormValue {
     uint count;
@@ -1925,6 +2035,8 @@ static_assert(alignof(RopeThdParams) == 8, "RopeThdParams alignment");
 
 init_rms_norm(f32, float)
 init_rms_norm(f16, half)
+init_rmsnorm_scale(f32, float)
+init_rmsnorm_scale(f16, half)
 init_layer_norm(f32, float)
 init_layer_norm(f16, half)
 init_rope(f32, float)
@@ -1991,6 +2103,7 @@ init_arg_reduce(Max, argmax, bf16, bfloat)
 init_softmax(bf16, bfloat)
 
 init_rms_norm(bf16, bfloat)
+init_rmsnorm_scale(bf16, bfloat)
 init_layer_norm(bf16, bfloat)
 init_rope(bf16, bfloat)
 #endif
