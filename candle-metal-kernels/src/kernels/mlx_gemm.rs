@@ -51,6 +51,52 @@ const TILE_64_64_16_1_2: TileConfig = TileConfig::new(64, 64, 16, 1, 2);
 const TILE_64_32_32_2_2: TileConfig = TileConfig::new(64, 32, 32, 2, 2);
 const TILE_32_64_16_1_2: TileConfig = TileConfig::new(32, 64, 16, 1, 2);
 
+// Tiles instantiated by issue #383 so the BN axis can be measured. They are
+// unreachable unless `LLOOM_383_TILE` names one; nothing in
+// `select_tile_config`'s own logic returns them.
+const TILE_32_16_16_2_2: TileConfig = TileConfig::new(32, 16, 16, 2, 2);
+const TILE_16_32_16_2_2: TileConfig = TileConfig::new(16, 32, 16, 2, 2);
+const TILE_16_16_16_2_2: TileConfig = TileConfig::new(16, 16, 16, 2, 2);
+
+/// Issue #383's tile-forcing arm: pin `select_tile_config`'s answer so the
+/// TILE is the variable and `m` is held, which is the discriminator shape
+/// §13.5a used for the GEMV/GEMM switch (`LLOOM_253_FORCE_GEMM`).
+///
+/// **Unset is what ships** and selects byte-for-byte what shipped, because the
+/// forcing happens after every other branch would have returned.
+///
+/// It exists because `DESIGN.md` §13.5b and lloom #378 both dispositioned a
+/// 32×16 tile **without one being instantiated** — #378 on the argument that
+/// *"every LFM2 `N_out` is an exact multiple of 32, so BN=32 wastes nothing on
+/// N"*. That is an argument about **padding**; llama.cpp #27441's stated
+/// mechanism is **occupancy** (*"launches `ne01/64` threadgroups, which
+/// under-fills the GPU at these sizes"*), and halving BN doubles the
+/// threadgroup count along N. The two arguments do not meet, and until this
+/// knob existed neither could be measured.
+///
+/// An unparseable or unknown value **panics** rather than falling back:
+/// `DESIGN.md` §2.4 — an arm that silently ran the baseline is #69's vacuous
+/// determinism run, and the whole point of this knob is to be A/B'd.
+fn forced_tile() -> Option<TileConfig> {
+    use std::sync::OnceLock;
+    static TILE: OnceLock<Option<TileConfig>> = OnceLock::new();
+    *TILE.get_or_init(|| match std::env::var("LLOOM_383_TILE") {
+        Ok(v) => Some(match v.as_str() {
+            "32x32" => TILE_32_32_16_2_2,
+            "32x16" => TILE_32_16_16_2_2,
+            "16x32" => TILE_16_32_16_2_2,
+            "16x16" => TILE_16_16_16_2_2,
+            "64x32" => TILE_64_32_32_2_2,
+            "64x64" => TILE_64_64_16_2_2,
+            other => panic!(
+                "LLOOM_383_TILE must be one of \
+                 32x32|32x16|16x32|16x16|64x32|64x64, got {other:?}"
+            ),
+        }),
+        Err(_) => None,
+    })
+}
+
 /// The `m` below which `select_tile_config` keeps `TILE_32_32_16_2_2`.
 ///
 /// **16 is what ships**, which is `select_tile_config`'s own literal and what
@@ -94,6 +140,13 @@ fn select_tile_config(
     b_trans: bool,
     device_type: MetalDeviceType,
 ) -> TileConfig {
+    // Issue #383's forcing arm, ahead of every other branch so the tile is
+    // held while `m` varies. Unset (the shipping case) costs one `OnceLock`
+    // read and changes nothing.
+    if let Some(tile) = forced_tile() {
+        return tile;
+    }
+
     // Special case: For very small M (vector-matrix multiply),
     // use the original 32x32 tile to avoid thread waste.
     // When M is very small (< bm), using larger bm values causes significant
