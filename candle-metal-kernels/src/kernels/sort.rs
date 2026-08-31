@@ -124,7 +124,12 @@ fn multi_block_sort(
     let mut merge_tiles = 2;
     let n_thr_per_group = usize::min(nblocks + 1, 1024);
     let partition_name = format!("partition_mbsort_{dtype_str}_uint32_bn{bn}_tn{tn}");
-    let merge_name = format!("merge_mbsort_float32_uint32_bn{bn}_tn{tn}");
+    // `mb_block_merge` is templated on `val_t` and reads `dev_vals_in` through
+    // it, so the name must follow the dtype exactly as its two siblings do.
+    // Pinned to `float32` this reinterpreted half-width data through a float
+    // pointer at every non-f32 dtype; the only test on this path was F32, where
+    // the hardcode is accidentally correct.
+    let merge_name = format!("merge_mbsort_{dtype_str}_uint32_bn{bn}_tn{tn}");
     while merge_tiles / 2 < nblocks {
         let (dev_vals_in, dev_vals_out) = if ping {
             (&mut dev_vals_1, &mut dev_vals_0)
@@ -209,15 +214,16 @@ fn multi_block_sort(
     } else {
         &mut dev_idxs_0
     };
-    // Copy output with appropriate strides
-    let copy_kernel = match dtype {
-        DType::U8 => crate::copy2d::U8,
-        DType::U32 => crate::copy2d::U32,
-        DType::I64 => crate::copy2d::I64,
-        DType::BF16 => crate::copy2d::BFLOAT,
-        DType::F16 => crate::copy2d::HALF,
-        DType::F32 => crate::copy2d::FLOAT,
-    };
+    // Copy output with appropriate strides.
+    //
+    // The buffer being copied is `dev_idxs_out` and the destination is `dst`:
+    // both hold **indices**, which are `uint32` at every value dtype — the
+    // kernels are instantiated `…_uint32_…` throughout. Selecting the copy
+    // kernel from the *value* dtype picked the element width of the wrong
+    // operand, so at f16/bf16 a u32 index buffer was copied 2 bytes at a time
+    // and at u8 1 byte at a time. It is correct only where the value dtype
+    // happens to be 4 bytes wide.
+    let copy_kernel = crate::copy2d::U32;
     crate::call_copy2d(
         device,
         encoder,

@@ -229,22 +229,78 @@ impl crate::CustomOp1 for ArgSort {
             .with_size_for(el, DType::U32)
             .with_label("asort")
             .build()?;
-        let mut ncols_pad = 1;
-        while ncols_pad < ncols {
-            ncols_pad *= 2;
+
+        // `call_arg_sort` dispatches ONE threadgroup of `ncols_pad` threads, and
+        // a Metal threadgroup holds at most 1024. Above that the dispatch is
+        // invalid and the kernel returns zeros -- silently, because an all-zeros
+        // result satisfies the naive "is each element >= the next" predicate
+        // (lloom issue #346, `DESIGN.md` §15.1 #1).
+        //
+        // `call_mlx_arg_sort` is the multi-block path and has no such limit, but
+        // it is not a drop-in replacement: it sorts ASCENDING ONLY (`CompareOp`
+        // is `LessThan` and no instantiation varies it) and covers six dtypes
+        // where this entry point names nine. So it is used exactly where it is
+        // applicable and the single-threadgroup path is kept for the rest --
+        // where, below the limit, it is correct.
+        let mlx_dtype = match storage.dtype() {
+            DType::BF16 => Some(candle_metal_kernels::DType::BF16),
+            DType::F16 => Some(candle_metal_kernels::DType::F16),
+            DType::F32 => Some(candle_metal_kernels::DType::F32),
+            DType::U8 => Some(candle_metal_kernels::DType::U8),
+            DType::U32 => Some(candle_metal_kernels::DType::U32),
+            DType::I64 => Some(candle_metal_kernels::DType::I64),
+            // F64, I16 and I32 have no `mlx_sort` instantiation.
+            _ => None,
+        };
+        match mlx_dtype {
+            // The ascending arm the multi-block path can serve. Taken at every
+            // width rather than only above 1024, so one path is exercised by the
+            // whole test suite instead of a wide arm nothing reaches.
+            Some(dtype) if self.asc => {
+                candle_metal_kernels::call_mlx_arg_sort(
+                    device.metal_device(),
+                    &command_encoder,
+                    kernels,
+                    dtype,
+                    nrows,
+                    ncols,
+                    src,
+                    &dst,
+                )
+                .map_err(crate::Error::wrap)?;
+            }
+            // Descending, or a dtype the multi-block path does not carry.
+            // Refuse above the threadgroup limit rather than returning zeros:
+            // a loud failure is what `DESIGN.md` §9.1a and §6.2b ask for where a
+            // silent wrong answer is the alternative.
+            _ => {
+                let mut ncols_pad = 1;
+                while ncols_pad < ncols {
+                    ncols_pad *= 2;
+                }
+                if ncols_pad > MAX_THREADS_PER_THREADGROUP {
+                    crate::bail!(
+                        "arg_sort on Metal: {ncols} columns needs {ncols_pad} threads, over the \
+                         {MAX_THREADS_PER_THREADGROUP} threadgroup limit. The multi-block path \
+                         handles this width but sorts ascending only and does not carry {:?}; \
+                         sort ascending and reverse, or move this tensor to the CPU.",
+                        storage.dtype()
+                    )
+                }
+                candle_metal_kernels::call_arg_sort(
+                    device.metal_device(),
+                    &command_encoder,
+                    kernels,
+                    name,
+                    nrows,
+                    ncols,
+                    ncols_pad,
+                    src,
+                    &dst,
+                )
+                .map_err(crate::Error::wrap)?;
+            }
         }
-        candle_metal_kernels::call_arg_sort(
-            device.metal_device(),
-            &command_encoder,
-            kernels,
-            name,
-            nrows,
-            ncols,
-            ncols_pad,
-            src,
-            &dst,
-        )
-        .map_err(crate::Error::wrap)?;
         let dst = crate::MetalStorage::new(dst, device.clone(), el, DType::U32);
         Ok((dst, layout.shape().clone()))
     }
@@ -258,6 +314,12 @@ fn next_power_of_2(x: usize) -> usize {
     }
     n
 }
+
+/// A Metal threadgroup holds at most 1024 threads (lloom `DESIGN.md` §3.1), and
+/// `call_arg_sort` asks for one thread per padded column. Above this the
+/// dispatch is invalid.
+#[cfg(feature = "metal")]
+const MAX_THREADS_PER_THREADGROUP: usize = 1024;
 
 impl Tensor {
     /// Returns the indices that sort the tensor along the last dimension.
