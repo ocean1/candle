@@ -432,20 +432,49 @@ struct SafeTensors_<'a>(SafeTensors<'a>);
 ///
 /// A checkpoint is mapped and then swept once, so the kernel's default
 /// demand-faulting handles every page individually. `WillNeed` lets it fault
-/// the range in one call instead. Selected by `CANDLE_MMAP_ADVICE`; the
-/// default is `None`, which is byte-for-byte the behaviour that shipped before
-/// this type existed.
+/// the range in one call instead. Selected by `CANDLE_MMAP_ADVICE`.
 ///
 /// Advice is exactly that -- the kernel may ignore it, and on this platform
-/// `Sequential` is measured to be a no-op. The variants are kept separate
-/// anyway so that "advice we asked for" stays distinguishable from "advice
-/// that did anything", which is a question a caller has to be able to ask.
+/// `Sequential` is a no-op when memory is plentiful. The variants are kept
+/// separate anyway so that "advice we asked for" stays distinguishable from
+/// "advice that did anything", which is a question a caller has to be able to
+/// ask.
+///
+/// # Why `WillNeed` is the default
+///
+/// It was `None` when this type was introduced, because the change that
+/// measured the effect deliberately did not also flip the default it was
+/// measuring. The flip is its own argued decision, taken on its own evidence.
+///
+/// **Cold** start pays for demand-faulting the 5.394 GB weight set one page at
+/// a time: 381 291 faults moving bytes at 0.90 GB/s, against `read(2)`'s 6.82
+/// on the same cold cache, so the load is fault-bound rather than
+/// storage-bound. One `madvise` call replaces them with a single batched
+/// fault-in, taking cold-process time-to-first-token from 7.40 s to 3.43 s.
+/// Measured across free memory from 45 GB down to 1.06 GB -- a 40x span, and
+/// well below the 5.394 GB the call asks for -- the saving is -49 % to -53 %,
+/// every confidence interval excluding zero and every null control spanning
+/// it. It does not fade as memory gets scarce, because the baseline degrades
+/// too: both arms pay for a scarce frame pool, so the ratio survives.
+///
+/// **Warm** start pays instead, and this is the cost the default owns. On an
+/// already-resident file `WillNeed` costs +216 ms (+15.21 %), because the call
+/// is synchronous here and still walks the range when there is nothing to
+/// fault. `Sequential` is a null in that case, which is what localises the
+/// cost to the range walk rather than to `madvise` itself.
+///
+/// So the trade is 216 ms per warm start against 3.6-4.9 s per cold one, a
+/// 17-23x ratio: a process would have to start warm more than 93.9 % of the
+/// time for `None` to win. It is not free, and a caller for whom that
+/// arithmetic comes out differently can set `CANDLE_MMAP_ADVICE=none`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MmapAdvice {
-    /// No `madvise` call at all. The default, and what shipped before.
-    #[default]
+    /// No `madvise` call at all. What shipped before this type existed, and
+    /// still reachable with `CANDLE_MMAP_ADVICE=none`.
     None,
-    /// `MADV_WILLNEED` over the whole mapping.
+    /// `MADV_WILLNEED` over the whole mapping. The default -- see the type
+    /// docs for the evidence, and for the warm cost it carries.
+    #[default]
     WillNeed,
     /// `MADV_SEQUENTIAL` over the whole mapping.
     Sequential,
@@ -458,9 +487,16 @@ impl MmapAdvice {
     /// the default: a mis-spelled arm that quietly runs the baseline reports a
     /// passing measurement for the path it was supposed to change, which is
     /// the vacuous-arm failure this project has already paid for once.
+    ///
+    /// Unset and empty are deliberately *not* the same as `none`. Unset means
+    /// "no opinion", so it takes `Self::default()` and moves with it; the
+    /// empty string is what a shell supplies for `CANDLE_MMAP_ADVICE=`, which
+    /// reads as an explicit request to disable and so stays pinned to `None`.
+    /// Collapsing the two would make the default unreachable-by-omission the
+    /// moment it changed.
     pub fn from_env() -> Result<Self> {
         match std::env::var("CANDLE_MMAP_ADVICE") {
-            Err(_) => Ok(Self::None),
+            Err(_) => Ok(Self::default()),
             Ok(v) => match v.to_ascii_lowercase().as_str() {
                 "" | "none" => Ok(Self::None),
                 "willneed" | "will_need" => Ok(Self::WillNeed),
@@ -751,10 +787,27 @@ mod tests {
     /// concurrently with each other and are one test rather than several.
     #[test]
     fn mmap_advice_parses_every_arm_and_rejects_the_rest() {
-        // The default is what shipped: no variable, no advice, no call.
+        // The default is `WillNeed`, and an unset variable takes it. Pinned
+        // here because the default is the whole subject of the decision that
+        // set it: a silent revert to `None` would restore a 7.40 s cold TTFT
+        // against this arm's 3.43 s, and no other test would notice.
         std::env::remove_var("CANDLE_MMAP_ADVICE");
+        assert_eq!(MmapAdvice::default(), MmapAdvice::WillNeed);
+        assert_eq!(MmapAdvice::from_env().unwrap(), MmapAdvice::WillNeed);
+
+        // Unset and empty must NOT agree, which is the asymmetry `from_env`
+        // documents: unset is "no opinion" and follows the default, while
+        // `CANDLE_MMAP_ADVICE=` is an explicit request to disable. If these
+        // ever collapse, opting out via the empty string silently stops
+        // working -- and so does reaching the default by omission.
+        std::env::set_var("CANDLE_MMAP_ADVICE", "");
         assert_eq!(MmapAdvice::from_env().unwrap(), MmapAdvice::None);
-        assert_eq!(MmapAdvice::default(), MmapAdvice::None);
+        std::env::remove_var("CANDLE_MMAP_ADVICE");
+        assert_ne!(
+            MmapAdvice::from_env().unwrap(),
+            MmapAdvice::None,
+            "unset must follow the default, not alias the empty string"
+        );
 
         // Every arm the axis declares must be reachable from the environment,
         // or an arm exists that no measurement can select.
@@ -801,15 +854,33 @@ mod tests {
         let path = "test_advice.safetensors";
         std::fs::write(path, bytes).unwrap();
 
-        // Default: no call is made, so the call counter must not move. This is
-        // the arm that proves the counter is not simply always incrementing.
-        std::env::remove_var("CANDLE_MMAP_ADVICE");
+        // `None`: no call is made, so the call counter must not move. This is
+        // the arm that proves the counter is not simply always incrementing,
+        // which is the property this test exists for.
+        //
+        // It is selected EXPLICITLY rather than by unsetting the variable.
+        // Since the default became `WillNeed`, an unset variable takes the
+        // advised arm -- so unsetting here would test that `WillNeed` makes no
+        // call, which is false, and the no-call arm would be left with no
+        // coverage at all.
+        std::env::set_var("CANDLE_MMAP_ADVICE", "none");
         let before = MMAP_ADVICE_CALLS.load(Ordering::Relaxed);
         let _ = unsafe { MmapedSafetensors::new(path) }.unwrap();
         assert_eq!(
             MMAP_ADVICE_CALLS.load(Ordering::Relaxed),
             before,
-            "the default arm made an madvise call"
+            "the `none` arm made an madvise call"
+        );
+
+        // And the DEFAULT arm -- unset -- does make one, which is the flip
+        // this test would otherwise be silent about.
+        std::env::remove_var("CANDLE_MMAP_ADVICE");
+        let before = MMAP_ADVICE_CALLS.load(Ordering::Relaxed);
+        let _ = unsafe { MmapedSafetensors::new(path) }.unwrap();
+        assert_eq!(
+            MMAP_ADVICE_CALLS.load(Ordering::Relaxed),
+            before + 1,
+            "the default arm did not make an madvise call"
         );
 
         // Advised: the call counter moves, once per mapping.
