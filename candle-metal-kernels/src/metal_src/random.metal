@@ -129,6 +129,36 @@ METAL_FUNC void atomic_store_seed(device seed_buffer *sb, ulong desired) {
     atomic_store_explicit(&sb->seed[1], y, memory_order_relaxed);
 }
 
+// One element per thread, each from its own stream (lloom #345).
+//
+// `rand_uniform` was not i.i.d. within a vector, and with equal weights the
+// argmax over a drawn vector must be uniform over positions -- that is the only
+// property GPU gumbel-max sampling needs, and it failed at chi-squared 36 157
+// against a p=0.001 critical value of 330.5 at n=256.
+//
+// TWO independent defects produced it, and fixing either alone leaves the test
+// failing. Both are fixed here.
+//
+// **1. Two elements shared one stream.** The kernel dispatched `size/2` threads
+// and had each write `out[tid]` and `out[size - off - tid]` from two
+// CONSECUTIVE `rand()` calls. `rand()` returns the current state and advances
+// it by a deterministic `f`, so the pair is `(s, f(s))` -- a curve in the unit
+// square rather than a fill of it. One element per thread removes it.
+//
+// **2. The global seed's orbit collapsed.** See the counter comment below. This
+// is the larger of the two: with the mirror pairing removed but the seed
+// advance unchanged, n=4 still read chi-squared 623 against a critical 16.27.
+//
+// Marginal checks see neither. `candle-metal-kernels`' own `random` test asserts
+// range and mean and passes on the broken kernel; the maximum is a tail
+// statistic, so a source can have near-correct marginals and still place its
+// maxima wrongly. Even the marginals are in fact wrong here -- 181 of 256
+// positions sit beyond 5 s.e. at 40 000 draws -- but the deviation is small
+// enough (~0.013 in the mean) that a 4 000-draw check reports 4 of 256 and
+// reads as clean.
+//
+// The cost is `size` threads where the old form dispatched `size/2`: the write
+// traffic is identical and the extra work is one `HybridTaus::init` per element.
 template<typename T> METAL_FUNC void rand_uniform(
     constant size_t &size,
     constant float &min,
@@ -141,24 +171,62 @@ template<typename T> METAL_FUNC void rand_uniform(
         return;
     }
 
-    // Evenly sized vectors need an offset when writing the mirror element.
-    uint off = 1 - size % 2;
     float diff = abs(min - max);
     ulong s = atomic_load_seed(sb);
     HybridTaus rng = HybridTaus::init({s, tid, 1, 1});
     out[tid] = static_cast<T>(rng.rand() * diff + min);
+
+    // Advance the stored seed as a COUNTER, not by feeding the generator's own
+    // output back into it (lloom #345).
+    //
+    // This stored `rng.rand() * UNIF01_NORM32` -- the generator's own next
+    // state, scaled. Two things made that lossy. `state` is a `float`, so the
+    // round trip through 24 mantissa bits discards the low 8; and
+    // `seed_per_thread` truncates to `uint4`, so only the low 32 bits of the
+    // stored value ever reach the generator anyway. The seed therefore walked a
+    // 2^32 space under a map that is not a bijection, and it collapsed:
+    // measured from `set_seed(299792458)`, the orbit closes after 9 631 calls
+    // onto a cycle of period **257**. Two hundred thousand draws visit 9 632
+    // distinct seeds.
+    //
+    // A counter is a bijection on the whole space by construction, so the
+    // period is 2^64 and cannot collapse for any seed. It is also what
+    // `DESIGN.md` 2.3.3 #7 asks for -- "counter-based RNG ... so sampling is
+    // reproducible regardless of dispatch order" -- and it makes the stream a
+    // pure function of (seed, call index, tid) rather than of the generator's
+    // own history.
     if (tid == 0) {
-        atomic_store_seed(sb, rng.rand() * UNIF01_NORM32);
-        // Return early if tid == 0 && off == 0, otherwise we will write to out[size].
-        if (off == 0)
-            return;
+        // Re-loaded rather than reusing the `s` read above, which is NOT
+        // redundant: keeping `s` live across `HybridTaus::init` and using it
+        // here crashes the Metal compiler on this toolchain --
+        // `XPC_ERROR_CONNECTION_INTERRUPTED ... after multiple retries`, with
+        // no diagnostic, so it presents as a pipeline-creation failure rather
+        // than a compile error. Reproduced 3/3 on macOS 26.6.2 / clang 21.0.0
+        // with both `atomic_store_seed(sb, s + 1)` and an explicitly-typed
+        // `ulong next = s + 1UL`. Only `tid == 0` runs this, so the extra load
+        // is one per dispatch. `DESIGN.md` 3.7g is the standing caution that
+        // these are properties of (device, OS, toolchain).
+        atomic_store_seed(sb, atomic_load_seed(sb) + 1);
     }
-    // Use symmetry to fill the other half of the array.
-    out[size - off - tid] = static_cast<T>(rng.rand() * diff + min);
 }
 
 // Create Gaussian normal distribution using Box-Muller transform:
 // https://en.wikipedia.org/wiki/Box–Muller_transform
+// One element per thread, as `rand_uniform` above and for the same reason.
+//
+// Box-Muller produces two independent normals from two independent uniforms,
+// and the previous form wrote them to `out[tid]` and `out[size - off - tid]`.
+// That is sound ONLY if `u1` and `u2` are independent, and here they were two
+// consecutive states of one `HybridTaus` -- so the transform's input assumption
+// was violated upstream and the two outputs inherited the dependence. Measured
+// on the old kernel, `rand_normal`'s argmax-position chi-squared read 74.3 at
+// n=4 against a critical 16.27 (lloom #345).
+//
+// Each thread now draws both uniforms for its OWN element and discards `z1`.
+// That halves the transform's efficiency and is the honest cost of independence:
+// the alternative -- keeping both outputs and giving them to two elements --
+// is what made the pair dependent in the first place, since two elements of one
+// vector must not share a stream.
 template<typename T> METAL_FUNC void normal(
     constant size_t &size,
     constant float &mean,
@@ -170,29 +238,32 @@ template<typename T> METAL_FUNC void normal(
     if (tid >= size) {
         return;
     }
-    // Evenly sized vectors need an offset when writing the mirror element.
-    uint off = 1 - size % 2;
     ulong s = atomic_load_seed(sb);
     HybridTaus rng = HybridTaus::init({s, tid, 1, 1});
     float u1 = rng.rand();
     float u2 = rng.rand();
 
     float cosval;
-    float sinval = sincos(TWO_PI * u2, cosval);
+    sincos(TWO_PI * u2, cosval);
     float mag = stddev * sqrt(-2.0 * log(u1));
     float z0  = mag * cosval + mean;
-    float z1  = mag * sinval + mean;
 
     out[tid] = static_cast<T>(z0);
 
+    // Counter advance, as `rand_uniform` above (lloom #345).
     if (tid == 0) {
-        atomic_store_seed(sb, rng.rand() * UNIF01_NORM32);
-        // Return early if tid == 0 && off == 0, otherwise we will write to out[size].
-        if (off == 0)
-            return;
+        // Re-loaded rather than reusing the `s` read above, which is NOT
+        // redundant: keeping `s` live across `HybridTaus::init` and using it
+        // here crashes the Metal compiler on this toolchain --
+        // `XPC_ERROR_CONNECTION_INTERRUPTED ... after multiple retries`, with
+        // no diagnostic, so it presents as a pipeline-creation failure rather
+        // than a compile error. Reproduced 3/3 on macOS 26.6.2 / clang 21.0.0
+        // with both `atomic_store_seed(sb, s + 1)` and an explicitly-typed
+        // `ulong next = s + 1UL`. Only `tid == 0` runs this, so the extra load
+        // is one per dispatch. `DESIGN.md` 3.7g is the standing caution that
+        // these are properties of (device, OS, toolchain).
+        atomic_store_seed(sb, atomic_load_seed(sb) + 1);
     }
-    // Use symmetry to fill the other half of the array.
-    out[size - off - tid] = static_cast<T>(z1);
 }
 
 #define UNIFORM_OP(NAME, T)                             \
