@@ -3,6 +3,8 @@ pub mod bs1770;
 pub mod chat_template;
 pub mod coco_classes;
 pub mod imagenet;
+/// Model setup shared by the LFM2 harnesses (`DESIGN.md` §14.5 step 2).
+pub mod lfm2_setup;
 pub mod token_output_stream;
 pub mod wav;
 use candle::utils::{cuda_is_available, metal_is_available};

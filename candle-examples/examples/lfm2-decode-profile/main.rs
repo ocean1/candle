@@ -45,16 +45,16 @@ extern crate accelerate_src;
 
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
+use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
 use candle_nn::ops::FlashScratchSizing;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::lfm2::{
-    AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Lfm2Config, Model,
+    AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model,
 };
 use clap::Parser;
-use serde_json::Value;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 /// The serialized run record (lloom issue #171).
@@ -981,6 +981,68 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     batch_check: bool,
 
+    /// Speculative window width `K` — `DESIGN.md` §10.2a's `advance`/`resolve`.
+    ///
+    /// **This is #284: the port of `lfm2-determinism`'s verify loop (#89) onto
+    /// the harness that has GPU-busy timing, `--batch` and the run store.** The
+    /// direction is §14.5 step 1's, and the reason is that
+    /// **GPU-busy per accepted token has never been produced for any
+    /// speculative run**: #89's cost curve (K=2 at 1.245x, K=8 at 0.587x) is
+    /// wall-clock `elapsed_ms` from `lfm2-determinism`, a harness whose own
+    /// documentation says that field *"is not comparable between arms"*. So the
+    /// most-cited speculative figures in this project rest on a quantity their
+    /// own harness disclaims, and this flag is what makes the honest one
+    /// takeable.
+    ///
+    /// # The denominator, which is why this is not just a flag
+    ///
+    /// §10.2i states the obstacle exactly: the profiler's loop *"emits one token
+    /// per step and times it, where a verify pass consumes K and emits between 1
+    /// and K, so `wall_ms_per_token` needs a denominator that does not exist
+    /// there."* It exists now — `spec_accepted` — and the per-token fields are
+    /// computed over **accepted tokens** rather than over steps whenever a
+    /// window ran. `wall_ms_per_token` keeps its name and its meaning at `K = 0`
+    /// (where a step *is* a token), so every recorded row stays comparable.
+    ///
+    /// `0` is the default and disables the mechanism entirely — no `advance`,
+    /// no `forward_all`, the ordinary decode loop — so an unflagged run is the
+    /// path every recorded figure belongs to.
+    ///
+    /// Requires `--conv-state rotating:<K'>` with `K' >= K` and
+    /// `--kv-append in-place`; `Cache::advance` refuses everything else before
+    /// any state is written (§10.2h).
+    #[arg(long, default_value_t = 0)]
+    speculate: usize,
+
+    /// Which proposer drives `--speculate`: `oracle` or `wrong:<N>`.
+    ///
+    /// Both are sequences rather than models, and that is the point (#89):
+    /// **greedy speculation is output-identical by construction**, so the
+    /// mechanism can be measured without a draft model at all. The proposer
+    /// decides only *how many* proposals are accepted, never *what* is emitted.
+    ///
+    /// * `oracle` proposes the token the target would have emitted, so every
+    ///   position is accepted and the window is the best case.
+    /// * `wrong:<N>` corrupts every `N`-th proposal, so a rejection happens on a
+    ///   schedule and the rollback is exercised on most windows. This is the
+    ///   **engagement proof** §2.4 requires: an arm that cannot be shown to have
+    ///   rejected anything has not exercised `resolve`, and #89 held the output
+    ///   invariant under 40 and 80 rejections with the stream unmoved.
+    #[arg(long, default_value = "oracle")]
+    spec_proposer: String,
+
+    /// Assert every row accepts the same prefix length at `--batch N`.
+    ///
+    /// **The per-row accept test, and the gate that catches a leak** (#284,
+    /// #252). See the acceptance loop for why uniformity is a *theorem* here
+    /// rather than an assumption, and therefore why a violation is a defect
+    /// rather than a tuning artifact.
+    ///
+    /// On by default, for `--batch-check`'s reason: a gate that has to be
+    /// remembered is a gate that is not run (§11.3j).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    spec_accept_check: bool,
+
     /// Install `DESIGN.md` §9.5's admission check at the given fraction of
     /// `recommendedMaxWorkingSetSize`.
     ///
@@ -1247,120 +1309,6 @@ struct Args {
     run_telemetry_jsonl: Option<PathBuf>,
 }
 
-/// Normalize an LFM2.5-VL `config.json` into candle's schema.
-///
-/// Same normalization as the `lfm2-determinism` probe, and for the same reason:
-/// the harness has to measure the configuration that actually runs. `rope_theta`
-/// hides in `rope_parameters` and candle would default it to 10000; candle
-/// recomputes `intermediate_size` as 8192 while the FFN weights are
-/// `[10752, 2048]`. Both change how much memory a token moves, so both matter to
-/// a bandwidth argument.
-fn parse_config(raw: &str) -> Result<Config> {
-    let root: Value = serde_json::from_str(raw).context("parsing config.json")?;
-    let text = root.get("text_config").unwrap_or(&root);
-    let mut obj = text
-        .as_object()
-        .context("expected a JSON object for the model config")?
-        .clone();
-
-    if !obj.contains_key("rope_theta") {
-        if let Some(theta) = obj
-            .get("rope_parameters")
-            .and_then(|p| p.get("rope_theta"))
-            .cloned()
-        {
-            obj.insert("rope_theta".into(), theta);
-        }
-    }
-
-    if !obj.contains_key("tie_embedding") {
-        if let Some(v) = obj.get("tie_word_embeddings").cloned() {
-            obj.insert("tie_embedding".into(), v);
-        }
-    }
-
-    for key in ["bos_token_id", "eos_token_id"] {
-        if !obj.contains_key(key) {
-            if let Some(v) = root.get(key).cloned() {
-                obj.insert(key.into(), v);
-            }
-        }
-    }
-
-    let normalized = Value::Object(obj);
-    let base: Lfm2Config = serde_json::from_value(normalized.clone())
-        .context("config.json does not match candle's LFM2 config schema")?;
-    let mut config = base.into_config(false);
-
-    if let Some(stated) = normalized
-        .get("intermediate_size")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
-    {
-        config.intermediate_size = stated;
-    }
-
-    Ok(config)
-}
-
-fn tensor_names(path: &Path) -> Result<Vec<String>> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut len_bytes = [0u8; 8];
-    file.read_exact(&mut len_bytes)?;
-    let header_len = u64::from_le_bytes(len_bytes) as usize;
-    anyhow::ensure!(
-        header_len > 0 && header_len < 100 * 1024 * 1024,
-        "implausible safetensors header length {header_len}"
-    );
-
-    let mut header = vec![0u8; header_len];
-    file.read_exact(&mut header)?;
-    let parsed: Value = serde_json::from_slice(&header)?;
-    Ok(parsed
-        .as_object()
-        .context("safetensors header is not a JSON object")?
-        .keys()
-        .filter(|k| *k != "__metadata__")
-        .cloned()
-        .collect())
-}
-
-fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let index = dir.join("model.safetensors.index.json");
-    if !index.exists() {
-        return Ok(vec![dir.join("model.safetensors")]);
-    }
-    let raw = std::fs::read_to_string(&index)?;
-    let parsed: Value = serde_json::from_str(&raw)?;
-    let map = parsed
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .context("safetensors index has no weight_map")?;
-    let mut names: Vec<String> = map
-        .values()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-    names.sort();
-    names.dedup();
-    Ok(names.into_iter().map(|n| dir.join(n)).collect())
-}
-
-fn default_model_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let base =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--LiquidAI--LFM2.5-VL-3B/snapshots");
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&base)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.join("config.json").exists())
-        .collect();
-    entries.sort();
-    entries.pop()
-}
-
 /// Bytes of language-model weights, computed from the loaded config rather than
 /// quoted from `DESIGN.md` §5.5.
 ///
@@ -1459,6 +1407,420 @@ fn flash_scratch_ask_bytes(
     };
     let head_dim = config.hidden_size / config.num_attention_heads;
     config.num_attention_heads * chunks * (head_dim + 2) * 4
+}
+
+/// What a `--speculate` run accumulated, and the denominator the per-token
+/// fields are computed over.
+///
+/// **`accepted` is the denominator §10.2i says does not exist here.** That
+/// section states the obstacle exactly: the profiler's loop *"emits one token
+/// per step and times it, where a verify pass consumes K and emits between 1 and
+/// K, so `wall_ms_per_token` needs a denominator that does not exist there."*
+/// This is it. A window's wall time is divided by the tokens it *kept*, not by
+/// the positions it *proposed* — which is what makes the figure GPU-busy **per
+/// accepted token**, the quantity #273's prediction is stated in and the one
+/// §5.6-style byte accounting cannot substitute for.
+///
+/// `proposed` is carried beside it rather than derived, because the two answer
+/// different questions: `accepted / proposed` is the acceptance rate a proposer
+/// is judged on, and `accepted` alone is what a token cost is divided by.
+#[derive(Clone, Copy, Debug, Default)]
+struct SpecCounters {
+    /// Verify passes run. **Zero after a `--speculate` run is a vacuous
+    /// instrument** (§2.4, after #69's determinism run reported a passing digest
+    /// for a path the flag never reached), so it is asserted rather than printed.
+    windows: usize,
+    /// Positions proposed across every window — the denominator of the
+    /// acceptance rate.
+    proposed: usize,
+    /// Positions whose state survived `resolve`. **The per-token denominator.**
+    accepted: usize,
+    /// Proposals the `wrong:<N>` arm deliberately corrupted. The engagement
+    /// proof for that arm: an arm that cannot be shown to have rejected anything
+    /// has not exercised the rollback at all (#89).
+    corrupted: usize,
+    /// Steps at which two batch rows accepted different prefix lengths, with the
+    /// row and the two lengths. `None` is the expected result and the theorem
+    /// below says why.
+    accept_divergence: Option<(usize, usize, usize, usize)>,
+}
+
+/// Record the token stream this configuration emits **without** speculation.
+///
+/// Runs an ordinary decode on a **throwaway cache** and returns row 0's tokens.
+/// Untimed, outside every measurement window, and dropped before the timed cache
+/// is touched — so the timed pass starts from the same state an unflagged run
+/// would, rather than continuing one.
+///
+/// # Why a whole decode rather than a cheaper oracle
+///
+/// Because the proposer must be *the target's own output*, and nothing cheaper
+/// is. That is the property #89 rests on: **greedy speculation is
+/// output-identical by construction**, so a proposer that proposes what the
+/// target would emit makes acceptance total and turns the mechanism's cost into
+/// the only variable. A proposer drawn from anywhere else measures the
+/// proposer's quality confounded with the mechanism's cost, which is the thing
+/// #284 exists to separate.
+///
+/// It costs one untimed decode of `n` tokens per run. That is real and it is
+/// stated rather than hidden: a `--speculate` run is roughly twice the wall time
+/// of an unflagged one, all of the excess outside the window.
+#[allow(clippy::too_many_arguments)]
+fn build_oracle_sequence(
+    model: &Model,
+    config: &Config,
+    dtype: DType,
+    device: &Device,
+    kv_capacity: usize,
+    prompt_ids: &[u32],
+    batch: usize,
+    n: usize,
+    seed: u64,
+    temperature: f64,
+    top_p: f64,
+) -> Result<Vec<u32>> {
+    // Its own cache, and its own `Cache::new_with` — so **admission runs on this
+    // one too** (§9.5l). A configuration whose predicted peak exceeds the budget
+    // is refused before the oracle is paid for rather than after.
+    let mut cache = Cache::new_with(true, dtype, config, device, kv_capacity)
+        .context("allocating the oracle's KV cache")?;
+    let sampling = if temperature <= 0. {
+        Sampling::ArgMax
+    } else {
+        Sampling::TopP {
+            p: top_p,
+            temperature,
+        }
+    };
+    // A fresh processor at the same seed, so the oracle samples exactly as the
+    // timed run will. Sharing one would advance its RNG state and make the timed
+    // run's sampling depend on how long the oracle ran (§2.3.3 #7's shape, in the
+    // harness rather than in the model).
+    let mut logits_processor = LogitsProcessor::from_sampling(seed, sampling);
+
+    let prefill_ids: Vec<u32> = prompt_ids.repeat(batch);
+    let input = Tensor::new(prefill_ids.as_slice(), device)?.reshape((batch, prompt_ids.len()))?;
+    let mut logits = model
+        .forward(&input, 0, &mut cache)
+        .context("oracle prefill")?;
+    let mut kv_len = prompt_ids.len();
+
+    let mut tokens: Vec<u32> = Vec::with_capacity(n);
+    let mut rows: Vec<u32> = vec![0; batch];
+    while tokens.len() < n {
+        for (r, slot) in rows.iter_mut().enumerate() {
+            let row = logits.narrow(0, r, 1)?.squeeze(0)?;
+            *slot = logits_processor.sample(&row).context("oracle sampling")?;
+        }
+        tokens.push(rows[0]);
+        let input = Tensor::new(rows.as_slice(), device)?.reshape((batch, 1))?;
+        logits = model
+            .forward(&input, kv_len, &mut cache)
+            .context("oracle decode")?;
+        kv_len += 1;
+    }
+    // The cache is dropped here, before the caller's timed one is used.
+    Ok(tokens)
+}
+
+/// Everything the speculative loop touches, bundled so the signature does not
+/// grow past what a reader can hold.
+struct SpecRun<'a> {
+    k: usize,
+    proposer: &'a str,
+    accept_check: bool,
+    n: usize,
+    batch: usize,
+    profiling: bool,
+    oracle: &'a [u32],
+    model: &'a Model,
+    device: &'a Device,
+    logits_processor: &'a mut LogitsProcessor,
+    cache: &'a mut Cache,
+    logits: &'a mut Tensor,
+    kv_len: &'a mut usize,
+    tokens: &'a mut Vec<u32>,
+    batch_rows: &'a mut Vec<u32>,
+    steps: &'a mut Vec<(f64, f64, u64)>,
+    step_stamps: &'a mut Vec<(u64, usize)>,
+    eos_ids: &'a [u32],
+    hit_eos: &'a mut bool,
+    spec: &'a mut SpecCounters,
+    batch_divergence: &'a mut Option<(usize, usize, u32, u32)>,
+    last_token_kernels: &'a mut Vec<(String, u64)>,
+}
+
+/// The verify loop: propose K, verify in one pass, accept a prefix, roll back
+/// K−n — `DESIGN.md` §10.2a's contract, ported from `lfm2-determinism` (#89)
+/// onto the harness that times it (#284, §14.5 step 1).
+///
+/// # The window is what is timed, and that is the port's whole point
+///
+/// The decode loop below times one **token**; this times one **window**, then
+/// divides by the tokens the window kept. §10.2i names that denominator as the
+/// thing the profiler lacked, and `SpecCounters::accepted` is it. A window that
+/// accepts 1 of 8 costs what it costs and produced one token, which is exactly
+/// the arithmetic #89's `elapsed_ms` could not do — that harness's own docs say
+/// the field *"is not comparable between arms"*, so the most-cited speculative
+/// figures in this project (K=2's 1.245×, K=8's 0.587×) rest on a quantity their
+/// own harness disclaims.
+fn run_speculative_decode(r: SpecRun<'_>) -> Result<()> {
+    let SpecRun {
+        k,
+        proposer,
+        accept_check,
+        n,
+        batch,
+        profiling,
+        oracle,
+        model,
+        device,
+        logits_processor,
+        cache,
+        logits,
+        kv_len,
+        tokens,
+        batch_rows,
+        steps,
+        step_stamps,
+        eos_ids,
+        hit_eos,
+        spec,
+        batch_divergence,
+        last_token_kernels,
+    } = r;
+
+    // `wrong:<N>` corrupts every `N`-th proposal. Parsed here rather than at the
+    // flag so the error names the flag and the value together.
+    let wrong_every: Option<usize> = match proposer {
+        "oracle" => None,
+        s => match s.strip_prefix("wrong:") {
+            Some(rest) => {
+                let every: usize = rest.parse().map_err(|_| {
+                    anyhow::anyhow!("--spec-proposer wrong:<N> needs an integer, got {rest:?}")
+                })?;
+                anyhow::ensure!(every > 0, "--spec-proposer wrong:0 would corrupt nothing");
+                Some(every)
+            }
+            None => {
+                anyhow::bail!("--spec-proposer must be `oracle` or `wrong:<N>`, got {proposer:?}")
+            }
+        },
+    };
+    let vocab_size = logits.dim(logits.rank() - 1)? as u32;
+
+    // **A position predicts the token that FOLLOWS the one it reads**, and the
+    // resulting off-by-one is the failure this loop is shaped to avoid. #89
+    // records what getting it wrong looks like, and it is not a crash: comparing
+    // position `j` against `window[j]` rather than against the proposal for the
+    // step it predicts produced a full, stable token stream with an acceptance
+    // rate of 0.26 **under a perfect oracle** — which reads as a bad proposer.
+    // That is why the oracle arm's acceptance is asserted rather than printed.
+    while tokens.len() < n {
+        let done = tokens.len();
+        if done >= oracle.len() {
+            break;
+        }
+
+        // Step `done`'s token, from the logits already in hand. It costs
+        // nothing — the pass that produced it has already been paid for — and
+        // feeding it back is what conditions the window on it.
+        for (row, slot) in batch_rows.iter_mut().enumerate() {
+            let l = logits.narrow(0, row, 1)?.squeeze(0)?;
+            *slot = logits_processor.sample(&l).context("sampling")?;
+        }
+        let emitted = batch_rows[0];
+        if accept_check && batch > 1 && batch_divergence.is_none() {
+            if let Some((row, &t)) = batch_rows.iter().enumerate().find(|(_, &t)| t != emitted) {
+                *batch_divergence = Some((done, row, emitted, t));
+            }
+        }
+        if eos_ids.contains(&emitted) {
+            *hit_eos = true;
+        }
+        tokens.push(emitted);
+
+        // **The emitted stream and the oracle must agree, and that is the
+        // mechanism's own guarantee rather than a coincidence.** Under greedy
+        // decoding every emitted token is the target's argmax, which is what
+        // non-speculative decoding emits, which is what the oracle recorded. A
+        // rejection changes *which proposals are wasted*, never *what is
+        // emitted*. So a divergence here is the verifier failing — not a
+        // rejected proposal — and the run stops rather than continuing against
+        // proposals for positions the model never reached.
+        anyhow::ensure!(
+            emitted == oracle[done],
+            "speculative decoding diverged from the non-speculative sequence at step \
+             {done}: emitted {emitted}, oracle {}. Under greedy decoding these are \
+             identical by construction (#89), so this is a defect in the verifier and \
+             not a rejected proposal.",
+            oracle[done]
+        );
+
+        if tokens.len() >= n || tokens.len() >= oracle.len() {
+            break;
+        }
+
+        // The proposals for the steps after it, clipped to the oracle.
+        let want = k.min(oracle.len() - tokens.len());
+        let mut props: Vec<u32> = oracle[done + 1..done + 1 + want].to_vec();
+        if let Some(every) = wrong_every {
+            for (j, p) in props.iter_mut().enumerate() {
+                if (done + 1 + j) % every == every - 1 {
+                    *p = p.wrapping_add(1) % vocab_size;
+                    spec.corrupted += 1;
+                }
+            }
+        }
+        let width = props.len();
+        if width == 0 {
+            break;
+        }
+
+        // `[emitted, props[..width-1]]` — `width` positions, verifying
+        // `width - 1` proposals and predicting one bonus token.
+        let mut ids: Vec<u32> = Vec::with_capacity(width);
+        ids.push(emitted);
+        ids.extend_from_slice(&props[..width - 1]);
+        // Every row runs the same window: `--batch` is uniform lockstep
+        // (§13.4b), so the rows share a proposal set exactly as they share a
+        // prompt.
+        let batched_ids: Vec<u32> = ids.repeat(batch);
+
+        // ---- the timed window ------------------------------------------
+        let tok = cache.advance(width)?;
+        let step_start = std::time::Instant::now();
+        let input = Tensor::new(batched_ids.as_slice(), device)?.reshape((batch, width))?;
+        let all = model
+            .forward_all(&input, *kv_len, cache)
+            .context("speculative verify pass")?;
+        // One synchronization per window, for the decode loop's reason: the
+        // acceptance test reads the logits back, so the serialization is
+        // inherent to the workload rather than an artifact of measuring it.
+        device.synchronize()?;
+        let wall = step_start.elapsed().as_secs_f64();
+        let (gpu, disp) = if profiling {
+            let s = profile::snapshot();
+            profile::reset();
+            *last_token_kernels = s.by_label.clone();
+            (s.gpu_busy_union_s, s.dispatches)
+        } else {
+            (0.0, 0)
+        };
+        *kv_len += width;
+
+        // ---- the accept test, per row ----------------------------------
+        //
+        // **Uniformity is a theorem here, not an assumption, and that is why the
+        // check asserts rather than handles.** #284 anticipates rows accepting
+        // different prefix lengths — *"a rollback affects some rows and not
+        // others"* — which is true of a **ragged** batch and is exactly what
+        // §13.4b puts out of scope. Under uniform lockstep with identical
+        // prompts, identical rows produce identical logits (that IS
+        // `--batch-check`), hence identical argmaxes, hence the same accepted
+        // length. So a divergence is a **batch leak** — §2.3.3 #7's forbidden
+        // dependence of a sequence on its neighbours — and is reported as a
+        // defect rather than accommodated.
+        //
+        // It is also the only shape the state can express: `KvSlot` carries one
+        // `len` for the whole batch and `Cache` one `conv_phase`, so `resolve`
+        // moves both for every row together. A genuinely ragged accept would
+        // need a per-row length that does not exist, which is #148's paging
+        // question rather than this harness's.
+        // `[B, width, vocab] -> [vocab]` for one (row, position). `narrow` twice
+        // and `squeeze` twice rather than `IndexOp::i`, matching the sampling
+        // above: both are views, neither copies, and it needs no trait import.
+        let row_pos = |all: &Tensor, row: usize, j: usize| -> Result<Tensor> {
+            Ok(all
+                .narrow(0, row, 1)?
+                .squeeze(0)?
+                .narrow(0, j, 1)?
+                .squeeze(0)?)
+        };
+        let mut accepted = 0usize;
+        for (j, proposed) in props.iter().enumerate() {
+            accepted += 1;
+            let target = logits_processor
+                .sample(&row_pos(&all, 0, j)?)
+                .context("sampling the verify pass")?;
+            if target != *proposed {
+                break;
+            }
+        }
+        if accept_check && batch > 1 && spec.accept_divergence.is_none() {
+            for row in 1..batch {
+                let mut row_accepted = 0usize;
+                for (j, proposed) in props.iter().enumerate() {
+                    row_accepted += 1;
+                    let target = logits_processor
+                        .sample(&row_pos(&all, row, j)?)
+                        .context("sampling the verify pass")?;
+                    if target != *proposed {
+                        break;
+                    }
+                }
+                if row_accepted != accepted {
+                    spec.accept_divergence = Some((done, row, accepted, row_accepted));
+                    break;
+                }
+            }
+        }
+
+        // Emit every accepted position except the last, whose logits become the
+        // carried prediction for the next window's first token.
+        //
+        // **Two loops rather than one**, and #89 records why: a single loop that
+        // both emitted position `j` and assigned `logits = row` emitted the same
+        // prediction twice, which showed up as an acceptance rate that looked
+        // like a mediocre proposer rather than as a bug. Separating them makes
+        // the invariant structural — exactly one row is carried, every other
+        // accepted row is emitted.
+        let mut carry = None;
+        for j in 0..accepted {
+            // `[B, width, vocab] -> [B, vocab]`, position `j` for every row.
+            let row = all.narrow(1, j, 1)?.squeeze(1)?.contiguous()?;
+            if j + 1 == accepted {
+                carry = Some(row);
+                break;
+            }
+            if tokens.len() >= n || tokens.len() >= oracle.len() {
+                break;
+            }
+            for (b, slot) in batch_rows.iter_mut().enumerate() {
+                let l = row.narrow(0, b, 1)?.squeeze(0)?;
+                *slot = logits_processor.sample(&l).context("sampling")?;
+            }
+            let target = batch_rows[0];
+            if accept_check && batch > 1 && batch_divergence.is_none() {
+                if let Some((rr, &t)) = batch_rows.iter().enumerate().find(|(_, &t)| t != target) {
+                    *batch_divergence = Some((tokens.len(), rr, target, t));
+                }
+            }
+            if eos_ids.contains(&target) {
+                *hit_eos = true;
+            }
+            tokens.push(target);
+        }
+        if let Some(row) = carry {
+            *logits = row;
+        }
+
+        // The pass appended `width` positions and `accepted` of them produced
+        // tokens that were kept, so `width - accepted` are discarded — a length
+        // decrement and a phase move, neither of which clears a byte (§10.2a).
+        cache.resolve(tok, accepted)?;
+        *kv_len -= width - accepted;
+
+        // **One `steps` entry per window, and the per-token divide happens
+        // later.** Recording it per accepted token instead would make the
+        // sd and the median describe a quantity no window produced.
+        steps.push((wall, gpu, disp));
+        step_stamps.push((run_record::now_ns(), *kv_len));
+        spec.windows += 1;
+        spec.proposed += width;
+        spec.accepted += accepted;
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -1726,6 +2088,57 @@ fn main() -> Result<()> {
     let mut batch_divergence: Option<(usize, usize, u32, u32)> = None;
     let mut hit_eos = false;
     let mut last_token_kernels: Vec<(String, u64)> = Vec::new();
+    // The speculative arm's counters. `spec.windows == 0` after a `--speculate`
+    // run is the vacuity check §2.4 requires, asserted rather than printed.
+    let mut spec = SpecCounters::default();
+
+    // The oracle sequence the proposer draws from — the tokens this
+    // configuration emits **without** speculation.
+    //
+    // # Why it is generated here rather than read from a file
+    //
+    // `lfm2-determinism` takes its oracle from `--force-tokens`, and that is not
+    // a mechanism this harness owes. That flag exists there to make two arms'
+    // logit dumps **position-comparable** (§2.3.9a): it pins the sequence so
+    // `max|Δlogit|` at position `i` is a property of the arithmetic rather than
+    // of two conversations drifting apart. The proposer is a *reuse* of it.
+    //
+    // Here there is no second arm and no dump to subtract. What speculation
+    // needs is only *a sequence the target would have emitted*, and that is
+    // derivable in-process from the very thing this harness already does. So the
+    // **proposer** is ported and the **file** is not — which also removes the
+    // two-run record-then-replay protocol a file would have imposed, and with it
+    // the chance of measuring against an oracle taken under a different
+    // configuration.
+    //
+    // # Why it gets its own cache
+    //
+    // The pre-pass mutates KV and conv state, so the timed pass cannot inherit
+    // it — a continuation is not a repeat (§2.4's rule for prefill, in the state
+    // rather than in the page cache). A second `Cache` at B=1 is 12.7 % of the
+    // machine by §9.5b's own table, and it is dropped before the timed cache is
+    // built. **Admission runs on it too**, so a configuration that would be
+    // refused is refused here rather than after the oracle has been paid for.
+    //
+    // Untimed and outside every window: nothing below `steps` sees it.
+    let oracle: Vec<u32> = if args.speculate > 0 {
+        build_oracle_sequence(
+            &model,
+            &config,
+            dtype,
+            &device,
+            args.kv_capacity,
+            &prompt_ids,
+            batch,
+            args.n,
+            args.seed,
+            args.temperature,
+            args.top_p,
+        )
+        .context("recording the oracle sequence the proposer draws from")?
+    } else {
+        Vec::new()
+    };
 
     #[cfg(feature = "metal")]
     let metal_device = match &device {
@@ -1752,7 +2165,42 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    while tokens.len() < args.n {
+    // ---- the speculative arm (#284, porting #89's verify loop) ------------
+    //
+    // Written as a separate loop rather than a branch inside the one below, for
+    // the reason `lfm2-determinism` gives at the same seam: the shapes genuinely
+    // differ. An ordinary step consumes one token and emits one; a verify pass
+    // consumes K and emits between 1 and K. Folding them would put a
+    // `seq_len`-dependent branch on the path every recorded figure belongs to,
+    // to serve a caller that path does not have — §11.3l finding 4's shape.
+    if args.speculate > 0 {
+        run_speculative_decode(SpecRun {
+            k: args.speculate,
+            proposer: &args.spec_proposer,
+            accept_check: args.spec_accept_check,
+            n: args.n,
+            batch,
+            profiling,
+            oracle: &oracle,
+            model: &model,
+            device: &device,
+            logits_processor: &mut logits_processor,
+            cache: &mut cache,
+            logits: &mut logits,
+            kv_len: &mut kv_len,
+            tokens: &mut tokens,
+            batch_rows: &mut batch_rows,
+            steps: &mut steps,
+            step_stamps: &mut step_stamps,
+            eos_ids: &eos_ids,
+            hit_eos: &mut hit_eos,
+            spec: &mut spec,
+            batch_divergence: &mut batch_divergence,
+            last_token_kernels: &mut last_token_kernels,
+        })?;
+    }
+
+    while args.speculate == 0 && tokens.len() < args.n {
         // **Sampled per row**, because `LogitsProcessor::sample` is rank-0 by
         // construction: `sample_argmax` is `argmax(D::Minus1)?.to_scalar()`, and
         // `to_scalar` requires rank 0, so a `[B, vocab]` tensor is not something
@@ -2059,6 +2507,42 @@ fn main() -> Result<()> {
     let gpu_mean: f64 = steady.iter().map(|s| s.1).sum::<f64>() / n_steady;
     let disp_mean: f64 = steady.iter().map(|s| s.2 as f64).sum::<f64>() / n_steady;
 
+    // ---- the speculative denominator (#284, §10.2i) ----------------------
+    //
+    // **The means above are per STEP, and under `--speculate` a step is a
+    // window.** §10.2i states the problem exactly: a verify pass *"consumes K
+    // and emits between 1 and K, so `wall_ms_per_token` needs a denominator that
+    // does not exist there."* This is that denominator — tokens **accepted** per
+    // window — and it is what makes the reported figure GPU-busy per **accepted
+    // token** rather than per window.
+    //
+    // # Why the ratio and not a per-window divide
+    //
+    // Because acceptance varies between windows and a mean of per-window ratios
+    // is not the per-token cost. §3.4a's own rule, established for traffic and
+    // then found to generalise (§3.4a-vii's energy case): **sum over the band and
+    // divide once.** A mean of `wall_j / accepted_j` weights a 1-accept window
+    // as heavily as an 8-accept one; the ratio of sums weights each window by
+    // what it produced, which is the quantity a token cost is.
+    //
+    // At `K = 0` this is exactly 1.0 — a step *is* a token — so
+    // `wall_ms_per_token` keeps its name, its meaning and its comparability with
+    // every row already recorded. The corpus does not re-interpret.
+    let spec_tokens_per_step: f64 = if spec.windows > 0 {
+        // Steady-state windows only, matching the means: the accepted total is
+        // over every window, so scale it by the fraction that survived warmup.
+        // Exact when no warmup is excluded, which is the measured case for a
+        // speculative run.
+        let steady_frac = n_steady / spec.windows.max(1) as f64;
+        (spec.accepted as f64 * steady_frac) / n_steady
+    } else {
+        1.0
+    };
+    // Per **accepted token**, which is the quantity #273's prediction is stated
+    // in and the one no speculative run has ever produced (#284's opening).
+    let wall_per_token = wall_mean / spec_tokens_per_step;
+    let gpu_per_token = gpu_mean / spec_tokens_per_step;
+
     // Standard deviation, so a mean is never reported without its spread.
     let wall_sd = (steady
         .iter()
@@ -2275,6 +2759,116 @@ fn main() -> Result<()> {
             },
         }
     }
+
+    // ---- the speculative report (#284) ------------------------------------
+    //
+    // Printed whether or not anything was rejected, for the batch gate's reason:
+    // a gate that reports only on failure is one a reader cannot tell was run
+    // (§2.4).
+    if args.speculate > 0 {
+        println!();
+        println!("=== speculative verify (issue #284, mechanism #89) ===");
+        println!("K                     {}", args.speculate);
+        println!("proposer              {}", args.spec_proposer);
+        println!("windows               {}", spec.windows);
+        println!(
+            "proposed / accepted   {} / {}  (accept rate {:.4})",
+            spec.proposed,
+            spec.accepted,
+            if spec.proposed > 0 {
+                spec.accepted as f64 / spec.proposed as f64
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "tokens per window     {spec_tokens_per_step:.4}  \
+             (the per-token denominator, §10.2i)"
+        );
+        if spec.corrupted > 0 {
+            println!(
+                "corrupted             {}  (the wrong-proposer arm's engagement proof)",
+                spec.corrupted
+            );
+        }
+        if batch > 1 {
+            match (args.spec_accept_check, spec.accept_divergence) {
+                (false, _) => {
+                    println!("per-row accept        NOT CHECKED (--spec-accept-check false)")
+                }
+                (true, None) => println!(
+                    "per-row accept        IDENTICAL across all {batch} rows, {} windows",
+                    spec.windows
+                ),
+                (true, Some((step, row, want, got))) => println!(
+                    "per-row accept        **DIVERGED** at step {step}: row 0 accepted \
+                     {want}, row {row} accepted {got}"
+                ),
+            }
+        }
+
+        // **The vacuity checks, asserted rather than printed** (§2.4, after
+        // #69's determinism run reported a passing digest for a path its flag
+        // never reached). A `--speculate` run that opened no window has measured
+        // the ordinary decode loop under the speculative arm's name, and a
+        // `wrong:<N>` arm that corrupted nothing is the oracle arm wearing a
+        // different label — the case #89 names as the stronger of its two,
+        // because a mechanism transparent only when nothing is rejected has not
+        // been shown to roll back at all.
+        anyhow::ensure!(
+            spec.windows > 0,
+            "--speculate {} was passed and no verify window ran, so every figure above is \
+             the ordinary decode loop's under the speculative arm's name",
+            args.speculate
+        );
+        anyhow::ensure!(
+            args.spec_proposer == "oracle" || spec.corrupted > 0,
+            "--spec-proposer {} corrupted nothing, so this arm is the oracle arm under \
+             another name and the rollback was never exercised",
+            args.spec_proposer
+        );
+        // **The output-identity gate, and it is the claim the whole mechanism
+        // rests on** (#89, #284): under greedy decoding a speculative run must
+        // emit *exactly* what the non-speculative run emits, whatever the
+        // proposer does. The oracle sequence is that non-speculative run — this
+        // harness generated it, from this configuration, minutes ago — so the
+        // comparison is direct rather than against a recorded digest.
+        //
+        // Asserted over the whole stream rather than trusted from the per-step
+        // check inside the loop: that one fires at the *carried* token, and the
+        // tokens emitted from inside a window are the half a rollback could
+        // corrupt. This covers both.
+        anyhow::ensure!(
+            tokens.as_slice() == &oracle[..tokens.len()],
+            "the speculative stream is not the non-speculative one. Under greedy \
+             decoding they are identical by construction (#89), so this is a defect in \
+             the verifier — a rejection changes which proposals are wasted, never what \
+             is emitted."
+        );
+        println!(
+            "output identity       IDENTICAL to the non-speculative stream over {} tokens",
+            tokens.len()
+        );
+
+        // **The oracle arm's acceptance is asserted, and this is the check that
+        // catches the off-by-one #89 records.** A perfect proposer accepts every
+        // position, so anything less means the verifier is comparing position
+        // `j` against the wrong proposal — which produces a stable token stream
+        // and an acceptance rate that reads as a mediocre proposer rather than
+        // as a defect. The stream being correct is exactly why this needs its
+        // own assertion.
+        if args.spec_proposer == "oracle" {
+            anyhow::ensure!(
+                spec.accepted == spec.proposed,
+                "the oracle proposer accepted {} of {} positions. A proposer that proposes \
+                 what the target emits is accepted at every position by construction \
+                 (#89), so a shortfall is a misalignment in the verifier — not a \
+                 rejection.",
+                spec.accepted,
+                spec.proposed
+            );
+        }
+    }
     println!();
 
     if args.per_token {
@@ -2344,16 +2938,21 @@ fn main() -> Result<()> {
         "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
          gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} dispatches_per_token={:.1} \
          dispatches_per_forward={:.1} aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
-         batch_streams_identical={} prefill_ms={:.2} \
+         batch_streams_identical={} spec_k={} spec_proposer={} spec_windows={} \
+         spec_proposed={} spec_accepted={} spec_corrupted={} spec_accept_rate={:.4} \
+         spec_tokens_per_step={:.4} spec_rows_agree={} prefill_ms={:.2} \
          prompt_tokens={} weight_bytes={} scratch_asks_bytes={} dtype={:?} hit_eos={} \
          profiling={} config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
         warmup,
         batch,
-        wall_mean * 1e3,
-        gpu_mean * 1e3,
-        (wall_mean - gpu_mean) * 1e3,
+        // Per **accepted token** under `--speculate`, per step otherwise — and
+        // at `K = 0` the two are the same number, so this field means what every
+        // recorded row means (§10.2i, and the divisor's own note above).
+        wall_per_token * 1e3,
+        gpu_per_token * 1e3,
+        (wall_per_token - gpu_per_token) * 1e3,
         disp_mean,
         // Floored at 0 rather than subtracted blindly: with profiling off
         // `disp_mean` is 0.0, and `0 - (B-1)` printed **-7.0** at B=8 — a count
@@ -2366,9 +2965,12 @@ fn main() -> Result<()> {
         } else {
             0.0
         },
-        // §13.4a's own quantity: `B / step_time`.
-        batch as f64 / wall_mean,
-        1.0 / wall_mean,
+        // §13.4a's own quantity: `B / step_time`. Under `--speculate` a step
+        // yields `spec_tokens_per_step` tokens per row rather than one, so the
+        // rate is over the tokens the windows kept — the same divisor the
+        // per-token fields take, applied to the same numerator.
+        batch as f64 / wall_per_token,
+        1.0 / wall_per_token,
         // Tri-state rather than a bool: at `B = 1` there is nothing to compare,
         // and reporting `true` there would claim a check that did not run —
         // §15.1a's vacuous-instrument class, in a field.
@@ -2377,6 +2979,37 @@ fn main() -> Result<()> {
             (_, false, _) => "unchecked",
             (_, true, false) => "true",
             (_, true, true) => "FALSE",
+        },
+        args.speculate,
+        // Stated even at `K = 0`, where it names the arm that did not run: a
+        // field absent from a line is a run the question cannot be asked of
+        // (#171's `UNRECORDED`), and this one is always answerable.
+        args.spec_proposer,
+        spec.windows,
+        spec.proposed,
+        spec.accepted,
+        spec.corrupted,
+        // The acceptance rate a proposer is judged on — a different quantity
+        // from the per-token divisor, which is why both are on the line.
+        if spec.proposed > 0 {
+            spec.accepted as f64 / spec.proposed as f64
+        } else {
+            0.0
+        },
+        spec_tokens_per_step,
+        // The per-row accept test's verdict, tri-state for `batch_streams_identical`'s
+        // reason: at `B = 1` there are no rows to compare and at `K = 0` no
+        // window ran, so `true` in either case would claim a check that did not.
+        match (
+            args.speculate,
+            batch,
+            args.spec_accept_check,
+            spec.accept_divergence.is_some(),
+        ) {
+            (0, _, _, _) | (_, 1, _, _) => "n/a",
+            (_, _, false, _) => "unchecked",
+            (_, _, true, false) => "true",
+            (_, _, true, true) => "FALSE",
         },
         prefill_wall.as_secs_f64() * 1e3,
         prompt_ids.len(),
@@ -2415,10 +3048,16 @@ fn main() -> Result<()> {
         // profiling path collects. Recorded NEVER RUN rather than as the 0.0
         // the `RESULT` line prints, which is the defect the corpus already
         // carries: a real zero standing where "not measured" was meant.
+        // **The same per-accepted-token divisor the `RESULT` line takes**, and
+        // that is a correctness requirement rather than a nicety: the store and
+        // the line describing one run with two different denominators is the
+        // shape §2.4 names — a field whose name promises one quantity while the
+        // arithmetic delivers another — and it would be invisible, because both
+        // numbers are individually plausible.
         let (gpu_metric, nongpu_metric, disp_metric) = if profiling {
             (
-                m(gpu_mean * 1e3),
-                m((wall_mean - gpu_mean) * 1e3),
+                m(gpu_per_token * 1e3),
+                m((wall_per_token - gpu_per_token) * 1e3),
                 m(disp_mean),
             )
         } else {
@@ -2470,7 +3109,7 @@ fn main() -> Result<()> {
             dtype: format!("{dtype:?}"),
             profiling_compiled: cfg!(feature = "metal"),
             profiling_enabled: profiling,
-            wall_ms_per_token: m(wall_mean * 1e3),
+            wall_ms_per_token: m(wall_per_token * 1e3),
             gpu_ms_per_token: gpu_metric,
             nongpu_ms_per_token: nongpu_metric,
             dispatches_per_token: disp_metric,
