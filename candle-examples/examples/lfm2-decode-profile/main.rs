@@ -1100,6 +1100,28 @@ struct Args {
     #[arg(long)]
     sample_split: bool,
 
+    /// Which sampler the `--temperature > 0` arm uses (lloom #277).
+    ///
+    /// `top-p` is the default and is what `LogitsProcessor::new` selects, so an
+    /// unflagged run is byte-for-byte the arm every recorded figure belongs to.
+    ///
+    /// | arm | what it does | readback |
+    /// |---|---|---|
+    /// | `top-p` | `softmax` on the GPU, then `to_vec1()`, a host sort and a multinomial draw | **512 KB** |
+    /// | `gumbel` | `argmax(logits/T + gumbel_noise)`, entirely on the GPU | **4 bytes** |
+    /// | `all` | `softmax`, `to_vec1()`, multinomial -- **no sort** | 512 KB |
+    ///
+    /// **`all` is here as a control rather than as a candidate.** It shares
+    /// `top-p`'s readback and drops only the sort, so the pair separates
+    /// candidate B from candidate C in `measurements/issue-277-prediction.md`
+    /// without needing the split timers to be trusted.
+    ///
+    /// **Ignored at `--temperature 0`**, which is `Sampling::ArgMax` on every
+    /// arm -- so the temp-0 digests cannot move whatever this is set to, which
+    /// is §2.3.3c tier 3's first acceptance test.
+    #[arg(long, default_value = "top-p")]
+    sampling: String,
+
     /// Sample inside the forward pass's command buffer (lloom #319).
     ///
     /// The default path samples the PREVIOUS iteration's logits after
@@ -1886,6 +1908,32 @@ fn main() -> Result<()> {
         Device::new_metal(0)?
     };
 
+    // **`--seed` reaches TWO generators and used to reach one** (lloom #277).
+    //
+    // `LogitsProcessor::from_sampling` seeds a host `StdRng`, which is what
+    // `sample_multinomial` draws from -- so `top-p` and `all` have always been
+    // seeded. `Sampling::GumbelSoftmax` draws instead from `rand_like`, which is
+    // the **device** RNG: an `MTLBuffer` initialised to `299792458` in
+    // `MetalDevice::new` and advanced only by `rand_uniform`'s own kernel.
+    // Nothing in any LFM2 harness called `Device::set_seed`, so that generator
+    // started from the same constant on every run.
+    //
+    // Measured before this line existed: `--seed 12345` and `--seed 999`
+    // produced **byte-identical** 60-token streams under `--sampling gumbel`
+    // (`measurements/issue-277-raw/seed-vacuous.txt`). The stream was
+    // reproducible, so §2.3.3c's tier-3 test 2 PASSED -- and it passed for a run
+    // in which the seed was not an input. **That is §15.1a's VACUOUS class in
+    // the acceptance test tier 3 was given**, and it is why #181's rule that a
+    // unanimity claim owes an inverted arm is load-bearing here rather than
+    // procedural: without the seed-999 arm this reads as a clean 3/3.
+    //
+    // Seeded here rather than inside `LogitsProcessor` because the device RNG is
+    // the *device's* state, not the sampler's -- `stable-diffusion`, `flux` and
+    // `z_image` all call it exactly here, so this is the established site and
+    // not a new convention. CPU is a no-op (`cpu_backend/mod.rs:3168`), which is
+    // why it is unconditional.
+    device.set_seed(args.seed)?;
+
     // f16 on Metal is what ambrogio loads. Measuring f32 here would measure a
     // path nothing runs, and would move twice the bytes per token.
     let dtype = match args.dtype.as_deref() {
@@ -2034,14 +2082,42 @@ fn main() -> Result<()> {
         candle_metal_kernels::metal::run_telemetry::set_enabled(true);
     }
 
+    // **`--temperature 0` is `ArgMax` on every `--sampling` arm**, deliberately
+    // and not incidentally: §2.3.3c's tier-3 test 1 is that the temp-0 digests
+    // are unmoved, and the cheapest way to guarantee that is for the arm not to
+    // be reachable at all rather than to be reachable and equal (§15.1 #1's
+    // shape -- a property held by construction beats one held by measurement).
     let sampling = if args.temperature <= 0. {
         Sampling::ArgMax
     } else {
-        Sampling::TopP {
-            p: args.top_p,
-            temperature: args.temperature,
+        match args.sampling.as_str() {
+            "top-p" => Sampling::TopP {
+                p: args.top_p,
+                temperature: args.temperature,
+            },
+            // The control that isolates the sort: same 512 KB readback, same
+            // multinomial, no `sort_by`. See `--sampling`'s doc comment.
+            "all" => Sampling::All {
+                temperature: args.temperature,
+            },
+            // `Sampling::GumbelSoftmax` and `candle_nn::sampling::gumbel_softmax`
+            // BOTH already existed on `lloom/integration` before this issue --
+            // the arm was compiled, reachable from `from_sampling`, and selected
+            // by no harness. #277's brief expects a kernel to be written; what
+            // was missing is a flag. Recorded on the RESULT line rather than in
+            // prose, since §2.4's engagement rule wants the arm proved from a
+            // quantity it should have changed.
+            "gumbel" => Sampling::GumbelSoftmax {
+                temperature: args.temperature,
+            },
+            other => {
+                anyhow::bail!("unknown --sampling {other:?}: expected one of top-p, all, gumbel")
+            }
         }
     };
+    // Kept for the RESULT line, which must render the arm the run is actually
+    // in rather than the flag it was asked for (§7.1a-i). `Sampling` is `Clone`.
+    let sampling_resolved = sampling.clone();
     let mut logits_processor = LogitsProcessor::from_sampling(args.seed, sampling);
 
     let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
@@ -2196,6 +2272,15 @@ fn main() -> Result<()> {
     let mut sample_steps: Vec<(f64, f64)> = Vec::with_capacity(args.n);
     // Per token under `--sample-split`: (argmax-and-sync seconds, readback seconds).
     let mut split_steps: Vec<(f64, f64)> = Vec::with_capacity(args.n);
+    // Per token under `--sample-split --temperature > 0` (lloom #277):
+    // (gpu seconds, 512 KB readback seconds, sort seconds, multinomial seconds).
+    let mut temp_split_steps: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(args.n);
+    // The split arm draws its own multinomial rather than calling
+    // `LogitsProcessor`, so it needs the same RNG seeded the same way --
+    // `from_sampling` is `StdRng::seed_from_u64(seed)` (`generation/mod.rs:27`).
+    // Seeded identically so the split arm's stream is comparable to the unsplit
+    // arm's rather than merely plausible.
+    let mut split_rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(args.seed);
 
     #[cfg(feature = "metal")]
     let metal_device = match &device {
@@ -2308,7 +2393,7 @@ fn main() -> Result<()> {
                 // are views and neither copies. At `B = 1` this is `squeeze(0)`,
                 // the exact shape the B=1 path always passed.
                 let row = logits.narrow(0, r, 1)?.squeeze(0)?;
-                *slot = if args.sample_split {
+                *slot = if args.sample_split && args.temperature <= 0. {
                     // The forward pass has already been synchronized by the
                     // previous iteration, so `argmax` here enqueues ONE dispatch
                     // over the vocab and `to_scalar` then blits 4 bytes back and
@@ -2323,6 +2408,79 @@ fn main() -> Result<()> {
                     let tok = idx.to_scalar::<u32>().context("argmax readback")?;
                     if r == 0 {
                         split_steps.push((argmax_s, read_start.elapsed().as_secs_f64()));
+                    }
+                    tok
+                } else if args.sample_split {
+                    // **The temperature > 0 split** (lloom #277).
+                    //
+                    // `LogitsProcessor::sample_f` is re-walked here rather than
+                    // called, because the question is which of ITS four stages
+                    // carries the term and a wrapper can only time the whole.
+                    // The arithmetic must be `generation/mod.rs:121-157`'s
+                    // exactly or this measures a different computation than the
+                    // one it is reporting on -- so it is transcribed, and the
+                    // control on that transcription is that the unsplit arm's
+                    // token stream and this arm's must match (`--dump-tokens`,
+                    // and the gate in the PR).
+                    //
+                    // Four stages, and the boundaries are chosen so each is
+                    // attributable to one of the prediction's candidates:
+                    //
+                    // | stage | what it is | candidate |
+                    // |---|---|---|
+                    // | `gpu` | `to_dtype`, `/T`, `softmax_last_dim`, then `synchronize()` | A/B's dispatch half |
+                    // | `read` | `to_vec1()` -- blit encoder + `flush_and_wait_current` | **B** |
+                    // | `sort` | `sort_by` over 128 000 indices + the cumulative scan | **C** |
+                    // | `draw` | `WeightedIndex` + `distr.sample` | -- |
+                    //
+                    // The `synchronize()` before `read` is what makes `read` the
+                    // readback alone rather than the readback plus whatever GPU
+                    // work was still outstanding. It is the same diagnostic
+                    // inflation §11.5a records for the argmax arm at 17 %, and
+                    // it is why this arm reports a SPLIT and not a total.
+                    let t0 = std::time::Instant::now();
+                    let f32row = row.to_dtype(candle::DType::F32).context("sample cast")?;
+                    let scaled = (&f32row / args.temperature).context("sample temperature")?;
+                    let prs_t = candle_nn::ops::softmax_last_dim(&scaled).context("softmax")?;
+                    device.synchronize()?;
+                    let gpu_s = t0.elapsed().as_secs_f64();
+
+                    let t1 = std::time::Instant::now();
+                    let mut prs: Vec<f32> = prs_t.to_vec1().context("prs readback")?;
+                    let read_s = t1.elapsed().as_secs_f64();
+
+                    // `sample_topp`'s body, transcribed. At `p >= 1.0` or
+                    // `p <= 0` the real one skips straight to the multinomial,
+                    // so the sort is skipped here too -- which keeps the split
+                    // faithful to the arm actually being timed.
+                    let t2 = std::time::Instant::now();
+                    let top_p = args.top_p as f32;
+                    let sorted = top_p > 0.0 && top_p < 1.0;
+                    if sorted {
+                        let mut argsort_indices = (0..prs.len()).collect::<Vec<_>>();
+                        argsort_indices.sort_by(|&i, &j| prs[j].total_cmp(&prs[i]));
+                        let mut cumsum = 0.;
+                        for index in &argsort_indices {
+                            if cumsum >= top_p {
+                                prs[*index] = 0.0;
+                            } else {
+                                cumsum += prs[*index];
+                            }
+                        }
+                    }
+                    let sort_s = t2.elapsed().as_secs_f64();
+
+                    let t3 = std::time::Instant::now();
+                    let tok = {
+                        use rand::distr::Distribution;
+                        let distr = rand::distr::weighted::WeightedIndex::new(&prs)
+                            .map_err(|e| anyhow::anyhow!("multinomial: {e}"))?;
+                        distr.sample(&mut split_rng) as u32
+                    };
+                    let draw_s = t3.elapsed().as_secs_f64();
+
+                    if r == 0 {
+                        temp_split_steps.push((gpu_s, read_s, sort_s, draw_s));
                     }
                     tok
                 } else {
@@ -3137,6 +3295,64 @@ fn main() -> Result<()> {
                 read_mean * 1e3
             );
         }
+        // **The temperature > 0 split** (lloom #277).
+        //
+        // Reported with BOTH mean and median per §6.6b and §11.5a: this field
+        // has the same floor-plus-right-tail shape as `nongpu_ms_per_token`, so
+        // a mean is not a location estimate and the two are printed side by side
+        // rather than one being chosen for the reader.
+        if args.sample_split && temp_split_steps.len() > warmup {
+            let s = &temp_split_steps[warmup..];
+            let n = s.len() as f64;
+            let med = |mut v: Vec<f64>| -> f64 {
+                v.sort_by(|a, b| a.total_cmp(b));
+                if v.is_empty() {
+                    0.0
+                } else {
+                    v[v.len() / 2]
+                }
+            };
+            let gpu_mean = s.iter().map(|x| x.0).sum::<f64>() / n;
+            let read_mean = s.iter().map(|x| x.1).sum::<f64>() / n;
+            let sort_mean = s.iter().map(|x| x.2).sum::<f64>() / n;
+            let draw_mean = s.iter().map(|x| x.3).sum::<f64>() / n;
+            let gpu_med = med(s.iter().map(|x| x.0).collect());
+            let read_med = med(s.iter().map(|x| x.1).collect());
+            let sort_med = med(s.iter().map(|x| x.2).collect());
+            let draw_med = med(s.iter().map(|x| x.3).collect());
+            let tot_mean = gpu_mean + read_mean + sort_mean + draw_mean;
+            println!();
+            println!(
+                "  --- temp>0 split (lloom #277; DIAGNOSTIC, the sync inflates the total) ---"
+            );
+            println!("  stage                 mean ms    median ms   share of split");
+            for (label, m, d) in [
+                ("cast+div+softmax+sync", gpu_mean, gpu_med),
+                ("512 KB to_vec1", read_mean, read_med),
+                ("host sort + scan", sort_mean, sort_med),
+                ("multinomial draw", draw_mean, draw_med),
+            ] {
+                println!(
+                    "  {label:<21} {:8.4}   {:8.4}      {:5.1} %",
+                    m * 1e3,
+                    d * 1e3,
+                    if tot_mean > 0.0 {
+                        100.0 * m / tot_mean
+                    } else {
+                        0.0
+                    }
+                );
+            }
+            println!("  {:<21} {:8.4}", "SPLIT TOTAL", tot_mean * 1e3);
+            // The transfer term, printed beside the readback it is meant to
+            // explain -- so a reader cannot attribute the readback to bytes
+            // moved without seeing that the bytes are 1.5 us (§3.4's 349.7 GB/s).
+            println!(
+                "  {:<21} {:8.4}   <- 512 KB at 349.7 GB/s: what a TRANSFER would cost",
+                "(transfer floor)",
+                (128000.0 * 4.0 / 349.7e9) * 1e3
+            );
+        }
         println!();
     }
 
@@ -3177,7 +3393,7 @@ fn main() -> Result<()> {
         "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
          gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} \
          sample_ms_per_token={:.4} sample_med_ms_per_token={:.4} eos_ms_per_token={:.4} \
-         sample_in_buffer={} step_ms_per_token={:.4} \
+         sample_in_buffer={} sampling={} step_ms_per_token={:.4} \
          dispatches_per_token={:.1} \
          dispatches_per_forward={:.1} aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
          batch_streams_identical={} spec_k={} spec_proposer={} spec_windows={} \
@@ -3203,6 +3419,26 @@ fn main() -> Result<()> {
         sample_med * 1e3,
         eos_mean * 1e3,
         args.sample_in_buffer,
+        // **Rendered from the RESOLVED `Sampling`, never from `args.sampling`**
+        // (§7.1a-i). The flag string says what was asked for; this says what the
+        // run is in. They differ at `--temperature 0`, where every arm resolves
+        // to `ArgMax` -- so a flag-string rendering would report
+        // `sampling=gumbel` for a run that dispatched `fast_argmax_f32` and
+        // never generated a Gumbel variate. That is exactly #241's
+        // present-and-wrong class, which compares EQUAL to real runs of another
+        // arm where an absent field would only be `UNRECORDED`.
+        //
+        // An exhaustive `match` rather than a fallback, so a new `Sampling`
+        // variant is a compile error rather than a silently mislabelled run --
+        // #241's own fix, applied at the point the same trap is available.
+        match &sampling_resolved {
+            Sampling::ArgMax => "ArgMax",
+            Sampling::All { .. } => "All",
+            Sampling::TopP { .. } => "TopP",
+            Sampling::TopK { .. } => "TopK",
+            Sampling::TopKThenTopP { .. } => "TopKThenTopP",
+            Sampling::GumbelSoftmax { .. } => "GumbelSoftmax",
+        },
         (wall_per_token + sample_mean + eos_mean) * 1e3,
         disp_mean,
         // Floored at 0 rather than subtracted blindly: with profiling off
