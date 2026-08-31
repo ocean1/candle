@@ -3174,11 +3174,16 @@ fn main() -> Result<()> {
     // (§5.5a's own caution), and it is labelled `asks` for that reason.
     let scratch_asks_bytes = flash_scratch_ask_bytes(&axes, &config, kv_len, args.kv_capacity);
     let (to_cpu_fast, to_cpu_blit) = candle::metal_backend::to_cpu_counts();
+    // #366: readbacks that found the buffer unmapped *after* the GPU wait and
+    // fell back to the blit. This is the window that used to segfault; printing
+    // it is what makes its frequency a number rather than a crash report.
+    let to_cpu_null_after_wait = candle::metal_backend::to_cpu_null_after_wait();
     println!(
         "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
          gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} \
          sample_ms_per_token={:.4} sample_med_ms_per_token={:.4} eos_ms_per_token={:.4} \
-         sample_in_buffer={} to_cpu_fast={} to_cpu_blit={} step_ms_per_token={:.4} \
+         sample_in_buffer={} to_cpu_fast={} to_cpu_blit={} \
+         to_cpu_null_after_wait={} step_ms_per_token={:.4} \
          dispatches_per_token={:.1} \
          dispatches_per_forward={:.1} aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
          batch_streams_identical={} spec_k={} spec_proposer={} spec_windows={} \
@@ -3209,6 +3214,7 @@ fn main() -> Result<()> {
         // measured the other one (§2.4, after #69's vacuous determinism run).
         to_cpu_fast,
         to_cpu_blit,
+        to_cpu_null_after_wait,
         (wall_per_token + sample_mean + eos_mean) * 1e3,
         disp_mean,
         // Floored at 0 rather than subtracted blindly: with profiling off

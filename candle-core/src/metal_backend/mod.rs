@@ -82,6 +82,22 @@ pub fn to_cpu_force_blit() -> bool {
     })
 }
 
+/// #366: readbacks whose buffer was null *after* the wait, and so took the blit.
+///
+/// This is the case that used to segfault. It is a counter rather than an
+/// assertion because the fallback is correct — the blit computes the same bytes
+/// — and because a number on the `RESULT` line is what makes the frequency
+/// visible instead of being discovered by a crash report. **A run with
+/// `to_cpu_fast > 0` and this at 0 is the healthy shape**; a nonzero value says
+/// the window this fix closes was live on that run.
+pub static TO_CPU_NULL_AFTER_WAIT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Readbacks that found the buffer unmapped after the GPU wait (#366).
+pub fn to_cpu_null_after_wait() -> u64 {
+    TO_CPU_NULL_AFTER_WAIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {
         buffer,
@@ -2153,13 +2169,48 @@ impl MetalStorage {
         // against the blit's own share, and only the blit is removed here.
         // Skipping the wait would be a read-before-write race, which §3.5 makes
         // silent corruption rather than an error.
+        //
+        // # The pointer is read ONCE, and after the wait (#366)
+        //
+        // The first version of this path read `contents()` twice — once to test
+        // for null and once inside `read_to_vec` — with `flush_and_wait_current`
+        // between them. **The value tested and the value used were different
+        // reads of an ObjC property**, and the second is what `memmove` gets.
+        // Measured, 25 of 25 crash reports read `memmove(dst, src=0x0, n=4)`
+        // with `esr` a *read* fault at `far=0x0`, on a stack of
+        // `sample_argmax -> to_scalar -> to_cpu_storage`.
+        //
+        // **And `read_to_vec`'s `assert!(!ptr.is_null())` does not survive
+        // optimization here**: the assert's panic string is absent from the
+        // release binary, and the emitted code goes `Buffer::contents` →
+        // `cbz x23` (the *length* test) → `memcpy` with no null test on the
+        // pointer at all. So the second read had no check of its own and the
+        // first read's check did not cover it.
+        //
+        // Reading once removes the window by construction rather than narrowing
+        // it: there is one value, it is tested, and it is the one used. The
+        // ordering is the fix — the wait must come first, because the pointer is
+        // only meaningful once the GPU has finished — which is the same
+        // §6.7 L4 shape as the pool's own two clocks, in a readback.
         if !crate::metal_backend::to_cpu_force_blit() {
+            // Wait first: `contents()` is only worth asking after the GPU has
+            // finished writing, and asking before means the answer can change
+            // before it is used.
+            self.device.flush_and_wait_current()?;
             let src = self.buffer.contents();
             if !src.is_null() {
                 TO_CPU_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.device.flush_and_wait_current()?;
-                return Ok(read_to_vec(&self.buffer, self.count));
+                // The same pointer that was tested, not a second read of it.
+                // SAFETY: `src` is non-null and CPU-mapped, the GPU work that
+                // writes it has completed above, and `self.buffer` keeps the
+                // allocation alive for the length of this borrow.
+                let slice = unsafe { std::slice::from_raw_parts(src as *const T, self.count) };
+                return Ok(slice.to_vec());
             }
+            // Mapped-then-null is the case #366 crashed on. It is reachable and
+            // it is now a fallback rather than a fault: the blit below is the
+            // pre-#336 path and computes the same bytes.
+            TO_CPU_NULL_AFTER_WAIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         TO_CPU_BLIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -2573,9 +2624,30 @@ impl BackendDevice for MetalDevice {
     }
 }
 
+/// Copies `n` elements out of a CPU-mapped buffer.
+///
+/// # The assertion here did not survive optimization (#366)
+///
+/// This function read `contents()` and `assert!`ed the result non-null. In the
+/// release binary that panic **does not exist** — its message string is absent
+/// and the emitted code runs `contents()` → a *length* test → `memcpy`, with no
+/// test on the pointer. So a null buffer reached `memmove` as `src=0x0` and
+/// segfaulted, 25 times out of 25 with an identical stack.
+///
+/// `panic!` inside an `if` is kept rather than `assert!` because it is a branch
+/// on a value the compiler cannot fold away, and the caller above no longer
+/// relies on it: the fast path tests its own pointer and takes the blit when it
+/// is null. This is the second line of defence, not the first.
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     let ptr = buffer.contents() as *const T;
-    assert!(!ptr.is_null());
+    if ptr.is_null() {
+        panic!(
+            "read_to_vec: buffer has no CPU mapping (len={}, n={n})",
+            buffer.length()
+        );
+    }
+    // SAFETY: `ptr` is non-null and CPU-mapped, and the caller has waited for
+    // the GPU work that writes it.
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
     slice.to_vec()
 }
