@@ -2556,8 +2556,46 @@ impl BackendDevice for MetalDevice {
 
         let seed_buffer = self.seed.try_lock().map_err(MetalError::from)?;
         let contents = seed_buffer.data();
+
+        // **The two words are written in the order the KERNEL reads them, which
+        // is not native `u64` order** (lloom #277).
+        //
+        // `random.metal`'s `atomic_load_seed` reconstructs the seed as
+        // `(ulong)seed[0] << 32 | seed[1]` -- word 0 is the HIGH half. Copying a
+        // native `u64` on a little-endian host puts the LOW half in word 0, so
+        // the kernel read `swap32(seed)`, and for every seed below 2^32 that is
+        // `seed << 32`.
+        //
+        // That is not merely a permuted seed, because of what happens next:
+        // `HybridTaus::seed_per_thread` computes `uint4(ulong4(seeds) * ...)`,
+        // and `uint4` **truncates to the low 32 bits**. A value of the form
+        // `seed << 32` has 32 zero low bits, and any multiple of it still does
+        // -- so component `.x`, the only component carrying the seed at all
+        // (the other three are `tid`, `1`, `1`), was **identically zero for
+        // every seed the API can express**.
+        //
+        // Measured before this fix, on `Tensor::rand(0,1,(4,))`: seeds `1`,
+        // `999`, `12345` and `0xDEADBEEF` all produced
+        // `[0.0030706443, 0.3755374, 0.676627, 0.69485384]` -- byte-identical to
+        // the default -- while seeds `1<<32` and `3<<32` each moved it. The
+        // probe was therefore capable of the other answer (§15.1 #1), which is
+        // what makes the null a measurement rather than a blind instrument.
+        // Artifact: `measurements/issue-277-raw/seed-probe.txt`.
+        //
+        // **Fixed on the host side rather than in the kernel, deliberately.**
+        // Swapping `atomic_load_seed`'s words would work too and would change
+        // what every existing seed means -- `random.metal` is shared with the
+        // CPU/CUDA parity tests and with every other model that calls
+        // `set_seed`. Writing the words the kernel's way is one file, no
+        // `.metal` change, and leaves the kernel's own contract untouched.
+        //
+        // The default seed installed in `MetalDevice::new` is unaffected: it is
+        // written by `new_buffer_with_data` and never passed through here, so a
+        // run that does not call `set_seed` is byte-for-byte what it was.
+        let hi = (seed >> 32) as u32;
+        let lo = (seed & 0xFFFF_FFFF) as u32;
         unsafe {
-            std::ptr::copy_nonoverlapping([seed].as_ptr(), contents as *mut u64, 1);
+            std::ptr::copy_nonoverlapping([hi, lo].as_ptr(), contents as *mut u32, 2);
         }
         seed_buffer.did_modify_range(NSRange::new(0, 8));
 
