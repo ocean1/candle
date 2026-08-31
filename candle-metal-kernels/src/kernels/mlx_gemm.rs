@@ -51,6 +51,27 @@ const TILE_64_64_16_1_2: TileConfig = TileConfig::new(64, 64, 16, 1, 2);
 const TILE_64_32_32_2_2: TileConfig = TileConfig::new(64, 32, 32, 2, 2);
 const TILE_32_64_16_1_2: TileConfig = TileConfig::new(32, 64, 16, 1, 2);
 
+/// The `m` below which `select_tile_config` keeps `TILE_32_32_16_2_2`.
+///
+/// **16 is what ships**, which is `select_tile_config`'s own literal and what
+/// every recorded figure in this repository belongs to. `LLOOM_364_SKINNY_MAX`
+/// raises it for issue #364's threshold arm and is read **once**.
+///
+/// An unparseable value **panics** rather than falling back to the default:
+/// `DESIGN.md` §2.4 — *"make an invalid setting panic rather than fall back
+/// silently"* — because an arm that silently ran the baseline is #69's vacuous
+/// determinism run, and the whole point of this knob is to be A/B'd.
+fn skinny_max() -> usize {
+    use std::sync::OnceLock;
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| match std::env::var("LLOOM_364_SKINNY_MAX") {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("LLOOM_364_SKINNY_MAX must be an integer, got {v:?}")),
+        Err(_) => 16,
+    })
+}
+
 /// Select optimal tile configuration based on matrix dimensions, data type, transpose mode,
 /// and device type.
 ///
@@ -82,7 +103,24 @@ fn select_tile_config(
     // We use m < 16 as the threshold because:
     // - For m=1 to m=15, even 32x32 tile has some waste but it's the smallest available
     // - For m >= 16, the larger tiles can provide better throughput despite some waste
-    if m < 16 {
+    //
+    // # The threshold is a measurement arm as of issue #364
+    //
+    // `LLOOM_364_SKINNY_MAX` raises it, so the 32x32 tile is kept past 16 rather
+    // than yielding to `TILE_64_32_32_2_2`. **Off by default** (`DESIGN.md`
+    // §7.1a: no default is flipped without its own argued decision), so an
+    // unconfigured process selects byte-for-byte what shipped.
+    //
+    // It exists because the comment above is a *prediction* — *"the larger
+    // tiles can provide better throughput"* — and measured at one token's
+    // resolution it fails: crossing `m = 15 -> 16` costs **+17.9 % GPU busy for
+    // +6.7 % of work**, RESOLVED against a null, while the same one-token step
+    // inside either tile regime is unresolved. The larger tile is the expensive
+    // one at its own boundary.
+    //
+    // Read once (`OnceLock`), so this is not a per-dispatch `getenv` on a path
+    // §15.2 #10 forbids O(N) work on.
+    if m < skinny_max() {
         return TILE_32_32_16_2_2;
     }
 
