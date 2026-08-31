@@ -1481,3 +1481,48 @@ instantiate_gemm_transpose_helper(f16, half, f16, half, 32, 64, 16, 1, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 64, 16, 1, 2)
 #endif
+
+// ============================================================
+// Tile configurations for lloom issue #383 -- NOT reachable from
+// `select_tile_config` unless `LLOOM_383_TILE` names one.
+//
+// Every tile above has BN in {32, 64}. **No BN=16 tile has ever been
+// instantiated in this tree**, so lloom #378's *"BN=32 wastes nothing on N"*
+// dismissal argued about a configuration that could not have been selected.
+// These exist so the BN axis is measured rather than argued.
+//
+//   (32, 16, 16, 2, 2)  llama.cpp #27441's skinny shape. Halves N against the
+//                       32x32 we win with -- the direct test of whether BN is
+//                       a real axis on this hardware (H1).
+//   (16, 32, 16, 2, 2)  BM halved, BN held. At m=32 this is 0 % M-padding with
+//                       TWO threadgroups along M where TILE_32_32 is 0 % with
+//                       ONE, so padding and threadgroup-count predict
+//                       DIFFERENTLY here (H2).
+//   (16, 16, 16, 2, 2)  both halved, the corner of the 2x2.
+//
+// The structural constraints are not obvious and were checked rather than
+// assumed:
+//   BlockMMA (`:284`) needs TM = BM/(8*WM) and TN = BN/(8*WN) to be integers
+//   >= 1. At WM=WN=2 that is BM,BN >= 16 and divisible by 16 -- so 16 is the
+//   SMALLEST legal value of either dimension at this warp shape, and there is
+//   no 8-wide tile to instantiate.
+//   BlockLoader (`:76`) needs n_reads = BCOLS*BROWS/tgp_size >= 1 with
+//   TCOLS = BCOLS/n_reads dividing evenly, at tgp_size = WM*WN*32 = 128.
+// ============================================================
+instantiate_gemm_transpose_helper(f32, float, f32, float, 32, 16, 16, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f16, half, 32, 16, 16, 2, 2)
+#if defined(__HAVE_BFLOAT__)
+instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 16, 16, 2, 2)
+#endif
+
+instantiate_gemm_transpose_helper(f32, float, f32, float, 16, 32, 16, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f16, half, 16, 32, 16, 2, 2)
+#if defined(__HAVE_BFLOAT__)
+instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 16, 32, 16, 2, 2)
+#endif
+
+instantiate_gemm_transpose_helper(f32, float, f32, float, 16, 16, 16, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f16, half, 16, 16, 16, 2, 2)
+#if defined(__HAVE_BFLOAT__)
+instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 16, 16, 16, 2, 2)
+#endif

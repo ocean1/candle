@@ -7147,3 +7147,72 @@ fn mlx_multi_block_sort_merges_at_every_dtype() {
     let idx = run_mlx_sort_dtype(&vals_u32, ncols, DType::U32);
     assert_sorts(&idx, ncols, |i| vals_u32[i as usize] as f32, "u32");
 }
+
+/// Issue #383 — parity for the tiles that issue instantiates, at shapes where
+/// each tile's edge handling actually fires.
+///
+/// **Why this is driven by an environment variable rather than a loop.**
+/// `LLOOM_383_TILE` is read through a `OnceLock` (deliberately — §15.2 #10
+/// forbids a per-dispatch `getenv`), so a single process can exercise exactly
+/// one tile. The test therefore asserts parity for whichever tile the process
+/// was started with, and `tiles-parity.sh` runs it once per tile. With the
+/// variable unset it still runs and covers the shipping selection, so it is
+/// not vacuous in a normal `cargo test`.
+///
+/// The reference is computed on the host in f32. That is the §3.1 "parity
+/// against a reference" requirement met by something that is *not the thing
+/// being changed* — the tile cannot make a host loop agree with it.
+#[test]
+fn mlx_gemm_383_tile_parity() {
+    // Shapes chosen so that m is NOT a multiple of any candidate BM (16/32/64)
+    // and n is NOT a multiple of every candidate BN, so the masked edge path
+    // (`load_safe`) is exercised rather than only the aligned fast path.
+    // k is deliberately not a multiple of 16 either, for `align_k`.
+    for &(b, m, n, k) in &[
+        (1usize, 17usize, 48usize, 40usize),
+        (1, 33, 80, 24),
+        (2, 5, 96, 40),
+        (1, 64, 32, 32), // a fully aligned case, as the control
+    ] {
+        let lhs: Vec<f32> = (0..b * m * k).map(|i| ((i % 13) as f32) - 6.0).collect();
+        let rhs: Vec<f32> = (0..b * n * k).map(|i| ((i % 7) as f32) - 3.0).collect();
+
+        let got = run_mlx_gemm(
+            GemmDType::F32,
+            (b, m, n, k),
+            &lhs,
+            &[m * k, k, 1],
+            0,
+            &rhs,
+            &[n * k, n, 1],
+            0,
+        );
+
+        // Host reference: C[bi,i,j] = sum_l A[bi,i,l] * B[bi,l,j]
+        let mut want = vec![0f32; b * m * n];
+        for bi in 0..b {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f32;
+                    for l in 0..k {
+                        acc += lhs[bi * m * k + i * k + l] * rhs[bi * n * k + l * n + j];
+                    }
+                    want[bi * m * n + i * n + j] = acc;
+                }
+            }
+        }
+
+        let tile = std::env::var("LLOOM_383_TILE").unwrap_or_else(|_| "unset".into());
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "tile={tile} shape=({b},{m},{n},{k}): length"
+        );
+        for (idx, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-3 * w.abs().max(1.0),
+                "tile={tile} shape=({b},{m},{n},{k}) idx={idx}: {g} vs {w}"
+            );
+        }
+    }
+}
