@@ -7035,3 +7035,115 @@ fn rmsnorm_scale_matches_the_shipping_reduction() {
         scale[0]
     );
 }
+
+/// Sorts `ncols` **tie-free** values through `call_mlx_arg_sort` and returns the
+/// indices. Ties are excluded deliberately: the sort is unstable, so a fixture
+/// with duplicates cannot distinguish "returned a different valid answer" from
+/// "returned a wrong one", and the defect this exercises presents as duplicated
+/// indices.
+fn run_mlx_sort_dtype<T: Clone>(v: &[T], ncols: usize, dtype: DType) -> Vec<u32> {
+    let nrows = v.len() / ncols;
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let input = new_buffer(&device, v);
+    let indexes = vec![0u32; v.len()];
+    let output = new_buffer(&device, &indexes);
+
+    call_mlx_arg_sort(
+        &device,
+        &encoder,
+        &kernels,
+        dtype,
+        nrows,
+        ncols,
+        BufferOffset::zero_offset(&input),
+        &output,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec(&output, v.len())
+}
+
+/// Asserts `idx` is a permutation of `0..ncols` **and** orders `vals`
+/// ascending. The permutation half is the one that discriminates: an
+/// all-zeros or index-duplicating result satisfies a naive "is each element
+/// <= the next" check vacuously (lloom `DESIGN.md` §15.1 #1).
+fn assert_sorts<F: Fn(u32) -> f32>(idx: &[u32], ncols: usize, val: F, what: &str) {
+    let mut seen = vec![false; ncols];
+    for &i in idx {
+        let i = i as usize;
+        assert!(i < ncols, "{what}: index {i} out of range 0..{ncols}");
+        assert!(!seen[i], "{what}: index {i} appears twice — not a permutation");
+        seen[i] = true;
+    }
+    assert_eq!(idx.len(), ncols, "{what}: wrong length");
+    for w in idx.windows(2) {
+        let (a, b) = (val(w[0]), val(w[1]));
+        assert!(a <= b, "{what}: not ascending — {a} before {b}");
+    }
+}
+
+/// `multi_block_sort` names its merge kernel from the dtype, like the two
+/// kernels either side of it.
+///
+/// `mb_block_merge` is templated on `val_t` and reads `dev_vals_in` through it.
+/// The name was pinned to `merge_mbsort_float32_…` regardless of dtype, so at
+/// every non-f32 dtype the merge reinterpreted the block-sorted values through
+/// a `float` pointer. **The only test on this path was F32**, where the
+/// hardcode is accidentally correct — so nothing exercised it.
+///
+/// Measured before the fix at f16, ncols = 16 000: 8 000 of 16 000 indices
+/// distinct, 8 000 duplicated, not ascending — against the same fixture at f32
+/// on the same code returning a clean permutation.
+#[test]
+fn mlx_multi_block_sort_merges_at_every_dtype() {
+    // 16 000 columns forces `n_blocks = 4`, so the merge runs. A tie-free
+    // fixture is built from distinct f16 bit patterns, which every dtype below
+    // represents exactly: f16 has 31 744 distinct positive finite values, so a
+    // 16 000-wide fixture has room without approaching the subnormal end.
+    let ncols = 16_000usize;
+    let base: Vec<f16> = (0..ncols)
+        .map(|i| f16::from_bits((i + 1024) as u16))
+        .collect();
+    // Shuffle so the answer is not the identity — an identity fixture cannot
+    // tell a sort from a no-op.
+    let mut shuffled = base.clone();
+    shuffled.shuffle(&mut rng());
+    assert!(
+        shuffled.windows(2).any(|w| w[0] > w[1]),
+        "fixture is already sorted; the test would pass on a no-op"
+    );
+
+    // f16 — the dtype LFM2 decodes in, and the one the hardcode broke.
+    let vals = shuffled.clone();
+    let idx = run_mlx_sort_dtype(&vals, ncols, DType::F16);
+    assert_sorts(&idx, ncols, |i| vals[i as usize].to_f32(), "f16");
+
+    // bf16 — the checkpoint's on-disk dtype. Its own bit patterns, not the f16
+    // ramp converted: bf16 has 8 fewer mantissa bits, so converting would
+    // collide and reintroduce the ties this fixture exists to exclude.
+    let mut vals_bf: Vec<bf16> = (0..ncols).map(|i| bf16::from_bits((i + 1024) as u16)).collect();
+    vals_bf.shuffle(&mut rng());
+    let idx = run_mlx_sort_dtype(&vals_bf, ncols, DType::BF16);
+    assert_sorts(&idx, ncols, |i| vals_bf[i as usize].to_f32(), "bf16");
+
+    // f32 — the control. This arm passed before the fix and must still pass;
+    // without it a green run is consistent with having broken the path
+    // wholesale rather than repaired it.
+    let vals_f32: Vec<f32> = shuffled.iter().map(|v| v.to_f32()).collect();
+    let idx = run_mlx_sort_dtype(&vals_f32, ncols, DType::F32);
+    assert_sorts(&idx, ncols, |i| vals_f32[i as usize], "f32 control");
+
+    // u32 — an integer dtype, so the reinterpretation is a different shape.
+    let vals_u32: Vec<u32> = {
+        let mut v: Vec<u32> = (0..ncols as u32).collect();
+        v.shuffle(&mut rng());
+        v
+    };
+    let idx = run_mlx_sort_dtype(&vals_u32, ncols, DType::U32);
+    assert_sorts(&idx, ncols, |i| vals_u32[i as usize] as f32, "u32");
+}
