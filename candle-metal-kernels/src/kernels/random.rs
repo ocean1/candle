@@ -26,8 +26,15 @@ pub fn call_random_uniform(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
 
-    let odd = (length % 2 != 0) as usize;
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length / 2 + odd);
+    // One thread per element (lloom #345).
+    //
+    // This dispatched `length / 2 + odd` threads and had each write two
+    // elements from consecutive states of one `HybridTaus` stream, which made
+    // the elements of a vector pairwise dependent -- see the comment on
+    // `rand_uniform` in `metal_src/random.metal`. Independence within a vector
+    // is the property GPU sampling rests on, and it costs one thread per
+    // element to have.
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
 
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "rand_uniform {name} elems={length}");
@@ -57,8 +64,8 @@ pub fn call_random_normal(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
 
-    let odd = (length % 2 != 0) as usize;
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length / 2 + odd);
+    // One thread per element, as `call_random_uniform` above (lloom #345).
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
 
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "rand_normal {name} elems={length}");
