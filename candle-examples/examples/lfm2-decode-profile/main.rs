@@ -1086,6 +1086,47 @@ struct Args {
     #[arg(long)]
     per_token: bool,
 
+    /// Split the sample into its GPU-work and host-stall halves (lloom #172).
+    ///
+    /// Ported from `bench/issue-172-sample-cost`, which `DESIGN.md` §11.5a
+    /// records as the mechanism that produced the 441 µs figure and that could
+    /// not be re-run from the tip. Synchronizes between the `argmax` dispatch
+    /// and the 4-byte `to_scalar` so the two are attributed separately.
+    ///
+    /// **Diagnostic, not a total.** The extra synchronization inflates
+    /// `sample / token`, so only the split is readable -- §11.5a measures the
+    /// inflation at 17 % and records that pooling this arm with the clean one
+    /// is what a gate fired on.
+    #[arg(long)]
+    sample_split: bool,
+
+    /// Sample inside the forward pass's command buffer (lloom #319).
+    ///
+    /// The default path samples the PREVIOUS iteration's logits after
+    /// `device.synchronize()` has already drained the queue, so `argmax` opens
+    /// a fresh command buffer for one dispatch and `to_scalar` waits on a
+    /// second submit -- §11.2a's fixed ~0.5 ms round trip, measured at
+    /// **441 µs/token** in §11.5a.
+    ///
+    /// With this on the `argmax` is enqueued while the forward pass's command
+    /// buffer is still open, so the existing `synchronize()` drains both and
+    /// the readback reads an already-computed value. **One command-buffer
+    /// boundary moved by one dispatch**: no `MTLSharedEvent`, no token ring, no
+    /// dependency on §11.5's bounded window.
+    #[arg(long)]
+    sample_in_buffer: bool,
+
+    /// Write row 0's generated token ids, one per line, to this path.
+    ///
+    /// **The gate for `--sample-in-buffer`** (issue #319). That arm moves which
+    /// command buffer carries the `argmax` and must not change which token it
+    /// selects, so the two arms' streams are compared directly rather than
+    /// through a timing. This harness has no digest of its own -- `sha256.rs`
+    /// is `lfm2-determinism`'s -- and a file of ids is `cmp`-able, which is what
+    /// the gate needs. Off the timed path: written after the loop.
+    #[arg(long)]
+    dump_tokens: Option<PathBuf>,
+
     /// Label printed with the result, to tag a run inside a batch.
     #[arg(long, default_value = "")]
     label: String,
@@ -2140,6 +2181,22 @@ fn main() -> Result<()> {
         Vec::new()
     };
 
+    // Per token: (sample seconds, EOS-test seconds). Issue #172's bucket,
+    // ported from `bench/issue-172-sample-cost` per §11.5a.
+    //
+    // The `wall` window below opens AFTER the sample on the default path, so
+    // §11.2's non-GPU figure -- wall minus GPU busy -- structurally cannot
+    // contain it. Timed here so a step is `wall + sample + eos` and the term is
+    // an observed interval rather than a share inferred from a busy series.
+    //
+    // A timer pair rather than a counter: §6.4a prices `Instant::now()` at
+    // 43 ns, negligible against a readback that blocks on
+    // `flush_and_wait_current()`, and it is the same instrument the wall window
+    // uses -- so the two are commensurable by construction.
+    let mut sample_steps: Vec<(f64, f64)> = Vec::with_capacity(args.n);
+    // Per token under `--sample-split`: (argmax-and-sync seconds, readback seconds).
+    let mut split_steps: Vec<(f64, f64)> = Vec::with_capacity(args.n);
+
     #[cfg(feature = "metal")]
     let metal_device = match &device {
         Device::Metal(d) => Some(d.clone()),
@@ -2156,6 +2213,25 @@ fn main() -> Result<()> {
     // Bytes last written to the by-class timeline, so the final report can say
     // whether it reached disk without re-reading it.
     let mut rt_written: usize = 0;
+
+    // **The `--sample-in-buffer` bootstrap** (issue #319).
+    //
+    // That arm reads each step's token at the BOTTOM of the loop, out of the
+    // argmax that rode the forward pass's command buffer. The first iteration
+    // has no previous bottom, so its token comes from the prefill logits here.
+    //
+    // This one sample is a second submit -- the prefill's `synchronize()` has
+    // already drained the queue -- and that is correct rather than a leak: the
+    // default arm pays exactly one such submit per token including this one, so
+    // paying it once outside the loop is what makes the two arms generate the
+    // same stream from the same prefill. It is off the per-token path and
+    // outside every timed window.
+    if args.sample_in_buffer {
+        for (r, slot) in batch_rows.iter_mut().enumerate() {
+            let row = logits.narrow(0, r, 1)?.squeeze(0)?;
+            *slot = logits_processor.sample(&row).context("prefill sampling")?;
+        }
+    }
 
     let mut mem_jsonl = match args.mem_jsonl.as_ref() {
         Some(p) => Some(std::io::BufWriter::new(
@@ -2218,14 +2294,43 @@ fn main() -> Result<()> {
         // reason — see the `dispatches_per_token_forward` note below.
         //
         // Each row gets its own narrowed view rather than a copy.
-        for (r, slot) in batch_rows.iter_mut().enumerate() {
-            // `[B, vocab] -> [vocab]`. `narrow` + `squeeze` rather than
-            // `IndexOp::i`, which would need a trait import for one call; both
-            // are views and neither copies. At `B = 1` this is `squeeze(0)`,
-            // the exact shape the B=1 path always passed.
-            let row = logits.narrow(0, r, 1)?.squeeze(0)?;
-            *slot = logits_processor.sample(&row).context("sampling")?;
+        //
+        // On the `--sample-in-buffer` arm the tokens for this step were already
+        // sampled at the bottom of the previous iteration, while the forward
+        // pass's command buffer was still open (issue #319) -- or, for the first
+        // iteration, out of the prefill logits just above the loop. `batch_rows`
+        // holds them, so there is nothing to do here and no second submit.
+        let sample_start = std::time::Instant::now();
+        if !args.sample_in_buffer {
+            for (r, slot) in batch_rows.iter_mut().enumerate() {
+                // `[B, vocab] -> [vocab]`. `narrow` + `squeeze` rather than
+                // `IndexOp::i`, which would need a trait import for one call; both
+                // are views and neither copies. At `B = 1` this is `squeeze(0)`,
+                // the exact shape the B=1 path always passed.
+                let row = logits.narrow(0, r, 1)?.squeeze(0)?;
+                *slot = if args.sample_split {
+                    // The forward pass has already been synchronized by the
+                    // previous iteration, so `argmax` here enqueues ONE dispatch
+                    // over the vocab and `to_scalar` then blits 4 bytes back and
+                    // blocks on `flush_and_wait_current()`. Synchronizing between
+                    // them attributes the two separately -- which is what decides
+                    // whether the cost is the submit or the transfer (§11.2a).
+                    let split_start = std::time::Instant::now();
+                    let idx = row.argmax(candle::D::Minus1).context("argmax")?;
+                    device.synchronize()?;
+                    let argmax_s = split_start.elapsed().as_secs_f64();
+                    let read_start = std::time::Instant::now();
+                    let tok = idx.to_scalar::<u32>().context("argmax readback")?;
+                    if r == 0 {
+                        split_steps.push((argmax_s, read_start.elapsed().as_secs_f64()));
+                    }
+                    tok
+                } else {
+                    logits_processor.sample(&row).context("sampling")?
+                };
+            }
         }
+        let sample_s = sample_start.elapsed().as_secs_f64();
         let next = batch_rows[0];
 
         // **The correctness gate** (issue #249): identical prompts must give
@@ -2239,7 +2344,11 @@ fn main() -> Result<()> {
             }
         }
 
-        if eos_ids.contains(&next) {
+        let eos_start = std::time::Instant::now();
+        let is_eos = eos_ids.contains(&next);
+        let eos_s = eos_start.elapsed().as_secs_f64();
+        sample_steps.push((sample_s, eos_s));
+        if is_eos {
             // The point is a steady-state decode measurement, so generation
             // continues past the model's natural stopping point. Recorded
             // because past EOS the text degenerates, and a reader should know
@@ -2279,6 +2388,35 @@ fn main() -> Result<()> {
         logits = model
             .forward(&input, kv_len, &mut cache)
             .context("decode forward pass")?;
+
+        // **Issue #319: the argmax rides the forward pass's command buffer.**
+        //
+        // Enqueued HERE -- after `forward` and before `synchronize()` -- the
+        // `argmax` dispatch lands in the command buffer the forward pass is
+        // still filling. The `synchronize()` below then drains both, and the
+        // `to_scalar` after it reads a value the GPU has already computed.
+        //
+        // On the default path this same `argmax` runs at the TOP of the next
+        // iteration, after `synchronize()` has drained the queue -- so it opens
+        // a fresh command buffer for one dispatch and `to_scalar` waits on a
+        // second submit. That is §11.2a's fixed ~0.5 ms round trip, measured at
+        // 441 µs/token in §11.5a. **The dispatch is the same and the arithmetic
+        // is the same; only which buffer carries it moves.**
+        //
+        // The `to_scalar` is deliberately NOT here: it must follow the
+        // `synchronize()`, because it is the readback and putting it before the
+        // drain would reintroduce the very wait this arm removes.
+        let pending_argmax = if args.sample_in_buffer {
+            let mut idx = Vec::with_capacity(batch);
+            for r in 0..batch {
+                let row = logits.narrow(0, r, 1)?.squeeze(0)?;
+                idx.push(row.argmax(candle::D::Minus1).context("argmax")?);
+            }
+            Some(idx)
+        } else {
+            None
+        };
+
         // One synchronization per token. This is what makes the window a single
         // token rather than a submission queue, and it is also what the decode
         // loop does anyway: sampling reads the logits back to the CPU, so the
@@ -2286,6 +2424,27 @@ fn main() -> Result<()> {
         // measuring it.
         device.synchronize()?;
         let wall = step_start.elapsed().as_secs_f64();
+
+        // The readback, on the `--sample-in-buffer` arm only. Timed into the
+        // same `sample_steps` bucket the default arm uses, so `wall + sample +
+        // eos` means the same thing on both arms and the two are comparable
+        // (§11.5a's disjointness requirement).
+        //
+        // Outside the `wall` window deliberately: `wall` is the forward pass's
+        // window on every recorded figure this project holds, and moving a term
+        // into it would make this arm's `wall` incomparable to all of them.
+        if let Some(idx) = pending_argmax {
+            let read_start = std::time::Instant::now();
+            for (r, slot) in batch_rows.iter_mut().enumerate() {
+                *slot = idx[r].to_scalar::<u32>().context("argmax readback")?;
+            }
+            let read_s = read_start.elapsed().as_secs_f64();
+            // Replaces this step's placeholder push, which recorded only the
+            // (zero) cost of the skipped top-of-loop sample.
+            if let Some(last) = sample_steps.last_mut() {
+                last.0 = read_s;
+            }
+        }
 
         let (gpu, disp) = if profiling {
             let s = profile::snapshot();
@@ -2558,6 +2717,26 @@ fn main() -> Result<()> {
     let wall_med = walls[walls.len() / 2];
     let wall_max = walls[walls.len() - 1];
 
+    // ---- the sample bucket (lloom #172, #319) ----------------------------
+    //
+    // **The median as well as the mean, and the median is what compares.**
+    // §11.5a establishes that `sample_ms_per_token` has §6.6b's shape -- a floor
+    // plus a one-sided tail -- so its mean rises over a long run while its
+    // median is flat, and *"a mean of a right-tailed distribution is not a
+    // location estimate"*. §11.2a reports this term as flat in `kv_len` and that
+    // is correct on the median only.
+    let sample_steady = &sample_steps[warmup.min(sample_steps.len())..];
+    let (sample_mean, sample_med, eos_mean) = if sample_steady.is_empty() {
+        (0.0, 0.0, 0.0)
+    } else {
+        let n = sample_steady.len() as f64;
+        let mean = sample_steady.iter().map(|s| s.0).sum::<f64>() / n;
+        let eos = sample_steady.iter().map(|s| s.1).sum::<f64>() / n;
+        let mut v: Vec<f64> = sample_steady.iter().map(|s| s.0).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (mean, v[v.len() / 2], eos)
+    };
+
     // Dispatch counts must be identical token to token if the sequence is
     // stable; report the range so a reader can see whether it was.
     let disp_min = steady.iter().map(|s| s.2).min().unwrap_or(0);
@@ -2573,6 +2752,20 @@ fn main() -> Result<()> {
         .collect();
     let n_attn = layer_is_attn.iter().filter(|b| **b).count();
     let weight_bytes = language_weight_bytes(&config, &layer_is_attn, dtype.size_in_bytes());
+
+    // Row 0's stream, for the `--sample-in-buffer` gate (issue #319). After the
+    // loop, so the write is outside every timed window.
+    if let Some(path) = args.dump_tokens.as_ref() {
+        use std::io::Write as _;
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(path)
+                .with_context(|| format!("creating token dump at {}", path.display()))?,
+        );
+        for t in &tokens {
+            writeln!(f, "{t}")?;
+        }
+        f.flush()?;
+    }
 
     println!("=== machine / configuration ===");
     println!("dtype                 {dtype:?}");
@@ -2901,6 +3094,52 @@ fn main() -> Result<()> {
         println!();
     }
 
+    // ---- the sample bucket, reported (lloom #172, #319) -------------------
+    //
+    // **A step is `wall + sample + eos`, DISJOINT rather than a share.** The
+    // `wall` window opens after the sample on the default arm and closes before
+    // the readback on the `--sample-in-buffer` arm, so §11.2's non-GPU figure
+    // structurally cannot contain either term (§11.2a, §11.5a).
+    {
+        let step_ms = (wall_mean + sample_mean + eos_mean) * 1e3;
+        println!("=== sample and EOS (lloom #172, #319) ===");
+        println!(
+            "  arm                 {}",
+            if args.sample_in_buffer {
+                "in-buffer  (argmax rides the forward's command buffer)"
+            } else {
+                "default    (argmax opens its own command buffer)"
+            }
+        );
+        println!(
+            "  sample / token      {:.4} ms  (med {:.4})",
+            sample_mean * 1e3,
+            sample_med * 1e3
+        );
+        println!("  EOS test / token    {:.4} ms", eos_mean * 1e3);
+        println!(
+            "  step = wall+sample+eos  {step_ms:.4} ms   -> {:.2} tok/s effective",
+            if step_ms > 0.0 { 1e3 / step_ms } else { 0.0 }
+        );
+        if args.sample_split && split_steps.len() > warmup {
+            let s = &split_steps[warmup..];
+            let n = s.len() as f64;
+            let argmax_mean = s.iter().map(|x| x.0).sum::<f64>() / n;
+            let read_mean = s.iter().map(|x| x.1).sum::<f64>() / n;
+            println!();
+            println!("  --- split (DIAGNOSTIC: the extra sync inflates the total) ---");
+            println!(
+                "  argmax + sync       {:.4} ms  <- the submit",
+                argmax_mean * 1e3
+            );
+            println!(
+                "  4-byte readback     {:.4} ms  <- blit + flush_and_wait_current",
+                read_mean * 1e3
+            );
+        }
+        println!();
+    }
+
     // The configuration is part of the RESULT line, not a separate note.
     // #99's diagnosis was that the harness emits a near-complete cache key
     // missing the commit and the variant axes; both are here, so a row can name
@@ -2936,7 +3175,10 @@ fn main() -> Result<()> {
     let scratch_asks_bytes = flash_scratch_ask_bytes(&axes, &config, kv_len, args.kv_capacity);
     println!(
         "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
-         gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} dispatches_per_token={:.1} \
+         gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} \
+         sample_ms_per_token={:.4} sample_med_ms_per_token={:.4} eos_ms_per_token={:.4} \
+         sample_in_buffer={} step_ms_per_token={:.4} \
+         dispatches_per_token={:.1} \
          dispatches_per_forward={:.1} aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
          batch_streams_identical={} spec_k={} spec_proposer={} spec_windows={} \
          spec_proposed={} spec_accepted={} spec_corrupted={} spec_accept_rate={:.4} \
@@ -2953,6 +3195,15 @@ fn main() -> Result<()> {
         wall_per_token * 1e3,
         gpu_per_token * 1e3,
         (wall_per_token - gpu_per_token) * 1e3,
+        // The sample bucket (#172, #319). DISJOINT from `wall`, so a step is
+        // the sum of the three rather than `wall` alone -- which is why
+        // `step_ms_per_token` is printed beside them rather than left to be
+        // recomputed by a reader who may not know the windows do not overlap.
+        sample_mean * 1e3,
+        sample_med * 1e3,
+        eos_mean * 1e3,
+        args.sample_in_buffer,
+        (wall_per_token + sample_mean + eos_mean) * 1e3,
         disp_mean,
         // Floored at 0 rather than subtracted blindly: with profiling off
         // `disp_mean` is 0.0, and `0 - (B-1)` printed **-7.0** at B=8 — a count
