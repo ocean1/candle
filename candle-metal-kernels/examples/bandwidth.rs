@@ -71,6 +71,29 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_values_t = [256usize, 512, 1024])]
     threadgroup: Vec<usize>,
 
+    /// Restrict the sweep to these kernels by name (default: all three).
+    ///
+    /// Added for lloom #393. A sweep is the right shape for finding a peak and
+    /// the wrong shape for anything that integrates over the run: this harness
+    /// spans 92.8 to 370.2 GB/s across its own configurations, so a concurrent
+    /// memory-controller measurement (`AMC Stats`, `DESIGN.md` §3.4a) averaged
+    /// over a whole sweep reports the sweep's *mix* rather than the machine's
+    /// ceiling. Pinning the kernel makes the sampled window one configuration,
+    /// which is what an aggregate-bandwidth question needs.
+    #[arg(long, value_delimiter = ',')]
+    kernels: Option<Vec<String>>,
+
+    /// Repeat the whole sweep N times back to back.
+    ///
+    /// Also #393's: one pass at one configuration is ~3 ms of GPU time at
+    /// 1 GiB, against `lloom-sample`'s 17 ms interval floor (§3.4a: GPU energy
+    /// updates at ~16.7 ms and anything finer is interpolation, so the floor is
+    /// refused rather than clamped). Repeating gives the sampler a window long
+    /// enough to carry whole intervals of the configuration under test instead
+    /// of one sample straddling the setup either side of it.
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+
     /// Print every configuration, not just the peak per size.
     #[arg(long)]
     verbose: bool,
@@ -198,6 +221,21 @@ fn main() -> Result<()> {
 
     let mut global_peak = 0.0f64;
     let mut global_peak_desc = String::new();
+    let mut gpu_busy_s = 0.0f64;
+    let mut gpu_bytes = 0.0f64;
+
+    // An unknown name is an error rather than an empty sweep: a filter that
+    // silently matches nothing produces a run with no timed work, which reads
+    // exactly like a correct run that measured nothing (§15.1a's VACUOUS class).
+    if let Some(names) = &args.kernels {
+        for n in names {
+            anyhow::ensure!(
+                VARIANTS.iter().any(|v| v.name == n),
+                "unknown kernel {n:?}; known: {:?}",
+                VARIANTS.iter().map(|v| v.name).collect::<Vec<_>>()
+            );
+        }
+    }
 
     for &mib in &args.sizes_mib {
         let bytes = mib * 1024 * 1024;
@@ -209,6 +247,11 @@ fn main() -> Result<()> {
         let mut size_peak_desc = String::new();
 
         for variant in &VARIANTS {
+            if let Some(names) = &args.kernels {
+                if !names.iter().any(|n| n == variant.name) {
+                    continue;
+                }
+            }
             let function = library
                 .newFunctionWithName(&NSString::from_str(variant.name))
                 .with_context(|| format!("looking up {}", variant.name))?;
@@ -230,7 +273,13 @@ fn main() -> Result<()> {
                 let n_elems = (bytes / variant.bytes_per_elem) as u32;
 
                 let mut best = f64::MAX;
-                for it in 0..(args.warmup + args.iters) {
+                // `repeat` multiplies the timed iterations rather than wrapping
+                // the sweep, so a pinned configuration occupies one long
+                // contiguous stretch of GPU time. Wrapping the sweep instead
+                // would interleave the configurations again, which is the thing
+                // the `--kernels` filter exists to stop.
+                let timed = args.iters * args.repeat.max(1);
+                for it in 0..(args.warmup + timed) {
                     let cb = queue.commandBuffer().context("command buffer")?;
                     let enc = cb.computeCommandEncoder().context("encoder")?;
                     enc.setComputePipelineState(&pipeline);
@@ -263,6 +312,17 @@ fn main() -> Result<()> {
                     let secs = cb.GPUEndTime() - cb.GPUStartTime();
                     if secs > 0.0 && secs < best {
                         best = secs;
+                    }
+                    if secs > 0.0 {
+                        // #393: the bytes this harness moved and the GPU time it
+                        // spent moving them, accumulated over every timed
+                        // iteration. A concurrent `AMC Stats` reading covers a
+                        // WALL window that also contains setup, so these two
+                        // totals are what bound how much of that window was the
+                        // kernel -- without them an aggregate figure cannot say
+                        // whether it was diluted.
+                        gpu_busy_s += secs;
+                        gpu_bytes += bytes as f64;
                     }
                 }
 
@@ -313,7 +373,21 @@ fn main() -> Result<()> {
     println!("  at                  {}", global_peak_desc.trim());
     println!("fraction of ~400 spec {:.0}%", 100.0 * global_peak / 400.0);
     println!();
-    println!("RESULT achieved_gbs={global_peak:.1}");
+    // `gpu_busy_s` and `gpu_bytes` are totals over every timed iteration of
+    // every configuration that ran, so their ratio is the sweep's MEAN rate and
+    // is deliberately not the headline -- `achieved_gbs` is the peak, which is
+    // what a roofline wants. They are emitted for #393, where a concurrent
+    // memory-controller reading needs to know how much of its wall window was
+    // kernel time; `mean_gbs` reproduces from them and is printed so the
+    // relationship between the two figures is visible rather than derived.
+    let mean_gbs = if gpu_busy_s > 0.0 {
+        gpu_bytes / gpu_busy_s / 1e9
+    } else {
+        0.0
+    };
+    println!(
+        "RESULT achieved_gbs={global_peak:.1} gpu_busy_s={gpu_busy_s:.4} gpu_bytes={gpu_bytes:.0} mean_gbs={mean_gbs:.1}"
+    );
 
     Ok(())
 }
