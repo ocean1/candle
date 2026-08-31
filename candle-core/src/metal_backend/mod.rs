@@ -51,6 +51,37 @@ pub use candle_metal_kernels::metal::trace;
 /// graph.
 pub use candle_metal_kernels::metal::profile;
 
+/// Restore the blit in [`MetalStorage::to_cpu`], for A/B and for a fallback.
+///
+/// `CANDLE_METAL_TO_CPU_BLIT=1` selects the pre-#336 path. Off by default, so
+/// the fast path is what ships and what every recorded figure after this change
+/// belongs to -- but the old arm stays *compiled and selectable* rather than
+/// deleted, which is §12.3's rule (variants coexist) and what makes the
+/// comparison in `measurements/issue-336-*` re-runnable rather than historical.
+///
+/// Read once through a `OnceLock`: this sits on the per-token path, and #69's
+/// vacuous determinism run is what a per-call `var()` risks (§2.4).
+/// Engagement counters for #336's two `to_cpu` paths (§2.4: an instrument that
+/// cannot be shown to have engaged has measured nothing). Free: two relaxed
+/// increments on a path that already waits on the GPU.
+pub static TO_CPU_FAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TO_CPU_BLIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(fast, blit)` readback counts since process start.
+pub fn to_cpu_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TO_CPU_FAST.load(Relaxed), TO_CPU_BLIT.load(Relaxed))
+}
+
+pub fn to_cpu_force_blit() -> bool {
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| {
+        std::env::var("CANDLE_METAL_TO_CPU_BLIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {
         buffer,
@@ -2089,6 +2120,49 @@ impl MetalStorage {
 
     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
+
+        // Fast path: read the source directly, no destination and no blit.
+        //
+        // `DESIGN.md` §15.2 #12 forbids blits on the decode path, and this
+        // function has violated it once per token for as long as it has existed
+        // (§11.5b finding 1) -- `to_scalar` on the sampled argmax reaches here
+        // for **4 bytes**. The blit exists to land the bytes somewhere the CPU
+        // can read; when the source is already CPU-readable there is nothing
+        // for it to do.
+        //
+        // **The test is `contents()`, and what it decides is not the storage
+        // mode -- it is whether Metal happened to MAP this allocation.**
+        // Measured on M1 Max / macOS 26.6.2 (`measurements/issue-336-raw/`):
+        // a `StorageModePrivate` buffer is CPU-mapped below **16384 bytes** and
+        // never at or above it, exactly. So `buffer.rs`'s "null for a
+        // Private-storage allocation" is wrong for small allocations and right
+        // for large ones, and neither a mode test nor a size test is the honest
+        // predicate: the pool rounds, so the same 4-byte `to_scalar` lands in a
+        // 12288 B buffer on one arm and a 731136 B one on another, and only the
+        // first is readable.
+        //
+        // Asking the pointer asks the only question whose answer is
+        // load-bearing, and it fails **closed**: an unmapped buffer takes the
+        // blit, which is the pre-existing path. That is why this is safe to
+        // ship even though which arm a given readback takes is a property of
+        // the allocator rather than of this function.
+        //
+        // What is NOT skipped is the wait. The GPU still has to finish writing
+        // the value before the CPU may read it, so `flush_and_wait_current`
+        // stays on both paths; §11.2a measures that half at 0.241-0.265 ms
+        // against the blit's own share, and only the blit is removed here.
+        // Skipping the wait would be a read-before-write race, which §3.5 makes
+        // silent corruption rather than an error.
+        if !crate::metal_backend::to_cpu_force_blit() {
+            let src = self.buffer.contents();
+            if !src.is_null() {
+                TO_CPU_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.device.flush_and_wait_current()?;
+                return Ok(read_to_vec(&self.buffer, self.count));
+            }
+        }
+        TO_CPU_BLIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let buffer = self
             .device
             .new_buffer_builder()
@@ -2504,4 +2578,325 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     assert!(!ptr.is_null());
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
     slice.to_vec()
+}
+
+#[cfg(test)]
+mod issue_336_split {
+    //! Where does the readback's time go: the encoder break, or the wait?
+    //!
+    //! §11.2a measures the readback half at 0.227-0.256 ms and does not
+    //! separate the two. This times the three components on the arm the issue
+    //! specifies -- the queue ALREADY DRAINED, which is what
+    //! `--sample-in-buffer` produces -- so `flush_and_wait_current` has nothing
+    //! left to wait for and whatever remains is the blit's own cost.
+    use crate::{DType, Device, Tensor, D};
+    use std::time::Instant;
+
+    #[test]
+    fn where_the_readback_time_goes() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(mdev) = &dev else {
+            unreachable!()
+        };
+        let n = 256usize;
+
+        let mut t_fast = Vec::new();
+        let mut t_blit = Vec::new();
+        let mut t_alloc = Vec::new();
+        let mut t_encode = Vec::new();
+        let mut t_wait = Vec::new();
+
+        for i in 0..n {
+            let logits = Tensor::rand(0f32, 1f32, (1, 128000), &dev).unwrap();
+            let am = logits.argmax(D::Minus1).unwrap();
+            let (storage, _) = am.storage_and_layout();
+            let crate::Storage::Metal(ms) = &*storage else {
+                unreachable!()
+            };
+
+            // The arm the issue specifies: queue already drained, as
+            // `--sample-in-buffer` leaves it.
+            mdev.wait_until_completed().unwrap();
+
+            // FAST: direct read + a wait that has nothing to do.
+            let s = Instant::now();
+            let v: Vec<u32> = ms.to_cpu().unwrap();
+            t_fast.push(s.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(v);
+
+            // BLIT, decomposed.
+            let size = ms.count * ms.dtype.size_in_bytes();
+            let s = Instant::now();
+            let dst = ms
+                .device
+                .new_buffer_builder()
+                .with_size(size)
+                .with_label("blit_to_cpu_dst")
+                .build()
+                .unwrap();
+            let a = s.elapsed().as_secs_f64() * 1e3;
+
+            let s2 = Instant::now();
+            {
+                let mut blit = ms.device.blit_command_encoder().unwrap();
+                blit.set_label("blit_to_cpu");
+                blit.copy_from_buffer(&ms.buffer, 0, &dst, 0, size);
+            }
+            let e = s2.elapsed().as_secs_f64() * 1e3;
+
+            let s3 = Instant::now();
+            ms.device.flush_and_wait_current().unwrap();
+            let w = s3.elapsed().as_secs_f64() * 1e3;
+            let v2: Vec<u32> = super::read_to_vec(&dst, ms.count);
+            std::hint::black_box(v2);
+
+            if i >= 32 {
+                // warmup
+                t_alloc.push(a);
+                t_encode.push(e);
+                t_wait.push(w);
+                t_blit.push(a + e + w);
+            }
+            let _ = DType::U32;
+        }
+
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            v[v.len() / 2]
+        };
+        let (f, b) = (med(&mut t_fast.split_off(32)), med(&mut t_blit));
+        let (al, en, wa) = (med(&mut t_alloc), med(&mut t_encode), med(&mut t_wait));
+        println!("ISSUE336-SPLIT n={} (queue pre-drained)", t_wait.len());
+        println!("ISSUE336-SPLIT fast_total_ms={f:.4}");
+        println!("ISSUE336-SPLIT blit_total_ms={b:.4}  alloc={al:.4} encode={en:.4} wait={wa:.4}");
+        println!("ISSUE336-SPLIT blit_minus_fast_ms={:.4}", b - f);
+    }
+}
+
+#[cfg(test)]
+mod issue_336_to_cpu {
+    //! `to_cpu` without the blit (lloom #336, `DESIGN.md` §15.2 #12).
+    //!
+    //! The parity arms compare the two paths **against each other on the same
+    //! tensor**, which is what makes them a comparison rather than a
+    //! restatement: `CANDLE_METAL_TO_CPU_BLIT` is read once per process
+    //! (§2.4/#69), so the arms are selected by calling the two code paths
+    //! directly rather than by setting the variable per test.
+    use crate::{DType, Device, Tensor, D};
+
+    /// Read back through the blit, unconditionally -- the pre-#336 path, kept
+    /// reachable so a test can compare against it in one process.
+    fn via_blit<T: Clone>(ms: &super::MetalStorage) -> Vec<T> {
+        let size = ms.count * ms.dtype.size_in_bytes();
+        let buffer = ms
+            .device
+            .new_buffer_builder()
+            .with_size(size)
+            .with_label("blit_to_cpu_dst")
+            .build()
+            .unwrap();
+        {
+            let mut blit = ms.device.blit_command_encoder().unwrap();
+            blit.set_label("blit_to_cpu");
+            blit.copy_from_buffer(&ms.buffer, 0, &buffer, 0, size);
+        }
+        ms.device.flush_and_wait_current().unwrap();
+        super::read_to_vec(&buffer, ms.count)
+    }
+
+    fn metal() -> Option<Device> {
+        Device::new_metal(0).ok()
+    }
+
+    /// The decode case this issue is about: a 4-byte `to_scalar` on the argmax.
+    #[test]
+    fn argmax_readback_agrees_with_the_blit() {
+        let Some(dev) = metal() else { return };
+        let logits = Tensor::rand(0f32, 1f32, (1, 128000), &dev).unwrap();
+        let am = logits.argmax(D::Minus1).unwrap();
+        let (storage, _) = am.storage_and_layout();
+        let crate::Storage::Metal(ms) = &*storage else {
+            unreachable!()
+        };
+
+        let fast = am.to_vec1::<u32>().unwrap();
+        let blit: Vec<u32> = via_blit(ms);
+        assert_eq!(fast, blit, "fast path disagrees with the blit");
+
+        // Non-vacuity (§15.1 #1): an argmax over a random 128000-wide row must
+        // not be a constant the comparison would pass on trivially.
+        assert_eq!(fast.len(), 1);
+        assert!(fast[0] < 128000);
+    }
+
+    /// The generic contract: every dtype and a size past one element, since
+    /// `to_cpu` is generic over both and only the 4-byte case motivated this.
+    #[test]
+    fn readback_agrees_with_the_blit_across_dtypes_and_sizes() {
+        let Some(dev) = metal() else { return };
+        let mut checked = 0usize;
+
+        for n in [1usize, 3, 1024, 128000] {
+            let base = Tensor::rand(0f32, 1f32, n, &dev).unwrap();
+
+            for dtype in [DType::F32, DType::F16, DType::BF16, DType::U32, DType::U8] {
+                let t = base.to_dtype(dtype).unwrap();
+                let (storage, _) = t.storage_and_layout();
+                let crate::Storage::Metal(ms) = &*storage else {
+                    unreachable!()
+                };
+
+                // Compare the raw bytes, so the check is dtype-agnostic and
+                // does not depend on a float comparison.
+                let fast: Vec<u8> = ms.to_cpu().unwrap();
+                let blit: Vec<u8> = via_blit(ms);
+                assert_eq!(
+                    fast.len() * std::mem::size_of::<u8>(),
+                    blit.len(),
+                    "length mismatch at {dtype:?} n={n}"
+                );
+                assert_eq!(fast, blit, "byte mismatch at {dtype:?} n={n}");
+
+                // The comparison must be capable of failing: a buffer of one
+                // repeated byte would agree under a broken read.
+                if n > 1 && dtype == DType::F32 {
+                    let distinct: std::collections::HashSet<_> = fast.iter().collect();
+                    assert!(
+                        distinct.len() > 1,
+                        "fixture is uniform at {dtype:?} n={n}; the comparison proves nothing"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 20, "expected 4 sizes x 5 dtypes");
+    }
+
+    /// The fast path must read the value the GPU wrote, not a stale one.
+    ///
+    /// Without the wait this races; the assertion is that the *sequence*
+    /// (dispatch, wait, read) lands the new value, run repeatedly so a
+    /// read-before-write would show up as a disagreement rather than as luck.
+    #[test]
+    fn readback_sees_the_current_value_not_a_stale_one() {
+        let Some(dev) = metal() else { return };
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..32u32 {
+            let t = (Tensor::ones(4, DType::U32, &dev).unwrap() * (i as f64)).unwrap();
+            let got = t.to_vec1::<u32>().unwrap();
+            assert_eq!(got, vec![i; 4], "stale or wrong readback at iteration {i}");
+            seen.insert(got[0]);
+        }
+        // The loop must actually vary the value, or it proves nothing.
+        assert_eq!(seen.len(), 32, "fixture did not vary");
+    }
+
+    /// **Which allocations are CPU-mapped, pinned as a fact about the machine.**
+    ///
+    /// This is what decides how often the fast path fires, and it is a property
+    /// of *(device, OS)* rather than of candle (`CONTRIBUTING.md` §2.7). A
+    /// Private allocation is mapped below 16 KiB and unmapped at or above it,
+    /// so the same 4-byte `to_scalar` is readable or not depending on what size
+    /// the pool rounded its buffer to.
+    ///
+    /// If this changes, the fast path's *hit rate* changes and nothing else --
+    /// `to_cpu` still returns the right bytes either way, because the null test
+    /// fails closed onto the blit.
+    #[test]
+    fn private_allocations_are_mapped_below_16k_and_not_above() {
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+
+        // Sized in u32 elements. The pool rounds up to `BUFFER_ALIGNMENT`
+        // (128 B), so 16380 would become 16384 and land on the wrong side --
+        // one element below the boundary is not one *allocation* below it.
+        // 4064 u32 = 16256 B, which rounds to itself.
+        let mapped = m.new_buffer(4064, DType::U32, "probe").unwrap(); // 16256 B
+        let unmapped = m.new_buffer(4096, DType::U32, "probe").unwrap(); // 16384 B
+
+        assert!(
+            !mapped.contents().is_null(),
+            "a 16256 B private allocation was expected to be CPU-mapped"
+        );
+        assert!(
+            unmapped.contents().is_null(),
+            "a 16384 B private allocation was expected NOT to be CPU-mapped; \
+             if this fires the threshold moved and the fast path's hit rate \
+             changed -- see measurements/issue-336-raw/threshold.txt"
+        );
+
+        // Shared is mapped at both sizes, which is what makes the above a
+        // statement about Private rather than about size alone.
+        let big_shared = m.allocate_buffer(1 << 20).unwrap();
+        assert!(!big_shared.contents().is_null(), "shared must be mapped");
+    }
+
+    /// The env switch resolves, and it defaults to the fast path.
+    #[test]
+    fn force_blit_defaults_off() {
+        // Only meaningful when the variable is unset, which is the shipping
+        // configuration and how CI runs.
+        if std::env::var("CANDLE_METAL_TO_CPU_BLIT").is_err() {
+            assert!(
+                !super::to_cpu_force_blit(),
+                "the blit must be off by default"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod issue_336_storage_probe {
+    //! Probe for lloom #336: is the argmax output's buffer CPU-readable?
+    //!
+    //! `to_cpu` blits for a 4-byte read (`DESIGN.md` §15.2 #12). Whether that
+    //! blit is removable turns on one fact: does the buffer the argmax writes
+    //! expose a CPU pointer that sees the GPU's write? This asks candle, through
+    //! candle's own allocation paths, rather than a hand-rolled `MTLBuffer`.
+    use crate::{DType, Device, Tensor, D};
+
+    #[test]
+    fn argmax_output_buffer_storage_and_readability() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no metal device; skipping");
+            return;
+        };
+        let Device::Metal(mdev) = &dev else {
+            unreachable!()
+        };
+
+        // The real decode shape: argmax over a [1, 128000] f32 row, which is
+        // what `sample_argmax` dispatches (§11.2a).
+        let logits = Tensor::rand(0f32, 1f32, (1, 128000), &dev).unwrap();
+        let am = logits.argmax(D::Minus1).unwrap();
+
+        let (storage, _) = am.storage_and_layout();
+        let crate::Storage::Metal(ms) = &*storage else {
+            unreachable!()
+        };
+
+        let ptr = ms.buffer().contents();
+        println!(
+            "ISSUE336 argmax_out dtype={:?} count={}",
+            am.dtype(),
+            am.elem_count()
+        );
+        println!("ISSUE336 contents_ptr={ptr:?} null={}", ptr.is_null());
+
+        // Drain so the GPU write has certainly landed, then read directly.
+        mdev.wait_until_completed().unwrap();
+        if !ptr.is_null() {
+            let direct = unsafe { *(ptr as *const u32) };
+            let viablit = am.to_vec1::<u32>().unwrap()[0];
+            println!(
+                "ISSUE336 direct={direct} via_blit={viablit} agree={}",
+                direct == viablit
+            );
+        }
+        let _ = DType::U32;
+    }
 }

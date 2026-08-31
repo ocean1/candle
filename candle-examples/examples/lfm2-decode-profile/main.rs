@@ -3173,11 +3173,12 @@ fn main() -> Result<()> {
     // harness computes is a prediction that agrees, not an observation**
     // (§5.5a's own caution), and it is labelled `asks` for that reason.
     let scratch_asks_bytes = flash_scratch_ask_bytes(&axes, &config, kv_len, args.kv_capacity);
+    let (to_cpu_fast, to_cpu_blit) = candle::metal_backend::to_cpu_counts();
     println!(
         "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
          gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} \
          sample_ms_per_token={:.4} sample_med_ms_per_token={:.4} eos_ms_per_token={:.4} \
-         sample_in_buffer={} step_ms_per_token={:.4} \
+         sample_in_buffer={} to_cpu_fast={} to_cpu_blit={} step_ms_per_token={:.4} \
          dispatches_per_token={:.1} \
          dispatches_per_forward={:.1} aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
          batch_streams_identical={} spec_k={} spec_proposer={} spec_windows={} \
@@ -3203,6 +3204,11 @@ fn main() -> Result<()> {
         sample_med * 1e3,
         eos_mean * 1e3,
         args.sample_in_buffer,
+        // #336's engagement proof, on every line: which `to_cpu` path the
+        // readbacks took. A run claiming the fast arm with `to_cpu_fast=0`
+        // measured the other one (§2.4, after #69's vacuous determinism run).
+        to_cpu_fast,
+        to_cpu_blit,
         (wall_per_token + sample_mean + eos_mean) * 1e3,
         disp_mean,
         // Floored at 0 rather than subtracted blindly: with profiling off
