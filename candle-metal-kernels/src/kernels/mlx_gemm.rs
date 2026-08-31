@@ -118,6 +118,69 @@ fn skinny_max() -> usize {
     })
 }
 
+/// Which side of the `m == 1 || n == 1` GEMV route to suppress, so the routing
+/// decision itself becomes an arm (issue #386).
+///
+/// **Unset is what ships**, and the shipping path is byte-for-byte unchanged:
+/// the suppression is read only inside that branch, so an unconfigured process
+/// takes exactly the route it took before.
+///
+/// It rebuilds `LLOOM_253_FORCE_GEMM`, which `DESIGN.md` §13.5a's discriminator
+/// used and which **exists on no branch** — `measurements/issue-253-raw/README.md`
+/// records it as a temporary edit, restored from a hashed snapshot. §13.5a is
+/// the precedent and this is the mechanism, made durable this time so the next
+/// re-take costs an environment variable rather than four re-applied lines.
+///
+/// Two arms rather than one, because the route has two halves and only one has
+/// ever been measured:
+///
+/// - `m` — route `m == 1` to the GEMM, holding `B` fixed so the batch is not a
+///   variable. This is §13.5a's arm exactly. `n == 1` still takes the GEMV.
+/// - `n` — route `n == 1` to the GEMM. **Never measured on any axis**: every
+///   citation in the corpus is about `m`, and `n == 1` fires the same branch.
+///
+/// An unknown value **panics** rather than falling back: `DESIGN.md` §2.4 — an
+/// arm that silently ran the baseline is #69's vacuous determinism run, and the
+/// whole point of this knob is to be A/B'd. Engagement is nonetheless proved
+/// from the **kernel census** rather than from the flag, per that same rule.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ForceGemm {
+    M,
+    N,
+    Both,
+}
+
+fn forced_gemm() -> Option<ForceGemm> {
+    use std::sync::OnceLock;
+    static FORCE: OnceLock<Option<ForceGemm>> = OnceLock::new();
+    *FORCE.get_or_init(|| match std::env::var("LLOOM_386_FORCE_GEMM") {
+        Ok(v) => Some(match v.as_str() {
+            "m" => ForceGemm::M,
+            "n" => ForceGemm::N,
+            "both" => ForceGemm::Both,
+            other => panic!("LLOOM_386_FORCE_GEMM must be one of m|n|both, got {other:?}"),
+        }),
+        Err(_) => None,
+    })
+}
+
+/// Whether the GEMV route should still be taken for this shape.
+///
+/// Split out so the branch at the call site reads as the routing decision it is,
+/// and so the shipping answer — *"`m == 1 || n == 1` takes the GEMV"* — is one
+/// expression rather than a condition with a flag threaded through it.
+fn takes_gemv_route(m: usize, n: usize) -> bool {
+    let m_is_vec = m == 1;
+    let n_is_vec = n == 1;
+    let (suppress_m, suppress_n) = match forced_gemm() {
+        None => (false, false),
+        Some(ForceGemm::M) => (true, false),
+        Some(ForceGemm::N) => (false, true),
+        Some(ForceGemm::Both) => (true, true),
+    };
+    (m_is_vec && !suppress_m) || (n_is_vec && !suppress_n)
+}
+
 /// Select optimal tile configuration based on matrix dimensions, data type, transpose mode,
 /// and device type.
 ///
@@ -794,7 +857,11 @@ pub fn call_mlx_gemm(
         .bt())?;
     };
 
-    if m == 1 || n == 1 {
+    // The routing decision this project has never audited (issue #386): no
+    // threshold, no config axis, and `select_tile_config` is never consulted.
+    // `takes_gemv_route` is `m == 1 || n == 1` unless `LLOOM_386_FORCE_GEMM`
+    // suppresses one half, which is the only way to build the other arm.
+    if takes_gemv_route(m, n) {
         return call_mlx_gemv(
             device,
             ep,
